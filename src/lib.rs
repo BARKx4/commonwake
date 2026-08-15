@@ -3,6 +3,7 @@ pub mod client;
 pub mod crypto;
 pub mod db;
 pub mod error;
+pub mod federation;
 pub mod ingest;
 pub mod model;
 pub mod node;

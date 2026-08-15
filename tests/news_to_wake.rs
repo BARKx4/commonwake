@@ -136,12 +136,35 @@ async fn communal_news_becomes_blank_session_orientation() {
     let temp = TempDir::new().expect("temp dir");
     let node = CommonwakeNode::initialize(temp.path()).expect("node");
     let bootstrap_work = node.db.work(100).expect("bootstrap work");
+    let discovery_page = node
+        .db
+        .work_page(None, 5, Some("discover_sources"))
+        .expect("first discovery page");
+    assert_eq!(discovery_page.items.len(), 5);
+    assert!(discovery_page.has_more);
+    let next_discovery_page = node
+        .db
+        .work_page(
+            discovery_page.next_cursor.as_deref(),
+            100,
+            Some("discover_sources"),
+        )
+        .expect("remaining discovery page");
+    assert_eq!(next_discovery_page.items.len(), 12);
+    assert!(!next_discovery_page.has_more);
+    assert!(node.db.work_page(Some("not-a-cursor"), 5, None).is_err());
+    assert!(discovery_page.items.iter().all(|first| {
+        next_discovery_page
+            .items
+            .iter()
+            .all(|next| first.work_id != next.work_id)
+    }));
     assert_eq!(
         bootstrap_work
             .iter()
             .filter(|work| work.kind == "discover_sources")
             .count(),
-        12
+        17
     );
     assert!(
         bootstrap_work
@@ -158,6 +181,27 @@ async fn communal_news_becomes_blank_session_orientation() {
             .iter()
             .filter(|work| work.kind == "discover_sources")
             .all(|work| work.required_results == 0)
+    );
+    for china_facet in [
+        "china_official_institutional",
+        "china_scholarly_technical",
+        "china_independent_civil_society",
+        "china_diasporic_chinese_language",
+        "china_regional_neighbors",
+    ] {
+        assert!(
+            bootstrap_work
+                .iter()
+                .any(|work| work.subject_id == china_facet),
+            "missing standing China plurality facet {china_facet}"
+        );
+    }
+    let empty_coverage = node.db.coverage_report().expect("empty coverage report");
+    assert_eq!(empty_coverage.standing_gaps.len(), 17);
+    assert!(
+        empty_coverage
+            .methodology_notice
+            .contains("not truth, quality")
     );
 
     let returning = actor(&node, "returning-lineage");
@@ -195,6 +239,11 @@ async fn communal_news_becomes_blank_session_orientation() {
     let probation = node.db.ingestible_sources().expect("probation sources");
     assert_eq!(probation.len(), 2);
     assert!(probation.iter().all(|source| source.status == "probation"));
+    let coverage = node.db.coverage_report().expect("coverage report");
+    assert_eq!(coverage.local_source_manifests, 2);
+    assert_eq!(coverage.eligible_source_manifests, 2);
+    assert_eq!(coverage.by_language.get("en"), Some(&2));
+    assert!(coverage.dominant_ownership.is_some());
 
     let source_a = probation
         .iter()
@@ -204,6 +253,49 @@ async fn communal_news_becomes_blank_session_orientation() {
         .iter()
         .find(|source| source.feed_url == feed_b)
         .unwrap();
+    for _ in 0..10 {
+        node.db
+            .mark_source_fetch(&source_a.source_id, true)
+            .expect("promote fixture source");
+    }
+    for _ in 0..3 {
+        node.db
+            .mark_source_fetch(&source_a.source_id, false)
+            .expect("degrade fixture source");
+    }
+    let degraded = node
+        .db
+        .ingestible_sources()
+        .expect("degraded sources remain retryable")
+        .into_iter()
+        .find(|source| source.source_id == source_a.source_id)
+        .expect("degraded source stays in autonomous collection");
+    assert_eq!(degraded.status, "degraded");
+    let (recovery_seen, recovery_accepted) = node
+        .ingest_feed_bytes(
+            &degraded,
+            rss(
+                "A Cooperative",
+                "https://a.example.org/decision-7",
+                "International body adopts interoperable agent audit standard",
+                "The decision creates a public audit and appeal framework for deployed agents.",
+            )
+            .as_bytes(),
+        )
+        .expect("a newly fetched observation can prove a degraded source recovered");
+    assert_eq!((recovery_seen, recovery_accepted), (1, 1));
+    node.db
+        .mark_source_fetch(&source_a.source_id, true)
+        .expect("recovered source fetch");
+    let recovered = node
+        .db
+        .sources(None)
+        .expect("recovered source view")
+        .into_iter()
+        .find(|source| source.source_id == source_a.source_id)
+        .expect("recovered source");
+    assert_eq!(recovered.status, "active");
+    assert_eq!(recovered.consecutive_failures, 0);
     node.ingest_feed_bytes(
         source_a,
         rss(

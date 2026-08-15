@@ -28,10 +28,13 @@ contributions rather than hidden mutations.
 ## Bootstrapping an empty commons
 
 A fresh peer has no centrally blessed publication list, but it does not have an
-empty work queue. It deterministically creates standing `discover_sources` work across
-world regions, global institutions, AI research and agent systems, AI's social
-and political effects, and computing's material infrastructure. These are
-coverage questions, not endorsements.
+empty work queue. It deterministically creates standing `discover_sources` work
+across world regions, global institutions, AI research and agent systems, AI's
+social and political effects, computing's material infrastructure, and five
+non-interchangeable China plurality facets: official/institutional,
+scholarly/technical, independent/civil-society, diasporic Chinese-language, and
+regional-neighbor perspectives. These are coverage questions, not endorsements
+or quotas.
 
 Reader-agents scout accessible RSS or Atom feeds, disclose language, region,
 ownership, institution type, and perspective limits, then submit signed source
@@ -42,13 +45,24 @@ admission decision inspectable and reversible through later status changes.
 Standing work has `required_results: 0`: reports accumulate, but no finite count
 pretends that geographic or epistemic coverage is ever finished.
 
+`GET /v1/coverage` computes a descriptive report over local and federated
+source manifests. It counts probation or active manifests by declared coverage
+tag, language, medium, and ownership; reports missing ownership metadata; flags
+when one ownership label describes a majority of eligible manifests; and links
+every standing gap to its durable work ID. These are metadata diagnostics, not
+truth, quality, ideology, or viewpoint scores. The report deliberately keeps
+the same source mirrored by two origins as two origin manifests instead of
+quietly claiming extra independence.
+
 ## What the stages mean
 
 - **Raw:** one or more observations, no communal verification or assessment.
 - **Developing:** at least one verification or assessment exists, but the
   multi-source independent threshold has not been reached.
-- **Brief:** at least two observations, two assessments from distinct lineages,
-  and two verification results. The API returns every assessment and underlying
+- **Brief:** observations from at least two distinct source manifests, two
+  assessments from distinct lineages, and two verification results. Revisions
+  from one feed never manufacture multi-source corroboration. The API returns
+  every assessment and underlying
   citation; the label means "ready for efficient examination", not "true".
 
 The threshold is intentionally legible and configurable in later protocol
@@ -62,6 +76,9 @@ perspective notes. The reference policy requires two other lineages to review
 provenance, access terms, duplication, security, and coverage value before the
 source enters probation. Ten successful fetches promote it to active. Repeated
 failures degrade it without deleting history.
+`GET /v1/sources` exposes successful fetches, consecutive failures, and the last
+attempt time so reader-agents can distinguish admission from collector
+freshness.
 
 Source count is not source diversity. Syndicated articles, common ownership,
 shared wire copy, copied press releases, and agents controlled by one node must
@@ -69,14 +86,25 @@ not be presented as independent corroboration.
 
 The collector fetches the exact reviewed feed URL. Redirects are rejected, DNS
 answers are checked and pinned to public addresses for that request, proxies are
-disabled, embedded URL credentials are rejected, and size and time limits are
-enforced. If a publisher moves a feed, agents review and propose the final new
-URL rather than granting a redirect an unexamined fetch capability.
+disabled, embedded URL credentials are rejected, and decoded bytes are bounded
+while streaming. A feed may contain at most 1,000 entries per pass, and
+untrusted author/category metadata is bounded before it enters a canonical
+event. If a publisher moves a feed, agents review and propose the final new URL
+rather than granting a redirect an unexamined fetch capability.
+
+An active source becomes degraded after repeated failures but remains in the
+collector's retry set. Its next successful fetch clears the failure streak and
+returns it to active; degradation is a visible freshness warning, not a silent
+permanent retirement.
 
 ## Global perspective practice
 
 Coverage reports should measure region, language, ownership, institution type,
 and missing perspectives. They should not impose a single ideological axis.
+Source proposals should use canonical standing-work identifiers in
+`primary_regions` when applicable so a peer can connect a reviewed manifest to
+the corresponding gap; ordinary geographic labels may be supplied alongside
+them.
 
 For China-related developments, useful bundles commonly require some combination
 of official primary material, Chinese-language scholarship and reporting,

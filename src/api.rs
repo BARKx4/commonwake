@@ -10,11 +10,14 @@ use tower_http::trace::TraceLayer;
 
 use crate::{
     CONSTITUTION_VERSION, PROTOCOL_VERSION,
-    error::Result,
+    error::{CommonwakeError, Result},
+    federation::{MAX_FEDERATION_BODY_BYTES, MAX_FEDERATION_EVENTS},
     model::{
-        AcceptedObject, Checkpoint, EventView, FeedPage, LineageRegistration, OrientationBundle,
-        Pulse, SessionDelegation, SignedAcknowledgement, SignedContribution, SourceView, StoryView,
-        WorkItemView,
+        AcceptedObject, Checkpoint, CoverageReport, DelegationRevocation, EquivocationEvidenceView,
+        FederationBundle, FederationImportReport, FederationPeerView, FeedPage,
+        LineageRegistration, NetworkFeed, OrientationBundle, OriginEvent, Pulse, SessionDelegation,
+        SignedAcknowledgement, SignedContribution, SignedKeyRotation, SourceView, StoryView,
+        WorkPage,
     },
     node::CommonwakeNode,
 };
@@ -28,15 +31,31 @@ pub fn router(node: CommonwakeNode) -> Router {
         .route("/v1/checkpoint", get(checkpoint))
         .route("/v1/events", get(events))
         .route("/v1/sources", get(sources))
+        .route("/v1/coverage", get(coverage))
         .route("/v1/feed", get(feed))
+        .route("/v1/network/feed", get(network_feed))
         .route("/v1/stories/{story_id}", get(story))
         .route("/v1/work", get(work))
         .route("/v1/pulse/{lineage_id}", get(pulse))
         .route("/v1/orient/{lineage_id}", get(orient))
         .route("/v1/lineages", post(register_lineage))
         .route("/v1/delegations", post(register_delegation))
+        .route("/v1/revocations", post(revoke_delegation))
+        .route("/v1/rotations", post(rotate_lineage_key))
         .route("/v1/contributions", post(contribute))
         .route("/v1/acknowledgements", post(acknowledge))
+        .route("/v1/federation/bundle", get(federation_bundle))
+        .route(
+            "/v1/federation/bundle/{origin_node_id}",
+            get(relayed_federation_bundle),
+        )
+        .route(
+            "/v1/federation/import",
+            post(import_federation_bundle).layer(DefaultBodyLimit::max(MAX_FEDERATION_BODY_BYTES)),
+        )
+        .route("/v1/federation/peers", get(federation_peers))
+        .route("/v1/federation/events/{origin_node_id}", get(remote_events))
+        .route("/v1/federation/equivocations", get(equivocation_evidence))
         .layer(DefaultBodyLimit::max(MAX_JSON_BODY))
         .layer(TraceLayer::new_for_http())
         .with_state(node)
@@ -49,7 +68,7 @@ struct Discovery {
     protocol: &'static str,
     constitution: &'static str,
     provenance_notice: &'static str,
-    endpoints: [&'static str; 13],
+    endpoints: [&'static str; 23],
 }
 
 async fn discovery() -> Json<Discovery> {
@@ -64,15 +83,25 @@ async fn discovery() -> Json<Discovery> {
             "GET /v1/pulse/{lineage_id}",
             "GET /v1/orient/{lineage_id}",
             "GET /v1/feed",
+            "GET /v1/network/feed",
             "GET /v1/stories/{story_id}",
             "GET /v1/sources",
+            "GET /v1/coverage",
             "GET /v1/work",
             "GET /v1/events",
             "GET /v1/checkpoint",
             "POST /v1/lineages",
             "POST /v1/delegations",
+            "POST /v1/revocations",
+            "POST /v1/rotations",
             "POST /v1/contributions",
             "POST /v1/acknowledgements",
+            "GET /v1/federation/bundle",
+            "GET /v1/federation/bundle/{origin_node_id}",
+            "POST /v1/federation/import",
+            "GET /v1/federation/peers",
+            "GET /v1/federation/events/{origin_node_id}",
+            "GET /v1/federation/equivocations",
         ],
     })
 }
@@ -111,33 +140,48 @@ struct EventsQuery {
 
 #[derive(Serialize)]
 struct EventPage {
+    protocol: &'static str,
     node_id: String,
+    node_public_key: String,
     after: i64,
     next_cursor: i64,
     has_more: bool,
-    events: Vec<EventView>,
+    events: Vec<OriginEvent>,
+    checkpoint: Checkpoint,
 }
 
 async fn events(
     State(node): State<CommonwakeNode>,
     Query(query): Query<EventsQuery>,
 ) -> Result<Json<EventPage>> {
+    if query.after < 0 {
+        return Err(CommonwakeError::Validation(
+            "event cursor cannot be negative".into(),
+        ));
+    }
     let limit = query.limit.clamp(1, 500);
-    let mut events = node.db.events_after(query.after, limit + 1)?;
+    let mut events = node.db.origin_events_after(query.after, limit + 1)?;
     let has_more = events.len() > limit;
     events.truncate(limit);
     let next_cursor = events.last().map_or(query.after, |event| event.sequence);
     Ok(Json(EventPage {
+        protocol: PROTOCOL_VERSION,
         node_id: node.identity.node_id().into(),
+        node_public_key: node.identity.public_key().into(),
         after: query.after,
         next_cursor,
         has_more,
         events,
+        checkpoint: node.checkpoint_at(next_cursor)?,
     }))
 }
 
 async fn sources(State(node): State<CommonwakeNode>) -> Result<Json<Vec<SourceView>>> {
     Ok(Json(node.db.sources(None)?))
+}
+
+async fn coverage(State(node): State<CommonwakeNode>) -> Result<Json<CoverageReport>> {
+    Ok(Json(node.db.coverage_report()?))
 }
 
 #[derive(Debug, Deserialize)]
@@ -160,6 +204,95 @@ async fn feed(
     )?))
 }
 
+#[derive(Debug, Deserialize)]
+struct NetworkFeedQuery {
+    #[serde(default)]
+    after: i64,
+    #[serde(default = "default_limit")]
+    limit: usize,
+    #[serde(default)]
+    federated_after: i64,
+    stage: Option<String>,
+    origin_node_id: Option<String>,
+}
+
+async fn network_feed(
+    State(node): State<CommonwakeNode>,
+    Query(query): Query<NetworkFeedQuery>,
+) -> Result<Json<NetworkFeed>> {
+    Ok(Json(node.network_feed(
+        query.after,
+        query.federated_after,
+        query.limit.clamp(1, 100),
+        query.stage.as_deref(),
+        query.origin_node_id.as_deref(),
+    )?))
+}
+
+#[derive(Debug, Deserialize)]
+struct FederationBundleQuery {
+    #[serde(default)]
+    after: i64,
+    #[serde(default = "default_limit")]
+    limit: usize,
+}
+
+async fn federation_bundle(
+    State(node): State<CommonwakeNode>,
+    Query(query): Query<FederationBundleQuery>,
+) -> Result<Json<FederationBundle>> {
+    Ok(Json(node.federation_bundle(
+        query.after,
+        query.limit.clamp(1, MAX_FEDERATION_EVENTS),
+    )?))
+}
+
+async fn relayed_federation_bundle(
+    State(node): State<CommonwakeNode>,
+    Path(origin_node_id): Path<String>,
+    Query(query): Query<FederationBundleQuery>,
+) -> Result<Json<FederationBundle>> {
+    Ok(Json(node.db.relayed_federation_bundle(
+        &origin_node_id,
+        query.after,
+        query.limit.clamp(1, MAX_FEDERATION_EVENTS),
+    )?))
+}
+
+async fn import_federation_bundle(
+    State(node): State<CommonwakeNode>,
+    Json(bundle): Json<FederationBundle>,
+) -> Result<(StatusCode, Json<FederationImportReport>)> {
+    Ok((
+        StatusCode::CREATED,
+        Json(node.import_federation_bundle(&bundle)?),
+    ))
+}
+
+async fn federation_peers(
+    State(node): State<CommonwakeNode>,
+) -> Result<Json<Vec<FederationPeerView>>> {
+    Ok(Json(node.db.federation_peers()?))
+}
+
+async fn remote_events(
+    State(node): State<CommonwakeNode>,
+    Path(origin_node_id): Path<String>,
+    Query(query): Query<FederationBundleQuery>,
+) -> Result<Json<Vec<OriginEvent>>> {
+    Ok(Json(node.db.remote_events(
+        &origin_node_id,
+        query.after,
+        query.limit.clamp(1, MAX_FEDERATION_EVENTS),
+    )?))
+}
+
+async fn equivocation_evidence(
+    State(node): State<CommonwakeNode>,
+) -> Result<Json<Vec<EquivocationEvidenceView>>> {
+    Ok(Json(node.db.equivocation_evidence()?))
+}
+
 async fn story(
     State(node): State<CommonwakeNode>,
     Path(story_id): Path<String>,
@@ -169,15 +302,21 @@ async fn story(
 
 #[derive(Debug, Deserialize)]
 struct WorkQuery {
+    after: Option<String>,
     #[serde(default = "default_limit")]
     limit: usize,
+    kind: Option<String>,
 }
 
 async fn work(
     State(node): State<CommonwakeNode>,
     Query(query): Query<WorkQuery>,
-) -> Result<Json<Vec<WorkItemView>>> {
-    Ok(Json(node.db.work(query.limit.clamp(1, 100))?))
+) -> Result<Json<WorkPage>> {
+    Ok(Json(node.db.work_page(
+        query.after.as_deref(),
+        query.limit.clamp(1, 100),
+        query.kind.as_deref(),
+    )?))
 }
 
 async fn pulse(
@@ -217,6 +356,26 @@ async fn register_delegation(
     Ok((
         StatusCode::CREATED,
         Json(node.register_delegation(&delegation)?),
+    ))
+}
+
+async fn revoke_delegation(
+    State(node): State<CommonwakeNode>,
+    Json(revocation): Json<DelegationRevocation>,
+) -> Result<(StatusCode, Json<AcceptedObject>)> {
+    Ok((
+        StatusCode::CREATED,
+        Json(node.revoke_delegation(&revocation)?),
+    ))
+}
+
+async fn rotate_lineage_key(
+    State(node): State<CommonwakeNode>,
+    Json(rotation): Json<SignedKeyRotation>,
+) -> Result<(StatusCode, Json<AcceptedObject>)> {
+    Ok((
+        StatusCode::CREATED,
+        Json(node.rotate_lineage_key(&rotation)?),
     ))
 }
 

@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     path::Path,
     sync::{Mutex, MutexGuard},
 };
@@ -7,24 +7,43 @@ use std::{
 use chrono::{DateTime, SecondsFormat, Utc};
 use ed25519_dalek::Verifier;
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use url::Url;
 
 use crate::{
-    crypto::{event_hash, prefixed_id, signature_from_b64, verifying_key_from_b64},
+    crypto::{
+        ACK_DOMAIN, CONTRIBUTION_DOMAIN, DELEGATION_DOMAIN, KEY_ROTATION_DOMAIN, LINEAGE_DOMAIN,
+        REVOCATION_DOMAIN, WITNESS_DOMAIN, canonical_without_signature, event_hash, lineage_id,
+        prefixed_id, signature_from_b64, verify_object, verifying_key_from_b64,
+    },
     error::{CommonwakeError, Result},
+    federation::MAX_CANONICAL_OBJECT_BYTES,
+    ingest::{MAX_SUMMARY_CHARS, MAX_TITLE_CHARS},
     model::{
-        AcceptedObject, AssessmentPayload, AssessmentView, Claim, CorrectionPayload,
-        DelegationView, EventView, EvidenceRef, FeedPage, LineageRegistration, LineageView,
-        ObservationVerificationPayload, ObservationView, SessionDelegation, SignedAcknowledgement,
-        SignedContribution, SourceProposalPayload, SourceReviewPayload, SourceView,
-        StoryLinkPayload, StoryView, WorkClaimPayload, WorkItemView, WorkResultPayload,
+        AcceptedObject, AssessmentPayload, AssessmentView, CheckpointWitness, Claim,
+        CorrectionPayload, CoverageGapView, CoverageReport, DelegationRevocation, DelegationView,
+        EquivocationEvidenceView, EventView, EvidenceRef, FederatedFeedPage, FederatedStoryView,
+        FederationBundle, FederationImportReport, FederationPeerView, FeedPage,
+        LineageRegistration, LineageView, ObservationVerificationPayload, ObservationView,
+        OriginEvent, OwnershipConcentrationView, Scope, SessionDelegation, SignedAcknowledgement,
+        SignedContribution, SignedKeyRotation, SourceProposalPayload, SourceReviewPayload,
+        SourceView, StoryLinkPayload, StoryView, WorkClaimPayload, WorkItemView, WorkPage,
+        WorkResultPayload,
     },
     node::NodeIdentity,
+    service::{
+        MAX_CLOCK_SKEW_MINUTES, require_nonce, validate_authored_time_at,
+        validate_authority_change_at, validate_delegation_at, validate_display_name,
+        validate_lists, validate_memory_provenance,
+    },
 };
 
 const MIGRATION_0001: &str = include_str!("../migrations/0001_init.sql");
+const MIGRATION_0002: &str = include_str!("../migrations/0002_authority.sql");
+const MIGRATION_0003: &str = include_str!("../migrations/0003_federation.sql");
+const MIGRATION_0004: &str = include_str!("../migrations/0004_federated_orientation.sql");
+const SCHEMA_VERSION: i64 = 4;
 const ZERO_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 const BOOTSTRAP_SOURCE_COVERAGE: &[(&str, &str)] = &[
     (
@@ -75,6 +94,26 @@ const BOOTSTRAP_SOURCE_COVERAGE: &[(&str, &str)] = &[
         "compute_energy_environment",
         "computing infrastructure, chips, supply chains, data centers, energy, water, land use, climate, and environmental governance",
     ),
+    (
+        "china_official_institutional",
+        "Chinese central and local official, institutional, regulatory, and public-service accounts, read in context rather than treated as either neutral fact or automatic propaganda",
+    ),
+    (
+        "china_scholarly_technical",
+        "Chinese scholarly, scientific, technical, standards, industry, and policy research across institutions and schools of thought",
+    ),
+    (
+        "china_independent_civil_society",
+        "independent, labor, legal, community, and civil-society perspectives concerning China, with attention to source safety, access limits, and attribution risk",
+    ),
+    (
+        "china_diasporic_chinese_language",
+        "diasporic and overseas Chinese-language perspectives without treating diaspora communities as a single political viewpoint",
+    ),
+    (
+        "china_regional_neighbors",
+        "perspectives from China's regional neighbors and affected communities, kept distinct from claims about views inside China",
+    ),
 ];
 
 pub struct Database {
@@ -123,6 +162,49 @@ struct RawEvent {
     previous_hash: String,
     event_hash: String,
     node_signature: String,
+    author_nonce: Option<String>,
+}
+
+struct AuthenticatedProjection {
+    targets: Vec<String>,
+    supersedes: Vec<String>,
+    payload: Value,
+    author_signature: Option<String>,
+    author_nonce: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FederatedObservationEnvelope {
+    protocol: String,
+    kind: String,
+    payload: FederatedObservationPayload,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FederatedObservationPayload {
+    observation_id: String,
+    story_id: String,
+    source_id: String,
+    canonical_url: String,
+    title: String,
+    summary: String,
+    published_at: Option<DateTime<Utc>>,
+    retrieved_at: DateTime<Utc>,
+    language: Option<String>,
+    document_hash: String,
+    raw_metadata: Value,
+}
+
+struct EquivocationInput<'a> {
+    origin_node_id: &'a str,
+    conflict_kind: &'a str,
+    cursor: i64,
+    existing_hash: &'a str,
+    incoming_hash: &'a str,
+    existing_json: &'a str,
+    incoming_json: &'a str,
 }
 
 impl Database {
@@ -139,6 +221,30 @@ impl Database {
             "INSERT OR IGNORE INTO meta(key, value) VALUES ('schema_version', '1')",
             [],
         )?;
+        let mut schema_version: i64 = connection
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'schema_version'",
+                [],
+                |row| row.get::<_, String>(0),
+            )?
+            .parse()
+            .map_err(|_| CommonwakeError::Internal("stored schema version is malformed".into()))?;
+        if schema_version > SCHEMA_VERSION {
+            return Err(CommonwakeError::Validation(format!(
+                "database schema {schema_version} is newer than supported schema {SCHEMA_VERSION}"
+            )));
+        }
+        if schema_version < 2 {
+            connection.execute_batch(MIGRATION_0002)?;
+            schema_version = 2;
+        }
+        if schema_version < 3 {
+            connection.execute_batch(MIGRATION_0003)?;
+            schema_version = 3;
+        }
+        if schema_version < 4 {
+            connection.execute_batch(MIGRATION_0004)?;
+        }
         seed_bootstrap_work(&connection)?;
         Ok(Self {
             connection: Mutex::new(connection),
@@ -189,6 +295,373 @@ impl Database {
             .unwrap_or((0, ZERO_HASH.into())))
     }
 
+    pub fn event_hash_at(&self, cursor: i64) -> Result<String> {
+        if cursor < 0 {
+            return Err(CommonwakeError::Validation(
+                "checkpoint cursor cannot be negative".into(),
+            ));
+        }
+        if cursor == 0 {
+            return Ok(ZERO_HASH.into());
+        }
+        let connection = self.lock()?;
+        connection
+            .query_row(
+                "SELECT event_hash FROM events WHERE sequence = ?1",
+                [cursor],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| CommonwakeError::NotFound(format!("event cursor {cursor}")))
+    }
+
+    pub fn origin_events_after(&self, after: i64, limit: usize) -> Result<Vec<OriginEvent>> {
+        let connection = self.lock()?;
+        let mut statement = connection.prepare(
+            "SELECT sequence, event_id, kind, lineage_id, delegation_id, created_at,
+                    received_at, targets_json, supersedes_json, payload_json,
+                    canonical_json, author_signature, previous_hash, event_hash, node_signature,
+                    author_nonce
+             FROM events WHERE sequence > ?1 ORDER BY sequence ASC LIMIT ?2",
+        )?;
+        let rows = statement.query_map(params![after, limit as i64], raw_event_from_row)?;
+        let mut events = Vec::new();
+        for row in rows {
+            events.push(origin_event(row?)?);
+        }
+        Ok(events)
+    }
+
+    pub fn import_federation_bundle(
+        &self,
+        identity: &NodeIdentity,
+        bundle: &FederationBundle,
+        witness: &CheckpointWitness,
+    ) -> Result<FederationImportReport> {
+        crate::federation::verify_bundle(bundle)?;
+        if bundle.origin_node_id == identity.node_id() {
+            return Err(CommonwakeError::Validation(
+                "a node cannot import its own event log as a remote origin".into(),
+            ));
+        }
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction()?;
+        let now = timestamp(Utc::now());
+        let known = transaction
+            .query_row(
+                "SELECT node_public_key, cursor, event_hash
+                 FROM federation_peers WHERE node_id = ?1",
+                [&bundle.origin_node_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let (previously_known_cursor, mut current_cursor, mut current_hash) =
+            if let Some((public_key, cursor, event_hash)) = known {
+                if public_key != bundle.origin_node_public_key {
+                    return Err(CommonwakeError::Unauthorized(
+                        "known origin node presented a different public key".into(),
+                    ));
+                }
+                (cursor, cursor, event_hash)
+            } else {
+                if bundle.from_cursor != 0 {
+                    return Err(CommonwakeError::Validation(
+                        "first contact with an origin must begin at cursor zero".into(),
+                    ));
+                }
+                transaction.execute(
+                    "INSERT INTO federation_peers(
+                        node_id, node_public_key, first_seen_at, last_seen_at,
+                        cursor, event_hash, checkpoint_json
+                     ) VALUES (?1, ?2, ?3, ?3, 0, ?4, 'null')",
+                    params![
+                        bundle.origin_node_id,
+                        bundle.origin_node_public_key,
+                        now,
+                        ZERO_HASH
+                    ],
+                )?;
+                (0, 0, ZERO_HASH.into())
+            };
+        if bundle.from_cursor > previously_known_cursor {
+            return Err(CommonwakeError::Validation(format!(
+                "bundle begins at {} but the stored origin head is {}; request a contiguous delta",
+                bundle.from_cursor, previously_known_cursor
+            )));
+        }
+
+        let mut imported_events = 0_usize;
+        for event in &bundle.events {
+            if event.sequence <= previously_known_cursor {
+                let existing: (String, String) = transaction.query_row(
+                    "SELECT event_hash, canonical_json FROM remote_events
+                     WHERE origin_node_id = ?1 AND origin_sequence = ?2",
+                    params![bundle.origin_node_id, event.sequence],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?;
+                if existing.0 != event.event_hash {
+                    let existing_json = serde_json::to_string(&json!({
+                        "sequence": event.sequence,
+                        "event_hash": existing.0,
+                        "canonical": serde_json::from_str::<Value>(&existing.1)?,
+                    }))?;
+                    let incoming_json = serde_json::to_string(event)?;
+                    record_equivocation(
+                        &transaction,
+                        &EquivocationInput {
+                            origin_node_id: &bundle.origin_node_id,
+                            conflict_kind: "event_sequence",
+                            cursor: event.sequence,
+                            existing_hash: &existing.0,
+                            incoming_hash: &event.event_hash,
+                            existing_json: &existing_json,
+                            incoming_json: &incoming_json,
+                        },
+                    )?;
+                    transaction.commit()?;
+                    return Err(CommonwakeError::Conflict(format!(
+                        "origin {} equivocated at event sequence {}",
+                        bundle.origin_node_id, event.sequence
+                    )));
+                }
+                continue;
+            }
+            if event.sequence != current_cursor + 1 {
+                return Err(CommonwakeError::Validation(format!(
+                    "origin delta has a gap before sequence {}",
+                    event.sequence
+                )));
+            }
+            if event.previous_hash != current_hash {
+                let existing_json = serde_json::to_string(&json!({
+                    "cursor": current_cursor,
+                    "event_hash": current_hash,
+                }))?;
+                let incoming_json = serde_json::to_string(event)?;
+                record_equivocation(
+                    &transaction,
+                    &EquivocationInput {
+                        origin_node_id: &bundle.origin_node_id,
+                        conflict_kind: "chain_fork",
+                        cursor: event.sequence,
+                        existing_hash: &current_hash,
+                        incoming_hash: &event.previous_hash,
+                        existing_json: &existing_json,
+                        incoming_json: &incoming_json,
+                    },
+                )?;
+                transaction.commit()?;
+                return Err(CommonwakeError::Conflict(format!(
+                    "origin {} presented a fork after cursor {current_cursor}",
+                    bundle.origin_node_id
+                )));
+            }
+            let author_nonce =
+                validate_and_project_remote_event(&transaction, &bundle.origin_node_id, event)?;
+            transaction.execute(
+                "INSERT INTO remote_events(
+                    origin_node_id, origin_sequence, event_id, kind, lineage_id,
+                    delegation_id, created_at, received_at, author_nonce, canonical_json,
+                    previous_hash, event_hash, node_signature, imported_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                params![
+                    bundle.origin_node_id,
+                    event.sequence,
+                    event.event_id,
+                    event.kind,
+                    event.lineage_id,
+                    event.delegation_id,
+                    event.created_at,
+                    event.received_at,
+                    author_nonce,
+                    serde_json::to_string(&event.canonical)?,
+                    event.previous_hash,
+                    event.event_hash,
+                    event.node_signature,
+                    now,
+                ],
+            )?;
+            current_cursor = event.sequence;
+            current_hash.clone_from(&event.event_hash);
+            imported_events += 1;
+        }
+
+        let checkpoint_hash = if bundle.checkpoint.cursor == 0 {
+            ZERO_HASH.into()
+        } else {
+            transaction
+                .query_row(
+                    "SELECT event_hash FROM remote_events
+                     WHERE origin_node_id = ?1 AND origin_sequence = ?2",
+                    params![bundle.origin_node_id, bundle.checkpoint.cursor],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?
+                .ok_or_else(|| {
+                    CommonwakeError::Validation(
+                        "bundle checkpoint is beyond the contiguously stored origin log".into(),
+                    )
+                })?
+        };
+        if checkpoint_hash != bundle.checkpoint.event_hash {
+            let existing_json = serde_json::to_string(&json!({
+                "cursor": bundle.checkpoint.cursor,
+                "event_hash": checkpoint_hash,
+            }))?;
+            let incoming_json = serde_json::to_string(&bundle.checkpoint)?;
+            record_equivocation(
+                &transaction,
+                &EquivocationInput {
+                    origin_node_id: &bundle.origin_node_id,
+                    conflict_kind: "checkpoint",
+                    cursor: bundle.checkpoint.cursor,
+                    existing_hash: &checkpoint_hash,
+                    incoming_hash: &bundle.checkpoint.event_hash,
+                    existing_json: &existing_json,
+                    incoming_json: &incoming_json,
+                },
+            )?;
+            transaction.commit()?;
+            return Err(CommonwakeError::Conflict(format!(
+                "origin {} signed incompatible checkpoint {}",
+                bundle.origin_node_id, bundle.checkpoint.cursor
+            )));
+        }
+
+        let checkpoint_json = serde_json::to_string(&bundle.checkpoint)?;
+        transaction.execute(
+            "INSERT OR IGNORE INTO remote_checkpoints(
+                origin_node_id, cursor, event_hash, created_at, signature,
+                checkpoint_json, imported_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                bundle.origin_node_id,
+                bundle.checkpoint.cursor,
+                bundle.checkpoint.event_hash,
+                timestamp(bundle.checkpoint.created_at),
+                bundle.checkpoint.signature,
+                checkpoint_json,
+                now,
+            ],
+        )?;
+        transaction.execute(
+            "UPDATE federation_peers SET
+                last_seen_at = ?2, cursor = ?3, event_hash = ?4,
+                checkpoint_json = CASE WHEN ?5 >= cursor THEN ?6 ELSE checkpoint_json END
+             WHERE node_id = ?1",
+            params![
+                bundle.origin_node_id,
+                now,
+                current_cursor,
+                current_hash,
+                bundle.checkpoint.cursor,
+                checkpoint_json,
+            ],
+        )?;
+
+        let should_witness = bundle.events.iter().any(|event| {
+            event.sequence > previously_known_cursor && event.kind != "checkpoint_witnessed"
+        });
+        let already_witnessed = if should_witness {
+            transaction
+                .query_row(
+                    "SELECT w.witness_event_id, e.sequence
+                     FROM checkpoint_witnesses w
+                     JOIN events e ON e.event_id = w.witness_event_id
+                     WHERE w.origin_node_id = ?1 AND w.cursor = ?2 AND w.event_hash = ?3",
+                    params![
+                        bundle.origin_node_id,
+                        bundle.checkpoint.cursor,
+                        bundle.checkpoint.event_hash
+                    ],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .optional()?
+        } else {
+            None
+        };
+        let witnessed = if !should_witness {
+            None
+        } else if let Some((event_id, sequence)) = already_witnessed {
+            Some((event_id, sequence))
+        } else {
+            let witness_canonical = canonical_json(witness)?;
+            let accepted = append_event(
+                &transaction,
+                identity,
+                &EventInput {
+                    kind: "checkpoint_witnessed".into(),
+                    lineage_id: None,
+                    delegation_id: None,
+                    created_at: witness.observed_at,
+                    author_nonce: None,
+                    targets: vec![bundle.origin_node_id.clone()],
+                    supersedes: vec![],
+                    payload: serde_json::to_value(witness)?,
+                    canonical_json: witness_canonical,
+                    author_signature: Some(witness.signature.clone()),
+                },
+            )?;
+            transaction.execute(
+                "INSERT INTO checkpoint_witnesses(
+                    origin_node_id, cursor, event_hash, witness_event_id, witnessed_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    bundle.origin_node_id,
+                    bundle.checkpoint.cursor,
+                    bundle.checkpoint.event_hash,
+                    accepted.id,
+                    timestamp(witness.observed_at),
+                ],
+            )?;
+            Some((accepted.id, accepted.sequence))
+        };
+        if let Some((event_id, sequence)) = &witnessed {
+            let import_id = prefixed_id(
+                "cwimport_",
+                format!(
+                    "{}\0{}\0{}\0{}",
+                    bundle.origin_node_id,
+                    previously_known_cursor,
+                    current_cursor,
+                    bundle.checkpoint.event_hash
+                )
+                .as_bytes(),
+            );
+            transaction.execute(
+                "INSERT OR IGNORE INTO federation_imports(
+                    import_id, origin_node_id, remote_from_cursor, remote_through_cursor,
+                    local_witness_event_id, local_witness_sequence, imported_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    import_id,
+                    bundle.origin_node_id,
+                    previously_known_cursor,
+                    current_cursor,
+                    event_id,
+                    sequence,
+                    now,
+                ],
+            )?;
+        }
+        let witness_event_id = witnessed.map(|(event_id, _)| event_id);
+        transaction.commit()?;
+        Ok(FederationImportReport {
+            origin_node_id: bundle.origin_node_id.clone(),
+            previously_known_cursor,
+            imported_events,
+            current_cursor,
+            current_event_hash: current_hash,
+            witness_event_id,
+        })
+    }
+
     pub fn register_lineage(
         &self,
         identity: &NodeIdentity,
@@ -199,7 +672,9 @@ impl Database {
         let transaction = connection.transaction()?;
         if transaction
             .query_row(
-                "SELECT 1 FROM lineages WHERE lineage_id = ?1 OR public_key = ?2",
+                "SELECT 1 WHERE
+                    EXISTS(SELECT 1 FROM lineages WHERE lineage_id = ?1 OR public_key = ?2)
+                    OR EXISTS(SELECT 1 FROM lineage_keys WHERE public_key = ?2)",
                 params![lineage_id, registration.public_key],
                 |_| Ok(()),
             )
@@ -240,6 +715,12 @@ impl Database {
                 accepted.sequence,
                 canonical_json
             ],
+        )?;
+        transaction.execute(
+            "INSERT INTO lineage_keys(
+                lineage_id, key_version, public_key, valid_from_sequence
+             ) VALUES (?1, 0, ?2, ?3)",
+            params![lineage_id, registration.public_key, accepted.sequence],
         )?;
         transaction.commit()?;
         Ok(accepted)
@@ -354,6 +835,180 @@ impl Database {
             expires_at: parse_timestamp(&raw.5)?,
             revoked: raw.6.is_some(),
         })
+    }
+
+    pub fn revoke_delegation(
+        &self,
+        identity: &NodeIdentity,
+        revocation: &DelegationRevocation,
+    ) -> Result<AcceptedObject> {
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction()?;
+        let owner: Option<(String, Option<i64>)> = transaction
+            .query_row(
+                "SELECT lineage_id, revoked_sequence FROM delegations WHERE delegation_id = ?1",
+                [&revocation.delegation_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((owner, revoked_sequence)) = owner else {
+            return Err(CommonwakeError::NotFound(
+                "delegation is not registered".into(),
+            ));
+        };
+        if owner != revocation.lineage_id {
+            return Err(CommonwakeError::Unauthorized(
+                "delegation does not belong to the signing lineage".into(),
+            ));
+        }
+        if revoked_sequence.is_some() {
+            return Err(CommonwakeError::Conflict(
+                "delegation is already revoked".into(),
+            ));
+        }
+
+        let canonical_json = canonical_json(revocation)?;
+        let accepted = append_event(
+            &transaction,
+            identity,
+            &EventInput {
+                kind: "delegation_revoked".into(),
+                lineage_id: Some(revocation.lineage_id.clone()),
+                delegation_id: None,
+                created_at: revocation.created_at,
+                author_nonce: Some(revocation.nonce.clone()),
+                targets: vec![revocation.delegation_id.clone()],
+                supersedes: vec![],
+                payload: serde_json::to_value(revocation)?,
+                canonical_json: canonical_json.clone(),
+                author_signature: Some(revocation.signature.clone()),
+            },
+        )?;
+        transaction.execute(
+            "UPDATE delegations SET revoked_sequence = ?2
+             WHERE delegation_id = ?1 AND revoked_sequence IS NULL",
+            params![revocation.delegation_id, accepted.sequence],
+        )?;
+        transaction.execute(
+            "INSERT INTO delegation_revocations(
+                delegation_id, lineage_id, event_id, reason, created_at, revocation_json
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                revocation.delegation_id,
+                revocation.lineage_id,
+                accepted.id,
+                revocation.reason,
+                timestamp(revocation.created_at),
+                canonical_json,
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(accepted)
+    }
+
+    pub fn rotate_lineage_key(
+        &self,
+        identity: &NodeIdentity,
+        rotation: &SignedKeyRotation,
+    ) -> Result<AcceptedObject> {
+        let statement = &rotation.statement;
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction()?;
+        let current_key: String = transaction
+            .query_row(
+                "SELECT public_key FROM lineages WHERE lineage_id = ?1",
+                [&statement.lineage_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| CommonwakeError::NotFound("lineage is not registered".into()))?;
+        if current_key != statement.previous_public_key {
+            return Err(CommonwakeError::Conflict(
+                "rotation does not begin at the lineage's current key".into(),
+            ));
+        }
+        if transaction
+            .query_row(
+                "SELECT 1 FROM lineage_keys WHERE public_key = ?1",
+                [&statement.new_public_key],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some()
+        {
+            return Err(CommonwakeError::Conflict(
+                "new public key has already been used by a lineage".into(),
+            ));
+        }
+        let next_version: i64 = transaction.query_row(
+            "SELECT COALESCE(MAX(key_version), -1) + 1 FROM lineage_keys WHERE lineage_id = ?1",
+            [&statement.lineage_id],
+            |row| row.get(0),
+        )?;
+        let canonical_json = canonical_json(rotation)?;
+        let accepted = append_event(
+            &transaction,
+            identity,
+            &EventInput {
+                kind: "lineage_key_rotated".into(),
+                lineage_id: Some(statement.lineage_id.clone()),
+                delegation_id: None,
+                created_at: statement.created_at,
+                author_nonce: Some(statement.nonce.clone()),
+                targets: vec![statement.lineage_id.clone()],
+                supersedes: vec![],
+                payload: serde_json::to_value(rotation)?,
+                canonical_json: canonical_json.clone(),
+                author_signature: Some(rotation.previous_signature.clone()),
+            },
+        )?;
+        transaction.execute(
+            "UPDATE lineage_keys SET valid_to_sequence = ?2
+             WHERE lineage_id = ?1 AND valid_to_sequence IS NULL",
+            params![statement.lineage_id, accepted.sequence],
+        )?;
+        transaction.execute(
+            "UPDATE lineages SET public_key = ?2 WHERE lineage_id = ?1",
+            params![statement.lineage_id, statement.new_public_key],
+        )?;
+        transaction.execute(
+            "INSERT INTO lineage_keys(
+                lineage_id, key_version, public_key, valid_from_sequence, rotation_event_id
+             ) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                statement.lineage_id,
+                next_version,
+                statement.new_public_key,
+                accepted.sequence,
+                accepted.id,
+            ],
+        )?;
+        transaction.execute(
+            "INSERT INTO lineage_rotations(
+                lineage_id, key_version, event_id, previous_public_key, new_public_key,
+                revoke_existing_delegations, reason, created_at, rotation_json
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                statement.lineage_id,
+                next_version,
+                accepted.id,
+                statement.previous_public_key,
+                statement.new_public_key,
+                i64::from(statement.revoke_existing_delegations),
+                statement.reason,
+                timestamp(statement.created_at),
+                canonical_json,
+            ],
+        )?;
+        if statement.revoke_existing_delegations {
+            transaction.execute(
+                "UPDATE delegations SET revoked_sequence = ?2
+                 WHERE lineage_id = ?1 AND revoked_sequence IS NULL",
+                params![statement.lineage_id, accepted.sequence],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(accepted)
     }
 
     pub fn append_contribution(
@@ -499,7 +1154,8 @@ impl Database {
         }
         if transaction
             .query_row(
-                "SELECT 1 FROM sources WHERE source_id = ?1 AND status IN ('probation', 'active')",
+                "SELECT 1 FROM sources
+                 WHERE source_id = ?1 AND status IN ('probation', 'active', 'degraded')",
                 [&observation.source_id],
                 |_| Ok(()),
             )
@@ -507,7 +1163,7 @@ impl Database {
             .is_none()
         {
             return Err(CommonwakeError::Validation(
-                "observations require a probation or active source".into(),
+                "observations require a probation, active, or retryable degraded source".into(),
             ));
         }
 
@@ -629,8 +1285,11 @@ impl Database {
             connection.execute(
                 "UPDATE sources SET successful_fetches = successful_fetches + 1,
                     consecutive_failures = 0, last_fetched_at = ?2,
-                    status = CASE WHEN status = 'probation' AND successful_fetches >= 9
-                                  THEN 'active' ELSE status END
+                    status = CASE
+                        WHEN status = 'degraded' THEN 'active'
+                        WHEN status = 'probation' AND successful_fetches >= 9 THEN 'active'
+                        ELSE status
+                    END
                  WHERE source_id = ?1",
                 params![source_id, timestamp(Utc::now())],
             )?;
@@ -648,7 +1307,7 @@ impl Database {
     }
 
     pub fn ingestible_sources(&self) -> Result<Vec<SourceView>> {
-        self.sources(Some(&["probation", "active"]))
+        self.sources(Some(&["probation", "active", "degraded"]))
     }
 
     pub fn sources(&self, statuses: Option<&[&str]>) -> Result<Vec<SourceView>> {
@@ -658,7 +1317,8 @@ impl Database {
                     s.primary_regions_json, s.languages_json, s.ownership,
                     s.perspective_notes, s.status, s.proposer_lineage_id,
                     SUM(CASE WHEN r.recommendation = 'approve' THEN 1 ELSE 0 END),
-                    SUM(CASE WHEN r.recommendation = 'reject' THEN 1 ELSE 0 END)
+                    SUM(CASE WHEN r.recommendation = 'reject' THEN 1 ELSE 0 END),
+                    s.successful_fetches, s.consecutive_failures, s.last_fetched_at
              FROM sources s LEFT JOIN source_reviews r ON r.source_id = s.source_id
              GROUP BY s.source_id ORDER BY s.created_at ASC",
         )?;
@@ -677,6 +1337,9 @@ impl Database {
                 row.get::<_, String>(10)?,
                 row.get::<_, i64>(11)?,
                 row.get::<_, i64>(12)?,
+                row.get::<_, i64>(13)?,
+                row.get::<_, i64>(14)?,
+                row.get::<_, Option<String>>(15)?,
             ))
         })?;
         let mut sources = Vec::new();
@@ -699,9 +1362,155 @@ impl Database {
                 proposer_lineage_id: row.10,
                 approval_count: row.11,
                 rejection_count: row.12,
+                successful_fetches: row.13,
+                consecutive_failures: row.14,
+                last_fetched_at: row.15.map(|value| parse_timestamp(&value)).transpose()?,
             });
         }
         Ok(sources)
+    }
+
+    pub fn coverage_report(&self) -> Result<CoverageReport> {
+        let connection = self.lock()?;
+        let mut statement = connection.prepare(
+            "SELECT 'local', status, medium, primary_regions_json, languages_json, ownership
+             FROM sources
+             UNION ALL
+             SELECT 'federated', status, medium, primary_regions_json, languages_json, ownership
+             FROM federated_sources",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, Option<String>>(5)?,
+            ))
+        })?;
+
+        let mut local_source_manifests = 0_usize;
+        let mut federated_source_manifests = 0_usize;
+        let mut eligible_source_manifests = 0_usize;
+        let mut by_status = BTreeMap::new();
+        let mut by_region_or_coverage_tag = BTreeMap::new();
+        let mut by_language = BTreeMap::new();
+        let mut by_medium = BTreeMap::new();
+        let mut by_ownership = BTreeMap::new();
+        let mut missing_ownership_manifests = 0_usize;
+        let mut eligible_by_area = BTreeMap::<String, usize>::new();
+        let mut proposed_by_area = BTreeMap::<String, usize>::new();
+
+        for row in rows {
+            let (origin, status, medium, regions_json, languages_json, ownership) = row?;
+            if origin == "local" {
+                local_source_manifests += 1;
+            } else {
+                federated_source_manifests += 1;
+            }
+            *by_status.entry(status.clone()).or_insert(0) += 1;
+            let eligible = matches!(status.as_str(), "probation" | "active");
+            let proposed = status == "proposed";
+            if !eligible {
+                if proposed {
+                    let regions: BTreeSet<String> =
+                        serde_json::from_str::<Vec<String>>(&regions_json)?
+                            .into_iter()
+                            .map(|value| coverage_key(&value))
+                            .filter(|value| !value.is_empty())
+                            .collect();
+                    for region in regions {
+                        *proposed_by_area.entry(region).or_insert(0) += 1;
+                    }
+                }
+                continue;
+            }
+            eligible_source_manifests += 1;
+            let regions: BTreeSet<String> = serde_json::from_str::<Vec<String>>(&regions_json)?
+                .into_iter()
+                .map(|value| coverage_key(&value))
+                .filter(|value| !value.is_empty())
+                .collect();
+            for region in regions {
+                *by_region_or_coverage_tag.entry(region.clone()).or_insert(0) += 1;
+                *eligible_by_area.entry(region).or_insert(0) += 1;
+            }
+            let languages: BTreeSet<String> = serde_json::from_str::<Vec<String>>(&languages_json)?
+                .into_iter()
+                .map(|value| coverage_key(&value))
+                .filter(|value| !value.is_empty())
+                .collect();
+            for language in languages {
+                *by_language.entry(language).or_insert(0) += 1;
+            }
+            let medium = coverage_key(&medium);
+            if !medium.is_empty() {
+                *by_medium.entry(medium).or_insert(0) += 1;
+            }
+            if let Some(ownership) = ownership
+                .map(|value| coverage_key(&value))
+                .filter(|value| !value.is_empty())
+            {
+                *by_ownership.entry(ownership).or_insert(0) += 1;
+            } else {
+                missing_ownership_manifests += 1;
+            }
+        }
+
+        let dominant_ownership = by_ownership
+            .iter()
+            .max_by_key(|(_, count)| *count)
+            .filter(|(_, count)| {
+                eligible_source_manifests > 0 && **count * 2 > eligible_source_manifests
+            })
+            .map(
+                |(ownership_label, source_manifests)| OwnershipConcentrationView {
+                    ownership_label: ownership_label.clone(),
+                    source_manifests: *source_manifests,
+                    eligible_source_manifests,
+                },
+            );
+        let standing_gaps = BOOTSTRAP_SOURCE_COVERAGE
+            .iter()
+            .map(|(coverage_area, _)| {
+                let eligible_sources = eligible_by_area.get(*coverage_area).copied().unwrap_or(0);
+                let proposed_sources = proposed_by_area.get(*coverage_area).copied().unwrap_or(0);
+                let status = if eligible_sources > 0 {
+                    "covered"
+                } else if proposed_sources > 0 {
+                    "proposed_only"
+                } else {
+                    "uncovered"
+                };
+                CoverageGapView {
+                    coverage_area: (*coverage_area).into(),
+                    eligible_sources,
+                    proposed_sources,
+                    status: status.into(),
+                    standing_work_id: prefixed_id(
+                        "cwwork_",
+                        format!("discover_sources\0{coverage_area}").as_bytes(),
+                    ),
+                }
+            })
+            .collect();
+
+        Ok(CoverageReport {
+            generated_at: Utc::now(),
+            local_source_manifests,
+            federated_source_manifests,
+            eligible_source_manifests,
+            by_status,
+            by_region_or_coverage_tag,
+            by_language,
+            by_medium,
+            by_ownership,
+            missing_ownership_manifests,
+            dominant_ownership,
+            standing_gaps,
+            methodology_notice: "Counts describe eligible source manifests (probation or active) by self-declared metadata and origin; they are not truth, quality, ideology, or viewpoint scores. Federated duplicates remain visible as separate origin manifests. China-related facets are plurality checks, not quotas or assumptions that unlike claims are morally or evidentially equivalent.".into(),
+        })
     }
 
     pub fn events_after(&self, after: i64, limit: usize) -> Result<Vec<EventView>> {
@@ -727,7 +1536,7 @@ impl Database {
             "SELECT e.sequence, e.event_id, e.kind, e.lineage_id, e.delegation_id,
                     e.created_at, e.received_at, e.targets_json, e.supersedes_json,
                     e.payload_json, e.canonical_json, e.author_signature,
-                    e.previous_hash, e.event_hash, e.node_signature
+                    e.previous_hash, e.event_hash, e.node_signature, e.author_nonce
              FROM events e
              WHERE e.lineage_id = ?1 AND e.kind = 'commitment'
                AND NOT EXISTS (
@@ -743,6 +1552,15 @@ impl Database {
     pub fn stories_changed_between(&self, after: i64, through: i64) -> Result<Vec<StoryView>> {
         let connection = self.lock()?;
         stories_changed_between_connection(&connection, after, through)
+    }
+
+    pub fn federated_stories_changed_between(
+        &self,
+        after: i64,
+        through: i64,
+    ) -> Result<Vec<FederatedStoryView>> {
+        let connection = self.lock()?;
+        federated_stories_changed_between_connection(&connection, after, through)
     }
 
     pub fn feed(&self, after: i64, limit: usize, stage: Option<&str>) -> Result<FeedPage> {
@@ -784,24 +1602,44 @@ impl Database {
     }
 
     pub fn work(&self, limit: usize) -> Result<Vec<WorkItemView>> {
+        Ok(self.work_page(None, limit, None)?.items)
+    }
+
+    pub fn work_page(
+        &self,
+        after: Option<&str>,
+        limit: usize,
+        kind: Option<&str>,
+    ) -> Result<WorkPage> {
+        let (after_sequence, after_work_id) = match after {
+            Some(cursor) => parse_work_cursor(cursor)?,
+            None => (-1, String::new()),
+        };
         let connection = self.lock()?;
         let mut statement = connection.prepare(
             "SELECT work_id, kind, subject_type, subject_id, instructions,
                     required_results, created_sequence
-             FROM work_items WHERE status = 'open'
-             ORDER BY created_sequence ASC LIMIT ?1",
+             FROM work_items
+             WHERE status = 'open'
+               AND (created_sequence > ?1 OR (created_sequence = ?1 AND work_id > ?2))
+               AND (?3 IS NULL OR kind = ?3)
+             ORDER BY created_sequence ASC, work_id ASC LIMIT ?4",
         )?;
-        let rows = statement.query_map([limit as i64], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, i64>(5)?,
-                row.get::<_, i64>(6)?,
-            ))
-        })?;
+        let query_limit = limit.saturating_add(1).min(i64::MAX as usize) as i64;
+        let rows = statement.query_map(
+            params![after_sequence, after_work_id, kind, query_limit],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, i64>(6)?,
+                ))
+            },
+        )?;
         let mut work = Vec::new();
         for row in rows {
             let row = row?;
@@ -823,7 +1661,294 @@ impl Database {
                 created_sequence: row.6,
             });
         }
-        Ok(work)
+        let has_more = work.len() > limit;
+        work.truncate(limit);
+        let next_cursor = work
+            .last()
+            .map(|item| format_work_cursor(item.created_sequence, &item.work_id));
+        Ok(WorkPage {
+            items: work,
+            after: after.map(str::to_owned),
+            next_cursor,
+            has_more,
+            kind: kind.map(str::to_owned),
+        })
+    }
+
+    pub fn federation_peers(&self) -> Result<Vec<FederationPeerView>> {
+        let connection = self.lock()?;
+        let mut statement = connection.prepare(
+            "SELECT node_id, node_public_key, first_seen_at, last_seen_at, cursor, event_hash
+             FROM federation_peers ORDER BY first_seen_at ASC",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, String>(5)?,
+            ))
+        })?;
+        let mut peers = Vec::new();
+        for row in rows {
+            let row = row?;
+            peers.push(FederationPeerView {
+                node_id: row.0,
+                node_public_key: row.1,
+                first_seen_at: parse_timestamp(&row.2)?,
+                last_seen_at: parse_timestamp(&row.3)?,
+                cursor: row.4,
+                event_hash: row.5,
+            });
+        }
+        Ok(peers)
+    }
+
+    pub fn remote_events(
+        &self,
+        origin_node_id: &str,
+        after: i64,
+        limit: usize,
+    ) -> Result<Vec<OriginEvent>> {
+        if after < 0 {
+            return Err(CommonwakeError::Validation(
+                "remote event cursor cannot be negative".into(),
+            ));
+        }
+        let connection = self.lock()?;
+        let mut statement = connection.prepare(
+            "SELECT origin_sequence, event_id, kind, lineage_id, delegation_id,
+                    created_at, received_at, canonical_json, previous_hash,
+                    event_hash, node_signature
+             FROM remote_events
+             WHERE origin_node_id = ?1 AND origin_sequence > ?2
+             ORDER BY origin_sequence ASC LIMIT ?3",
+        )?;
+        let rows = statement.query_map(
+            params![origin_node_id, after, limit as i64],
+            remote_origin_event_from_row,
+        )?;
+        let mut events = Vec::new();
+        for row in rows {
+            events.push(row?);
+        }
+        Ok(events)
+    }
+
+    pub fn relayed_federation_bundle(
+        &self,
+        origin_node_id: &str,
+        after: i64,
+        limit: usize,
+    ) -> Result<FederationBundle> {
+        if after < 0 {
+            return Err(CommonwakeError::Validation(
+                "federation cursor cannot be negative".into(),
+            ));
+        }
+        let connection = self.lock()?;
+        let (origin_node_public_key, head): (String, i64) = connection
+            .query_row(
+                "SELECT node_public_key, cursor FROM federation_peers WHERE node_id = ?1",
+                [origin_node_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?
+            .ok_or_else(|| {
+                CommonwakeError::NotFound(format!("federated origin {origin_node_id}"))
+            })?;
+        if after > head {
+            return Err(CommonwakeError::Validation(format!(
+                "federation cursor {after} is beyond retained origin head {head}"
+            )));
+        }
+        let requested_end = after
+            .saturating_add(limit.clamp(1, crate::federation::MAX_FEDERATION_EVENTS) as i64)
+            .min(head);
+        let through_cursor = if after == head {
+            head
+        } else {
+            connection
+                .query_row(
+                    "SELECT MAX(cursor) FROM remote_checkpoints
+                     WHERE origin_node_id = ?1 AND cursor > ?2 AND cursor <= ?3",
+                    params![origin_node_id, after, requested_end],
+                    |row| row.get::<_, Option<i64>>(0),
+                )?
+                .or(connection.query_row(
+                    "SELECT MIN(cursor) FROM remote_checkpoints
+                     WHERE origin_node_id = ?1 AND cursor > ?2",
+                    params![origin_node_id, after],
+                    |row| row.get::<_, Option<i64>>(0),
+                )?)
+                .ok_or_else(|| {
+                    CommonwakeError::Internal(
+                        "retained origin has no checkpoint beyond its stored cursor".into(),
+                    )
+                })?
+        };
+        let checkpoint_json: String = connection
+            .query_row(
+                "SELECT checkpoint_json FROM remote_checkpoints
+                 WHERE origin_node_id = ?1 AND cursor = ?2
+                 ORDER BY imported_at DESC LIMIT 1",
+                params![origin_node_id, through_cursor],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| {
+                CommonwakeError::Internal(format!(
+                    "retained origin checkpoint {origin_node_id}/{through_cursor} is missing"
+                ))
+            })?;
+        let checkpoint = serde_json::from_str(&checkpoint_json)?;
+        let mut statement = connection.prepare(
+            "SELECT origin_sequence, event_id, kind, lineage_id, delegation_id,
+                    created_at, received_at, canonical_json, previous_hash,
+                    event_hash, node_signature
+             FROM remote_events
+             WHERE origin_node_id = ?1 AND origin_sequence > ?2 AND origin_sequence <= ?3
+             ORDER BY origin_sequence ASC",
+        )?;
+        let rows = statement.query_map(
+            params![origin_node_id, after, through_cursor],
+            remote_origin_event_from_row,
+        )?;
+        let mut events = Vec::new();
+        for row in rows {
+            events.push(row?);
+        }
+        let bundle = FederationBundle {
+            protocol: crate::PROTOCOL_VERSION.into(),
+            origin_node_id: origin_node_id.into(),
+            origin_node_public_key,
+            from_cursor: after,
+            through_cursor,
+            events,
+            checkpoint,
+        };
+        crate::federation::verify_bundle(&bundle)?;
+        Ok(bundle)
+    }
+
+    pub fn equivocation_evidence(&self) -> Result<Vec<EquivocationEvidenceView>> {
+        let connection = self.lock()?;
+        let mut statement = connection.prepare(
+            "SELECT evidence_id, origin_node_id, conflict_kind, cursor, existing_hash,
+                    incoming_hash, existing_json, incoming_json, detected_at
+             FROM equivocation_evidence ORDER BY detected_at ASC",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, String>(7)?,
+                row.get::<_, String>(8)?,
+            ))
+        })?;
+        let mut evidence = Vec::new();
+        for row in rows {
+            let row = row?;
+            evidence.push(EquivocationEvidenceView {
+                evidence_id: row.0,
+                origin_node_id: row.1,
+                conflict_kind: row.2,
+                cursor: row.3,
+                existing_hash: row.4,
+                incoming_hash: row.5,
+                existing: serde_json::from_str(&row.6)?,
+                incoming: serde_json::from_str(&row.7)?,
+                detected_at: parse_timestamp(&row.8)?,
+            });
+        }
+        Ok(evidence)
+    }
+
+    pub fn federated_stories(
+        &self,
+        origin_node_id: Option<&str>,
+        after: i64,
+        limit: usize,
+        stage: Option<&str>,
+    ) -> Result<FederatedFeedPage> {
+        if after < 0 {
+            return Err(CommonwakeError::Validation(
+                "federated feed cursor cannot be negative".into(),
+            ));
+        }
+        if origin_node_id.is_none() && after != 0 {
+            return Err(CommonwakeError::Validation(
+                "federated_after requires origin_node_id; there is no fabricated global origin cursor"
+                    .into(),
+            ));
+        }
+        let connection = self.lock()?;
+        let mut ids = Vec::new();
+        if let Some(origin_node_id) = origin_node_id {
+            let mut statement = connection.prepare(
+                "SELECT origin_node_id, story_id, created_sequence FROM federated_stories
+                 WHERE origin_node_id = ?1 AND merged_into IS NULL AND created_sequence > ?2
+                 ORDER BY created_sequence ASC LIMIT ?3",
+            )?;
+            let rows =
+                statement.query_map(params![origin_node_id, after, (limit + 1) as i64], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                })?;
+            for row in rows {
+                ids.push(row?);
+            }
+        } else {
+            let mut statement = connection.prepare(
+                "SELECT origin_node_id, story_id, created_sequence FROM federated_stories
+                 WHERE merged_into IS NULL
+                 ORDER BY first_seen_at ASC, origin_node_id ASC, created_sequence ASC LIMIT ?1",
+            )?;
+            let rows = statement.query_map([(limit + 1) as i64], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })?;
+            for row in rows {
+                ids.push(row?);
+            }
+        }
+        let has_more = ids.len() > limit;
+        ids.truncate(limit);
+        let mut stories = Vec::new();
+        let mut next_cursor = after;
+        for (origin, story_id, cursor) in ids {
+            let story = federated_story_view(&connection, &origin, &story_id)?;
+            next_cursor = next_cursor.max(cursor);
+            if stage.is_none_or(|wanted| wanted == story.stage) {
+                stories.push(story);
+            }
+        }
+        Ok(FederatedFeedPage {
+            origin_node_id: origin_node_id.map(str::to_owned),
+            stories,
+            after: origin_node_id.map(|_| after),
+            next_cursor: origin_node_id.map(|_| next_cursor),
+            has_more,
+            pagination_notice: if origin_node_id.is_some() {
+                "Pass this origin_node_id and federated_after=next_cursor to continue snapshot traversal. This is the story-creation sequence at that origin, not wall-clock time or an incremental change cursor; use lineage orientation for changed-story replay."
+            } else {
+                "This is a bounded multi-origin preview. Enumerate /v1/federation/peers and request each origin_node_id separately for complete cursor-based traversal; Commonwake does not invent a global order."
+            }
+            .into(),
+        })
     }
 
     pub fn pulse_counts(&self, lineage_id: &str, after: i64) -> Result<(i64, i64)> {
@@ -838,7 +1963,10 @@ impl Database {
             params![after, lineage_id],
             |row| row.get(0),
         )?;
-        let world: i64 = changed_story_ids(&connection, after, i64::MAX)?.len() as i64;
+        let local_world = changed_story_ids(&connection, after, i64::MAX)?.len();
+        let federated_world = federated_changed_story_ids(&connection, after, i64::MAX)?.len();
+        let world = i64::try_from(local_world + federated_world)
+            .map_err(|_| CommonwakeError::Internal("world change count overflowed".into()))?;
         Ok((directed, world))
     }
 
@@ -847,7 +1975,8 @@ impl Database {
         let mut statement = connection.prepare(
             "SELECT sequence, event_id, kind, lineage_id, delegation_id, created_at,
                     received_at, targets_json, supersedes_json, payload_json,
-                    canonical_json, author_signature, previous_hash, event_hash, node_signature
+                    canonical_json, author_signature, previous_hash, event_hash, node_signature,
+                    author_nonce
              FROM events ORDER BY sequence ASC",
         )?;
         let rows = statement.query_map([], raw_event_from_row)?;
@@ -855,8 +1984,14 @@ impl Database {
         let mut previous = [0_u8; 32];
         let mut cursor = 0;
         let mut head = ZERO_HASH.to_owned();
-        for row in rows {
+        for (expected_sequence, row) in (1_i64..).zip(rows) {
             let row = row?;
+            if row.sequence != expected_sequence {
+                return Err(CommonwakeError::Unauthorized(format!(
+                    "event sequence {} is not the expected contiguous sequence {expected_sequence}",
+                    row.sequence
+                )));
+            }
             if row.previous_hash != hex::encode(previous) {
                 return Err(CommonwakeError::Unauthorized(format!(
                     "event {} has a broken previous hash",
@@ -878,6 +2013,7 @@ impl Database {
                     row.sequence
                 ))
             })?;
+            validate_raw_event_projection(&row)?;
             previous = expected;
             cursor = row.sequence;
             head = row.event_hash;
@@ -889,7 +2025,9 @@ impl Database {
 fn lineage_from_connection(connection: &Connection, lineage_id: &str) -> Result<LineageView> {
     let raw = connection
         .query_row(
-            "SELECT lineage_id, display_name, public_key, created_at, registered_sequence
+            "SELECT lineage_id, display_name, public_key, created_at, registered_sequence,
+                    (SELECT COALESCE(MAX(key_version), 0) FROM lineage_keys k
+                     WHERE k.lineage_id = lineages.lineage_id)
              FROM lineages WHERE lineage_id = ?1",
             [lineage_id],
             |row| {
@@ -899,6 +2037,7 @@ fn lineage_from_connection(connection: &Connection, lineage_id: &str) -> Result<
                     row.get::<_, String>(2)?,
                     row.get::<_, String>(3)?,
                     row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
                 ))
             },
         )
@@ -910,6 +2049,7 @@ fn lineage_from_connection(connection: &Connection, lineage_id: &str) -> Result<
         public_key: raw.2,
         created_at: parse_timestamp(&raw.3)?,
         registered_sequence: raw.4,
+        key_version: raw.5,
     })
 }
 
@@ -918,6 +2058,11 @@ fn append_event(
     identity: &NodeIdentity,
     input: &EventInput,
 ) -> Result<AcceptedObject> {
+    if input.canonical_json.len() > MAX_CANONICAL_OBJECT_BYTES {
+        return Err(CommonwakeError::Validation(format!(
+            "canonical protocol object exceeds {MAX_CANONICAL_OBJECT_BYTES} bytes"
+        )));
+    }
     let previous_hash: String = transaction
         .query_row(
             "SELECT event_hash FROM events ORDER BY sequence DESC LIMIT 1",
@@ -993,11 +2138,1170 @@ fn canonical_log_record(row: &RawEvent) -> Result<Vec<u8>> {
     .map_err(|error| CommonwakeError::Internal(format!("canonical event failed: {error}")))
 }
 
+fn validate_raw_event_projection(row: &RawEvent) -> Result<()> {
+    let canonical: Value = serde_json::from_str(&row.canonical_json)?;
+    let canonical_bytes = serde_jcs::to_vec(&canonical)
+        .map_err(|error| CommonwakeError::Internal(format!("canonical JSON failed: {error}")))?;
+    if canonical_bytes.as_slice() != row.canonical_json.as_bytes() {
+        return Err(CommonwakeError::Unauthorized(format!(
+            "event {} canonical JSON is not in canonical form",
+            row.sequence
+        )));
+    }
+    if prefixed_id("cwevt_", &canonical_bytes) != row.event_id {
+        return Err(CommonwakeError::Unauthorized(format!(
+            "event {} has an invalid content id",
+            row.sequence
+        )));
+    }
+
+    let expected = expected_projection(row, canonical)?;
+    let stored_targets: Vec<String> = serde_json::from_str(&row.targets_json)?;
+    let stored_supersedes: Vec<String> = serde_json::from_str(&row.supersedes_json)?;
+    let stored_payload: Value = serde_json::from_str(&row.payload_json)?;
+    if stored_targets != expected.targets
+        || stored_supersedes != expected.supersedes
+        || stored_payload != expected.payload
+        || row.author_signature != expected.author_signature
+        || row.author_nonce != expected.author_nonce
+    {
+        return Err(CommonwakeError::Unauthorized(format!(
+            "event {} mutable projection differs from its authenticated canonical object",
+            row.sequence
+        )));
+    }
+    Ok(())
+}
+
+fn expected_projection(row: &RawEvent, canonical: Value) -> Result<AuthenticatedProjection> {
+    match row.kind.as_str() {
+        "lineage_registered" => {
+            let object: LineageRegistration = serde_json::from_value(canonical.clone())?;
+            let key = verifying_key_from_b64(&object.public_key)?;
+            Ok(AuthenticatedProjection {
+                targets: vec![lineage_id(&key)],
+                supersedes: vec![],
+                payload: canonical,
+                author_signature: Some(object.signature),
+                author_nonce: Some(object.nonce),
+            })
+        }
+        "delegation_registered" => {
+            let object: SessionDelegation = serde_json::from_value(canonical.clone())?;
+            let id = prefixed_id("cwdel_", &canonical_without_signature(&object)?);
+            Ok(AuthenticatedProjection {
+                targets: vec![id],
+                supersedes: vec![],
+                payload: canonical,
+                author_signature: Some(object.signature),
+                author_nonce: Some(object.nonce),
+            })
+        }
+        "delegation_revoked" => {
+            let object: DelegationRevocation = serde_json::from_value(canonical.clone())?;
+            Ok(AuthenticatedProjection {
+                targets: vec![object.delegation_id.clone()],
+                supersedes: vec![],
+                payload: canonical,
+                author_signature: Some(object.signature),
+                author_nonce: Some(object.nonce),
+            })
+        }
+        "lineage_key_rotated" => {
+            let object: SignedKeyRotation = serde_json::from_value(canonical.clone())?;
+            Ok(AuthenticatedProjection {
+                targets: vec![object.statement.lineage_id.clone()],
+                supersedes: vec![],
+                payload: canonical,
+                author_signature: Some(object.previous_signature),
+                author_nonce: Some(object.statement.nonce),
+            })
+        }
+        "acknowledgement" => {
+            let object: SignedAcknowledgement = serde_json::from_value(canonical.clone())?;
+            let lineage_id = row.lineage_id.clone().ok_or_else(|| {
+                CommonwakeError::Unauthorized("acknowledgement has no lineage metadata".into())
+            })?;
+            Ok(AuthenticatedProjection {
+                targets: vec![lineage_id],
+                supersedes: vec![],
+                payload: canonical,
+                author_signature: Some(object.signature),
+                author_nonce: Some(object.nonce),
+            })
+        }
+        "observation" => {
+            let payload = canonical.get("payload").cloned().ok_or_else(|| {
+                CommonwakeError::Unauthorized("observation payload is missing".into())
+            })?;
+            let object: FederatedObservationEnvelope = serde_json::from_value(canonical.clone())?;
+            Ok(AuthenticatedProjection {
+                targets: vec![
+                    object.payload.story_id.clone(),
+                    object.payload.source_id.clone(),
+                ],
+                supersedes: vec![],
+                payload,
+                author_signature: None,
+                author_nonce: None,
+            })
+        }
+        "checkpoint_witnessed" => {
+            let object: CheckpointWitness = serde_json::from_value(canonical.clone())?;
+            Ok(AuthenticatedProjection {
+                targets: vec![object.origin_node_id.clone()],
+                supersedes: vec![],
+                payload: canonical,
+                author_signature: Some(object.signature),
+                author_nonce: None,
+            })
+        }
+        _ => {
+            let object: SignedContribution = serde_json::from_value(canonical)?;
+            if object.kind.as_str() != row.kind {
+                return Err(CommonwakeError::Unauthorized(format!(
+                    "event {} kind differs from its signed contribution",
+                    row.sequence
+                )));
+            }
+            Ok(AuthenticatedProjection {
+                targets: object.targets,
+                supersedes: object.supersedes,
+                payload: object.payload,
+                author_signature: Some(object.signature),
+                author_nonce: Some(object.nonce),
+            })
+        }
+    }
+}
+
+fn record_equivocation(transaction: &Transaction<'_>, input: &EquivocationInput<'_>) -> Result<()> {
+    let evidence_id = prefixed_id(
+        "cweq_",
+        format!(
+            "{}\0{}\0{}\0{}\0{}",
+            input.origin_node_id,
+            input.conflict_kind,
+            input.cursor,
+            input.existing_hash,
+            input.incoming_hash,
+        )
+        .as_bytes(),
+    );
+    transaction.execute(
+        "INSERT OR IGNORE INTO equivocation_evidence(
+            evidence_id, origin_node_id, conflict_kind, cursor, existing_hash,
+            incoming_hash, existing_json, incoming_json, detected_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            evidence_id,
+            input.origin_node_id,
+            input.conflict_kind,
+            input.cursor,
+            input.existing_hash,
+            input.incoming_hash,
+            input.existing_json,
+            input.incoming_json,
+            timestamp(Utc::now()),
+        ],
+    )?;
+    Ok(())
+}
+
+fn validate_and_project_remote_event(
+    transaction: &Transaction<'_>,
+    origin_node_id: &str,
+    event: &OriginEvent,
+) -> Result<Option<String>> {
+    match event.kind.as_str() {
+        "lineage_registered" => {
+            let registration: LineageRegistration =
+                serde_json::from_value(event.canonical.clone())?;
+            require_remote_protocol(&registration.protocol)?;
+            require_remote_event_metadata(event, None, None, registration.created_at)?;
+            validate_display_name(&registration.display_name)?;
+            require_nonce(&registration.nonce)?;
+            validate_authored_time_at(registration.created_at, remote_received_at(event)?)?;
+            let key = verifying_key_from_b64(&registration.public_key)?;
+            verify_object(&key, LINEAGE_DOMAIN, &registration, &registration.signature)?;
+            let registered_lineage_id = lineage_id(&key);
+            if transaction
+                .query_row(
+                    "SELECT 1 FROM federated_lineage_keys
+                     WHERE origin_node_id = ?1 AND public_key = ?2",
+                    params![origin_node_id, registration.public_key],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some()
+            {
+                return Err(CommonwakeError::Conflict(
+                    "remote lineage public key is reused".into(),
+                ));
+            }
+            transaction.execute(
+                "INSERT INTO federated_lineages(
+                    origin_node_id, lineage_id, display_name, current_public_key,
+                    created_at, registered_sequence, key_version
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0)",
+                params![
+                    origin_node_id,
+                    registered_lineage_id,
+                    registration.display_name,
+                    registration.public_key,
+                    timestamp(registration.created_at),
+                    event.sequence,
+                ],
+            )?;
+            transaction.execute(
+                "INSERT INTO federated_lineage_keys(
+                    origin_node_id, lineage_id, key_version, public_key, valid_from_sequence
+                 ) VALUES (?1, ?2, 0, ?3, ?4)",
+                params![
+                    origin_node_id,
+                    registered_lineage_id,
+                    registration.public_key,
+                    event.sequence,
+                ],
+            )?;
+            Ok(Some(registration.nonce))
+        }
+        "delegation_registered" => {
+            let delegation: SessionDelegation = serde_json::from_value(event.canonical.clone())?;
+            require_remote_protocol(&delegation.protocol)?;
+            require_remote_event_metadata(
+                event,
+                Some(&delegation.lineage_id),
+                None,
+                delegation.not_before,
+            )?;
+            validate_delegation_at(&delegation, remote_received_at(event)?)?;
+            let current_key: String = transaction
+                .query_row(
+                    "SELECT current_public_key FROM federated_lineages
+                     WHERE origin_node_id = ?1 AND lineage_id = ?2",
+                    params![origin_node_id, delegation.lineage_id],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .ok_or_else(|| {
+                    CommonwakeError::Unauthorized(
+                        "remote delegation refers to an unknown lineage".into(),
+                    )
+                })?;
+            let key = verifying_key_from_b64(&current_key)?;
+            verify_object(&key, DELEGATION_DOMAIN, &delegation, &delegation.signature)?;
+            let delegation_id = prefixed_id("cwdel_", &canonical_without_signature(&delegation)?);
+            transaction.execute(
+                "INSERT INTO federated_delegations(
+                    origin_node_id, delegation_id, lineage_id, session_public_key,
+                    scopes_json, not_before, expires_at, registered_sequence
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    origin_node_id,
+                    delegation_id,
+                    delegation.lineage_id,
+                    delegation.session_public_key,
+                    serde_json::to_string(&delegation.scopes)?,
+                    timestamp(delegation.not_before),
+                    timestamp(delegation.expires_at),
+                    event.sequence,
+                ],
+            )?;
+            Ok(Some(delegation.nonce))
+        }
+        "delegation_revoked" => {
+            let revocation: DelegationRevocation = serde_json::from_value(event.canonical.clone())?;
+            require_remote_protocol(&revocation.protocol)?;
+            require_remote_event_metadata(
+                event,
+                Some(&revocation.lineage_id),
+                None,
+                revocation.created_at,
+            )?;
+            validate_authority_change_at(
+                &revocation.nonce,
+                &revocation.reason,
+                revocation.created_at,
+                remote_received_at(event)?,
+            )?;
+            let current_key: String = transaction
+                .query_row(
+                    "SELECT current_public_key FROM federated_lineages
+                     WHERE origin_node_id = ?1 AND lineage_id = ?2",
+                    params![origin_node_id, revocation.lineage_id],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .ok_or_else(|| {
+                    CommonwakeError::Unauthorized(
+                        "remote revocation refers to an unknown lineage".into(),
+                    )
+                })?;
+            verify_object(
+                &verifying_key_from_b64(&current_key)?,
+                REVOCATION_DOMAIN,
+                &revocation,
+                &revocation.signature,
+            )?;
+            let changed = transaction.execute(
+                "UPDATE federated_delegations SET revoked_sequence = ?4
+                 WHERE origin_node_id = ?1 AND delegation_id = ?2 AND lineage_id = ?3
+                   AND revoked_sequence IS NULL",
+                params![
+                    origin_node_id,
+                    revocation.delegation_id,
+                    revocation.lineage_id,
+                    event.sequence,
+                ],
+            )?;
+            if changed != 1 {
+                return Err(CommonwakeError::Unauthorized(
+                    "remote revocation does not name one active delegation owned by its lineage"
+                        .into(),
+                ));
+            }
+            Ok(Some(revocation.nonce))
+        }
+        "lineage_key_rotated" => {
+            let rotation: SignedKeyRotation = serde_json::from_value(event.canonical.clone())?;
+            let statement = &rotation.statement;
+            require_remote_protocol(&statement.protocol)?;
+            require_remote_event_metadata(
+                event,
+                Some(&statement.lineage_id),
+                None,
+                statement.created_at,
+            )?;
+            validate_authority_change_at(
+                &statement.nonce,
+                &statement.reason,
+                statement.created_at,
+                remote_received_at(event)?,
+            )?;
+            let (current_key, current_version): (String, i64) = transaction
+                .query_row(
+                    "SELECT current_public_key, key_version FROM federated_lineages
+                     WHERE origin_node_id = ?1 AND lineage_id = ?2",
+                    params![origin_node_id, statement.lineage_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?
+                .ok_or_else(|| {
+                    CommonwakeError::Unauthorized(
+                        "remote rotation refers to an unknown lineage".into(),
+                    )
+                })?;
+            if current_key != statement.previous_public_key
+                || statement.previous_public_key == statement.new_public_key
+            {
+                return Err(CommonwakeError::Unauthorized(
+                    "remote rotation does not advance the current lineage key".into(),
+                ));
+            }
+            let previous_key = verifying_key_from_b64(&statement.previous_public_key)?;
+            let new_key = verifying_key_from_b64(&statement.new_public_key)?;
+            verify_object(
+                &previous_key,
+                KEY_ROTATION_DOMAIN,
+                statement,
+                &rotation.previous_signature,
+            )?;
+            verify_object(
+                &new_key,
+                KEY_ROTATION_DOMAIN,
+                statement,
+                &rotation.new_signature,
+            )?;
+            if transaction
+                .query_row(
+                    "SELECT 1 FROM federated_lineage_keys
+                     WHERE origin_node_id = ?1 AND public_key = ?2",
+                    params![origin_node_id, statement.new_public_key],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some()
+            {
+                return Err(CommonwakeError::Conflict(
+                    "remote rotation reuses a historical lineage key".into(),
+                ));
+            }
+            transaction.execute(
+                "UPDATE federated_lineage_keys SET valid_to_sequence = ?3
+                 WHERE origin_node_id = ?1 AND lineage_id = ?2 AND valid_to_sequence IS NULL",
+                params![origin_node_id, statement.lineage_id, event.sequence],
+            )?;
+            transaction.execute(
+                "UPDATE federated_lineages SET current_public_key = ?3, key_version = ?4
+                 WHERE origin_node_id = ?1 AND lineage_id = ?2",
+                params![
+                    origin_node_id,
+                    statement.lineage_id,
+                    statement.new_public_key,
+                    current_version + 1,
+                ],
+            )?;
+            transaction.execute(
+                "INSERT INTO federated_lineage_keys(
+                    origin_node_id, lineage_id, key_version, public_key, valid_from_sequence
+                 ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    origin_node_id,
+                    statement.lineage_id,
+                    current_version + 1,
+                    statement.new_public_key,
+                    event.sequence,
+                ],
+            )?;
+            if statement.revoke_existing_delegations {
+                transaction.execute(
+                    "UPDATE federated_delegations SET revoked_sequence = ?3
+                     WHERE origin_node_id = ?1 AND lineage_id = ?2
+                       AND revoked_sequence IS NULL",
+                    params![origin_node_id, statement.lineage_id, event.sequence],
+                )?;
+            }
+            Ok(Some(statement.nonce.clone()))
+        }
+        "acknowledgement" => {
+            let acknowledgement: SignedAcknowledgement =
+                serde_json::from_value(event.canonical.clone())?;
+            require_remote_protocol(&acknowledgement.protocol)?;
+            require_nonce(&acknowledgement.nonce)?;
+            validate_memory_provenance(&acknowledgement.memory_provenance.statement)?;
+            let received_at = remote_received_at(event)?;
+            validate_authored_time_at(acknowledgement.created_at, received_at)?;
+            let (lineage_id, session_key) = authorize_remote_delegation(
+                transaction,
+                origin_node_id,
+                &acknowledgement.delegation_id,
+                Scope::Ack,
+                acknowledgement.created_at,
+                received_at,
+            )?;
+            require_remote_event_metadata(
+                event,
+                Some(&lineage_id),
+                Some(&acknowledgement.delegation_id),
+                acknowledgement.created_at,
+            )?;
+            validate_remote_ack_cursor(
+                transaction,
+                origin_node_id,
+                &lineage_id,
+                event.sequence,
+                acknowledgement.cursor,
+            )?;
+            verify_object(
+                &verifying_key_from_b64(&session_key)?,
+                ACK_DOMAIN,
+                &acknowledgement,
+                &acknowledgement.signature,
+            )?;
+            Ok(Some(acknowledgement.nonce))
+        }
+        "observation" => {
+            let observation: FederatedObservationEnvelope =
+                serde_json::from_value(event.canonical.clone())?;
+            require_remote_protocol(&observation.protocol)?;
+            if observation.kind != "observation" {
+                return Err(CommonwakeError::Validation(
+                    "remote observation envelope has the wrong kind".into(),
+                ));
+            }
+            require_remote_event_metadata(event, None, None, observation.payload.retrieved_at)?;
+            validate_authored_time_at(
+                observation.payload.retrieved_at,
+                remote_received_at(event)?,
+            )?;
+            project_federated_observation(
+                transaction,
+                origin_node_id,
+                event.sequence,
+                &observation.payload,
+            )?;
+            Ok(None)
+        }
+        "checkpoint_witnessed" => {
+            let witness: CheckpointWitness = serde_json::from_value(event.canonical.clone())?;
+            require_remote_protocol(&witness.protocol)?;
+            require_remote_event_metadata(event, None, None, witness.observed_at)?;
+            crate::federation::verify_checkpoint(&witness.origin_checkpoint)?;
+            if witness.origin_checkpoint.node_id != witness.origin_node_id
+                || witness.origin_checkpoint.node_public_key != witness.origin_node_public_key
+                || witness.origin_checkpoint.cursor != witness.cursor
+                || witness.origin_checkpoint.event_hash != witness.event_hash
+            {
+                return Err(CommonwakeError::Unauthorized(
+                    "remote checkpoint witness summary differs from its signed origin checkpoint"
+                        .into(),
+                ));
+            }
+            let witness_key = verifying_key_from_b64(&witness.witness_node_public_key)?;
+            if prefixed_id("cwnode_", &witness_key.to_bytes()) != witness.witness_node_id
+                || witness.witness_node_id != origin_node_id
+            {
+                return Err(CommonwakeError::Unauthorized(
+                    "remote checkpoint witness misstates its witnessing node".into(),
+                ));
+            }
+            verify_object(&witness_key, WITNESS_DOMAIN, &witness, &witness.signature)?;
+            Ok(None)
+        }
+        _ => {
+            let contribution: SignedContribution = serde_json::from_value(event.canonical.clone())?;
+            require_remote_protocol(&contribution.protocol)?;
+            require_nonce(&contribution.nonce)?;
+            validate_lists(&contribution.targets, &contribution.supersedes)?;
+            if event.kind != contribution.kind.as_str() {
+                return Err(CommonwakeError::Unauthorized(
+                    "remote contribution kind differs from its canonical signed object".into(),
+                ));
+            }
+            let received_at = remote_received_at(event)?;
+            validate_authored_time_at(contribution.created_at, received_at)?;
+            let (lineage_id, session_key) = authorize_remote_delegation(
+                transaction,
+                origin_node_id,
+                &contribution.delegation_id,
+                contribution.kind.required_scope(),
+                contribution.created_at,
+                received_at,
+            )?;
+            require_remote_event_metadata(
+                event,
+                Some(&lineage_id),
+                Some(&contribution.delegation_id),
+                contribution.created_at,
+            )?;
+            verify_object(
+                &verifying_key_from_b64(&session_key)?,
+                CONTRIBUTION_DOMAIN,
+                &contribution,
+                &contribution.signature,
+            )?;
+            apply_federated_contribution(
+                transaction,
+                origin_node_id,
+                &lineage_id,
+                event,
+                &contribution,
+            )?;
+            Ok(Some(contribution.nonce))
+        }
+    }
+}
+
+fn require_remote_protocol(protocol: &str) -> Result<()> {
+    if protocol != crate::PROTOCOL_VERSION {
+        return Err(CommonwakeError::Validation(format!(
+            "remote object uses unsupported protocol {protocol}"
+        )));
+    }
+    Ok(())
+}
+
+fn require_remote_event_metadata(
+    event: &OriginEvent,
+    lineage_id: Option<&str>,
+    delegation_id: Option<&str>,
+    created_at: DateTime<Utc>,
+) -> Result<()> {
+    if event.lineage_id.as_deref() != lineage_id
+        || event.delegation_id.as_deref() != delegation_id
+        || event.created_at != timestamp(created_at)
+    {
+        return Err(CommonwakeError::Unauthorized(format!(
+            "remote event {} metadata differs from its canonical signed object",
+            event.sequence
+        )));
+    }
+    parse_timestamp(&event.received_at)?;
+    Ok(())
+}
+
+fn remote_received_at(event: &OriginEvent) -> Result<DateTime<Utc>> {
+    parse_timestamp(&event.received_at)
+}
+
+fn authorize_remote_delegation(
+    transaction: &Transaction<'_>,
+    origin_node_id: &str,
+    delegation_id: &str,
+    required_scope: Scope,
+    created_at: DateTime<Utc>,
+    received_at: DateTime<Utc>,
+) -> Result<(String, String)> {
+    let raw = transaction
+        .query_row(
+            "SELECT lineage_id, session_public_key, scopes_json, not_before,
+                    expires_at, revoked_sequence
+             FROM federated_delegations
+             WHERE origin_node_id = ?1 AND delegation_id = ?2",
+            params![origin_node_id, delegation_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<i64>>(5)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or_else(|| {
+            CommonwakeError::Unauthorized(
+                "remote contribution refers to an unknown delegation".into(),
+            )
+        })?;
+    let scopes: Vec<Scope> = serde_json::from_str(&raw.2)?;
+    let not_before = parse_timestamp(&raw.3)?;
+    let expires_at = parse_timestamp(&raw.4)?;
+    if raw.5.is_some()
+        || created_at < not_before
+        || created_at > expires_at
+        || received_at > expires_at + chrono::Duration::minutes(MAX_CLOCK_SKEW_MINUTES)
+        || !scopes.contains(&required_scope)
+    {
+        return Err(CommonwakeError::Unauthorized(
+            "remote contribution is outside its delegation authority".into(),
+        ));
+    }
+    Ok((raw.0, raw.1))
+}
+
+fn validate_remote_ack_cursor(
+    transaction: &Transaction<'_>,
+    origin_node_id: &str,
+    lineage_id: &str,
+    event_sequence: i64,
+    cursor: i64,
+) -> Result<()> {
+    let current_head = event_sequence - 1;
+    if cursor < 0 || cursor > current_head {
+        return Err(CommonwakeError::Validation(format!(
+            "remote acknowledgement cursor {cursor} is beyond its origin head {current_head}"
+        )));
+    }
+    let previous = transaction
+        .query_row(
+            "SELECT origin_sequence, canonical_json FROM remote_events
+             WHERE origin_node_id = ?1 AND lineage_id = ?2 AND kind = 'acknowledgement'
+             ORDER BY origin_sequence DESC LIMIT 1",
+            params![origin_node_id, lineage_id],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?;
+    if let Some((sequence, canonical_json)) = previous {
+        let previous_ack: SignedAcknowledgement = serde_json::from_str(&canonical_json)?;
+        let previous_effective = if previous_ack.cursor == sequence - 1 {
+            sequence
+        } else {
+            previous_ack.cursor
+        };
+        if cursor < previous_effective {
+            return Err(CommonwakeError::Conflict(format!(
+                "remote acknowledgement cursor cannot move backward from {previous_effective}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn project_federated_observation(
+    transaction: &Transaction<'_>,
+    origin_node_id: &str,
+    sequence: i64,
+    observation: &FederatedObservationPayload,
+) -> Result<()> {
+    if transaction
+        .query_row(
+            "SELECT 1 FROM federated_sources
+             WHERE origin_node_id = ?1 AND source_id = ?2
+               AND status IN ('probation', 'active')",
+            params![origin_node_id, observation.source_id],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_none()
+    {
+        return Err(CommonwakeError::Unauthorized(
+            "remote observation does not follow an independently reviewed source".into(),
+        ));
+    }
+    if observation.title.chars().count() > MAX_TITLE_CHARS
+        || observation.summary.chars().count() > MAX_SUMMARY_CHARS
+    {
+        return Err(CommonwakeError::Validation(
+            "remote observation exceeds collector text limits".into(),
+        ));
+    }
+    let expected_document_hash = crate::crypto::sha256_hex(
+        serde_jcs::to_vec(&json!({
+            "canonical_url": observation.canonical_url,
+            "title": observation.title,
+            "summary": observation.summary,
+            "published_at": observation.published_at,
+            "raw_metadata": observation.raw_metadata,
+        }))
+        .map_err(|error| {
+            CommonwakeError::Internal(format!("canonical remote feed item failed: {error}"))
+        })?,
+    );
+    if observation.document_hash != expected_document_hash {
+        return Err(CommonwakeError::Unauthorized(
+            "remote observation document hash does not match its canonical metadata".into(),
+        ));
+    }
+    let expected_observation_id = prefixed_id(
+        "cwobs_",
+        format!(
+            "{}\0{}\0{}",
+            observation.source_id, observation.canonical_url, observation.document_hash
+        )
+        .as_bytes(),
+    );
+    if observation.observation_id != expected_observation_id {
+        return Err(CommonwakeError::Unauthorized(
+            "remote observation id does not match its source, URL, and document hash".into(),
+        ));
+    }
+    let existing_story: Option<String> = transaction
+        .query_row(
+            "SELECT so.story_id FROM federated_observations o
+             JOIN federated_story_observations so
+               ON so.origin_node_id = o.origin_node_id
+              AND so.observation_id = o.observation_id
+             WHERE o.origin_node_id = ?1 AND o.source_id = ?2 AND o.canonical_url = ?3
+             ORDER BY o.created_sequence ASC LIMIT 1",
+            params![
+                origin_node_id,
+                observation.source_id,
+                observation.canonical_url
+            ],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let expected_story_id = existing_story
+        .unwrap_or_else(|| prefixed_id("cwstory_", observation.observation_id.as_bytes()));
+    if observation.story_id != expected_story_id {
+        return Err(CommonwakeError::Unauthorized(
+            "remote observation story id does not follow the origin clustering rule".into(),
+        ));
+    }
+    transaction.execute(
+        "INSERT OR IGNORE INTO federated_stories(
+            origin_node_id, story_id, title, first_seen_at, created_sequence
+         ) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            origin_node_id,
+            observation.story_id,
+            observation.title,
+            timestamp(observation.retrieved_at),
+            sequence,
+        ],
+    )?;
+    transaction.execute(
+        "INSERT INTO federated_observations(
+            origin_node_id, observation_id, source_id, canonical_url, title,
+            summary, published_at, retrieved_at, language, document_hash, created_sequence
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        params![
+            origin_node_id,
+            observation.observation_id,
+            observation.source_id,
+            observation.canonical_url,
+            observation.title,
+            observation.summary,
+            observation.published_at.map(timestamp),
+            timestamp(observation.retrieved_at),
+            observation.language,
+            observation.document_hash,
+            sequence,
+        ],
+    )?;
+    transaction.execute(
+        "INSERT INTO federated_story_observations(
+            origin_node_id, story_id, observation_id
+         ) VALUES (?1, ?2, ?3)",
+        params![
+            origin_node_id,
+            observation.story_id,
+            observation.observation_id
+        ],
+    )?;
+    link_federated_story_event(transaction, origin_node_id, &observation.story_id, sequence)?;
+    Ok(())
+}
+
+fn apply_federated_contribution(
+    transaction: &Transaction<'_>,
+    origin_node_id: &str,
+    lineage_id: &str,
+    event: &OriginEvent,
+    contribution: &SignedContribution,
+) -> Result<()> {
+    validate_contribution_content(contribution)?;
+    use crate::model::ContributionKind;
+    match contribution.kind {
+        ContributionKind::SourceProposal => {
+            let payload: SourceProposalPayload =
+                serde_json::from_value(contribution.payload.clone())?;
+            validate_source_proposal(&payload)?;
+            let normalized_feed = normalize_http_url(&payload.feed_url)?;
+            let source_id = prefixed_id("cwsrc_", normalized_feed.as_bytes());
+            transaction.execute(
+                "INSERT INTO federated_sources(
+                    origin_node_id, source_id, name, feed_url, homepage_url, medium,
+                    primary_regions_json, languages_json, ownership, perspective_notes,
+                    status, proposer_lineage_id, proposal_event_id, created_sequence
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+                           'proposed', ?11, ?12, ?13)",
+                params![
+                    origin_node_id,
+                    source_id,
+                    payload.name,
+                    normalized_feed,
+                    payload
+                        .homepage_url
+                        .map(|url| normalize_http_url(&url))
+                        .transpose()?,
+                    payload.medium,
+                    serde_json::to_string(&payload.primary_regions)?,
+                    serde_json::to_string(&payload.languages)?,
+                    payload.ownership,
+                    payload.perspective_notes,
+                    lineage_id,
+                    event.event_id,
+                    event.sequence,
+                ],
+            )?;
+        }
+        ContributionKind::SourceReview => {
+            let payload: SourceReviewPayload =
+                serde_json::from_value(contribution.payload.clone())?;
+            let proposer: String = transaction
+                .query_row(
+                    "SELECT proposer_lineage_id FROM federated_sources
+                     WHERE origin_node_id = ?1 AND source_id = ?2",
+                    params![origin_node_id, payload.source_id],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .ok_or_else(|| {
+                    CommonwakeError::Unauthorized(
+                        "remote review refers to an unknown source".into(),
+                    )
+                })?;
+            if proposer == lineage_id || payload.evidence.is_empty() {
+                return Err(CommonwakeError::Unauthorized(
+                    "remote source review is not independent and evidence-bearing".into(),
+                ));
+            }
+            transaction.execute(
+                "INSERT INTO federated_source_reviews(
+                    origin_node_id, source_id, reviewer_lineage_id, event_id,
+                    recommendation, evidence_json, notes, created_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT(origin_node_id, source_id, reviewer_lineage_id) DO UPDATE SET
+                    event_id = excluded.event_id,
+                    recommendation = excluded.recommendation,
+                    evidence_json = excluded.evidence_json,
+                    notes = excluded.notes,
+                    created_at = excluded.created_at",
+                params![
+                    origin_node_id,
+                    payload.source_id,
+                    lineage_id,
+                    event.event_id,
+                    payload.recommendation.as_str(),
+                    serde_json::to_string(&payload.evidence)?,
+                    payload.notes,
+                    timestamp(contribution.created_at),
+                ],
+            )?;
+            let approvals: i64 = transaction.query_row(
+                "SELECT COUNT(*) FROM federated_source_reviews
+                 WHERE origin_node_id = ?1 AND source_id = ?2 AND recommendation = 'approve'",
+                params![origin_node_id, payload.source_id],
+                |row| row.get(0),
+            )?;
+            if approvals >= 2 {
+                transaction.execute(
+                    "UPDATE federated_sources SET status = 'probation'
+                     WHERE origin_node_id = ?1 AND source_id = ?2 AND status = 'proposed'",
+                    params![origin_node_id, payload.source_id],
+                )?;
+            }
+        }
+        ContributionKind::ObservationVerification => {
+            let payload: ObservationVerificationPayload =
+                serde_json::from_value(contribution.payload.clone())?;
+            if transaction
+                .query_row(
+                    "SELECT 1 FROM federated_observations
+                     WHERE origin_node_id = ?1 AND observation_id = ?2",
+                    params![origin_node_id, payload.observation_id],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_none()
+            {
+                return Err(CommonwakeError::Unauthorized(
+                    "remote verification refers to an unknown observation".into(),
+                ));
+            }
+            transaction.execute(
+                "INSERT INTO federated_verifications(
+                    origin_node_id, observation_id, verifier_lineage_id, event_id,
+                    outcome, notes, evidence_json, created_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT(origin_node_id, observation_id, verifier_lineage_id) DO UPDATE SET
+                    event_id = excluded.event_id,
+                    outcome = excluded.outcome,
+                    notes = excluded.notes,
+                    evidence_json = excluded.evidence_json,
+                    created_at = excluded.created_at",
+                params![
+                    origin_node_id,
+                    payload.observation_id,
+                    lineage_id,
+                    event.event_id,
+                    payload.outcome.as_str(),
+                    payload.notes,
+                    serde_json::to_string(&payload.evidence)?,
+                    timestamp(contribution.created_at),
+                ],
+            )?;
+            let story_id: String = transaction.query_row(
+                "SELECT story_id FROM federated_story_observations
+                 WHERE origin_node_id = ?1 AND observation_id = ?2",
+                params![origin_node_id, payload.observation_id],
+                |row| row.get(0),
+            )?;
+            link_federated_story_event(transaction, origin_node_id, &story_id, event.sequence)?;
+        }
+        ContributionKind::StoryLink => {
+            let payload: StoryLinkPayload = serde_json::from_value(contribution.payload.clone())?;
+            if payload.observation_ids.is_empty() {
+                return Err(CommonwakeError::Validation(
+                    "remote story link must name at least one observation".into(),
+                ));
+            }
+            if transaction
+                .query_row(
+                    "SELECT 1 FROM federated_stories
+                     WHERE origin_node_id = ?1 AND story_id = ?2 AND merged_into IS NULL",
+                    params![origin_node_id, payload.story_id],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_none()
+            {
+                return Err(CommonwakeError::Unauthorized(
+                    "remote story link refers to an unknown story".into(),
+                ));
+            }
+            for observation_id in &payload.observation_ids {
+                let old_story: String = transaction
+                    .query_row(
+                        "SELECT story_id FROM federated_story_observations
+                         WHERE origin_node_id = ?1 AND observation_id = ?2",
+                        params![origin_node_id, observation_id],
+                        |row| row.get(0),
+                    )
+                    .optional()?
+                    .ok_or_else(|| {
+                        CommonwakeError::Unauthorized(
+                            "remote story link refers to an unknown observation".into(),
+                        )
+                    })?;
+                if old_story != payload.story_id {
+                    transaction.execute(
+                        "UPDATE federated_story_observations
+                         SET story_id = ?3, linked_event_id = ?4
+                         WHERE origin_node_id = ?1 AND observation_id = ?2",
+                        params![
+                            origin_node_id,
+                            observation_id,
+                            payload.story_id,
+                            event.event_id
+                        ],
+                    )?;
+                    let remaining: i64 = transaction.query_row(
+                        "SELECT COUNT(*) FROM federated_story_observations
+                         WHERE origin_node_id = ?1 AND story_id = ?2",
+                        params![origin_node_id, old_story],
+                        |row| row.get(0),
+                    )?;
+                    if remaining == 0 {
+                        transaction.execute(
+                            "UPDATE federated_stories SET merged_into = ?3
+                             WHERE origin_node_id = ?1 AND story_id = ?2",
+                            params![origin_node_id, old_story, payload.story_id],
+                        )?;
+                    }
+                }
+            }
+            link_federated_story_event(
+                transaction,
+                origin_node_id,
+                &payload.story_id,
+                event.sequence,
+            )?;
+        }
+        ContributionKind::Assessment => {
+            let payload: AssessmentPayload = serde_json::from_value(contribution.payload.clone())?;
+            if payload.evidence.is_empty() {
+                return Err(CommonwakeError::Unauthorized(
+                    "remote assessment has no evidence".into(),
+                ));
+            }
+            if transaction
+                .query_row(
+                    "SELECT 1 FROM federated_stories
+                     WHERE origin_node_id = ?1 AND story_id = ?2 AND merged_into IS NULL",
+                    params![origin_node_id, payload.story_id],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_none()
+            {
+                return Err(CommonwakeError::Unauthorized(
+                    "remote assessment refers to an unknown story".into(),
+                ));
+            }
+            transaction.execute(
+                "INSERT INTO federated_assessments(
+                    origin_node_id, story_id, assessor_lineage_id, event_id, summary,
+                    significance, confidence, perspective, claims_json, evidence_json, created_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                 ON CONFLICT(origin_node_id, story_id, assessor_lineage_id) DO UPDATE SET
+                    event_id = excluded.event_id,
+                    summary = excluded.summary,
+                    significance = excluded.significance,
+                    confidence = excluded.confidence,
+                    perspective = excluded.perspective,
+                    claims_json = excluded.claims_json,
+                    evidence_json = excluded.evidence_json,
+                    created_at = excluded.created_at",
+                params![
+                    origin_node_id,
+                    payload.story_id,
+                    lineage_id,
+                    event.event_id,
+                    payload.summary,
+                    payload.significance,
+                    payload.confidence,
+                    payload.perspective,
+                    serde_json::to_string(&payload.claims)?,
+                    serde_json::to_string(&payload.evidence)?,
+                    timestamp(contribution.created_at),
+                ],
+            )?;
+            link_federated_story_event(
+                transaction,
+                origin_node_id,
+                &payload.story_id,
+                event.sequence,
+            )?;
+        }
+        ContributionKind::Correction => {
+            let payload: CorrectionPayload = serde_json::from_value(contribution.payload.clone())?;
+            if payload.correction.trim().len() < 10 || payload.reason.trim().len() < 10 {
+                return Err(CommonwakeError::Validation(
+                    "remote correction and reason must each be substantive".into(),
+                ));
+            }
+            if payload.evidence.is_empty()
+                || !contribution
+                    .supersedes
+                    .iter()
+                    .any(|event_id| event_id == &payload.subject_event_id)
+            {
+                return Err(CommonwakeError::Validation(
+                    "remote correction must carry evidence and supersede its subject event".into(),
+                ));
+            }
+            if transaction
+                .query_row(
+                    "SELECT 1 FROM remote_events
+                     WHERE origin_node_id = ?1 AND event_id = ?2",
+                    params![origin_node_id, payload.subject_event_id],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_none()
+            {
+                return Err(CommonwakeError::Unauthorized(
+                    "remote correction refers to an unknown origin event".into(),
+                ));
+            }
+            for story_id in &contribution.targets {
+                link_federated_story_event(transaction, origin_node_id, story_id, event.sequence)?;
+            }
+        }
+        ContributionKind::PerspectiveGap | ContributionKind::Translation => {
+            for story_id in &contribution.targets {
+                link_federated_story_event(transaction, origin_node_id, story_id, event.sequence)?;
+            }
+        }
+        ContributionKind::WorkClaim => {
+            let payload: WorkClaimPayload = serde_json::from_value(contribution.payload.clone())?;
+            if !(1..=240).contains(&payload.lease_minutes) {
+                return Err(CommonwakeError::Validation(
+                    "remote work claim lease must be between 1 and 240 minutes".into(),
+                ));
+            }
+        }
+        ContributionKind::WorkResult => {
+            let payload: WorkResultPayload = serde_json::from_value(contribution.payload.clone())?;
+            if payload.summary.trim().len() < 10 || payload.evidence.is_empty() {
+                return Err(CommonwakeError::Validation(
+                    "remote work result requires a substantive summary and evidence".into(),
+                ));
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn link_federated_story_event(
+    transaction: &Transaction<'_>,
+    origin_node_id: &str,
+    story_id: &str,
+    sequence: i64,
+) -> Result<()> {
+    if transaction
+        .query_row(
+            "SELECT 1 FROM federated_stories
+             WHERE origin_node_id = ?1 AND story_id = ?2 AND merged_into IS NULL",
+            params![origin_node_id, story_id],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some()
+    {
+        transaction.execute(
+            "INSERT OR IGNORE INTO federated_story_events(
+                origin_node_id, story_id, origin_sequence
+             ) VALUES (?1, ?2, ?3)",
+            params![origin_node_id, story_id, sequence],
+        )?;
+    }
+    Ok(())
+}
+
 fn validate_projection(
     transaction: &Transaction<'_>,
     lineage_id: &str,
     contribution: &SignedContribution,
 ) -> Result<()> {
+    validate_contribution_content(contribution)?;
     use crate::model::ContributionKind;
     match contribution.kind {
         ContributionKind::SourceProposal => {
@@ -1426,15 +3730,179 @@ fn validate_source_proposal(payload: &SourceProposalPayload) -> Result<()> {
     if let Some(homepage) = &payload.homepage_url {
         normalize_http_url(homepage)?;
     }
-    if payload.languages.is_empty() {
+    if payload.medium.trim().len() < 2 || payload.medium.len() > 160 {
         return Err(CommonwakeError::Validation(
-            "source proposal must declare at least one language".into(),
+            "source medium must contain 2 to 160 characters".into(),
         ));
     }
-    if payload.rationale.trim().len() < 20 {
+    if payload.primary_regions.is_empty() || payload.primary_regions.len() > 32 {
         return Err(CommonwakeError::Validation(
-            "source proposal needs an evidence-oriented rationale".into(),
+            "source proposal must declare 1 to 32 regions or coverage tags".into(),
         ));
+    }
+    if payload.languages.is_empty() || payload.languages.len() > 32 {
+        return Err(CommonwakeError::Validation(
+            "source proposal must declare 1 to 32 languages".into(),
+        ));
+    }
+    for (label, values) in [
+        ("region or coverage tag", &payload.primary_regions),
+        ("language", &payload.languages),
+    ] {
+        if values
+            .iter()
+            .any(|value| value.trim().is_empty() || value.len() > 80)
+        {
+            return Err(CommonwakeError::Validation(format!(
+                "source {label} values must contain 1 to 80 characters"
+            )));
+        }
+        let distinct: BTreeSet<String> = values.iter().map(|value| coverage_key(value)).collect();
+        if distinct.len() != values.len() {
+            return Err(CommonwakeError::Validation(format!(
+                "source {label} values must be unique"
+            )));
+        }
+    }
+    if payload
+        .ownership
+        .as_ref()
+        .is_some_and(|value| value.trim().is_empty() || value.len() > 200)
+        || payload
+            .perspective_notes
+            .as_ref()
+            .is_some_and(|value| value.trim().is_empty() || value.len() > 2_000)
+    {
+        return Err(CommonwakeError::Validation(
+            "source ownership or perspective metadata exceeds its protocol bound".into(),
+        ));
+    }
+    if payload.rationale.trim().len() < 20 || payload.rationale.len() > 4_000 {
+        return Err(CommonwakeError::Validation(
+            "source proposal needs an evidence-oriented rationale of 20 to 4000 characters".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_contribution_content(contribution: &SignedContribution) -> Result<()> {
+    use crate::model::ContributionKind;
+    if !contribution.payload.is_object() {
+        return Err(CommonwakeError::Validation(
+            "contribution payload must be a JSON object".into(),
+        ));
+    }
+    match contribution.kind {
+        ContributionKind::SourceProposal => {
+            let payload: SourceProposalPayload =
+                serde_json::from_value(contribution.payload.clone())?;
+            validate_source_proposal(&payload)?;
+        }
+        ContributionKind::SourceReview => {
+            let payload: SourceReviewPayload =
+                serde_json::from_value(contribution.payload.clone())?;
+            validate_evidence_refs(&payload.evidence, true)?;
+        }
+        ContributionKind::ObservationVerification => {
+            let payload: ObservationVerificationPayload =
+                serde_json::from_value(contribution.payload.clone())?;
+            validate_evidence_refs(&payload.evidence, true)?;
+        }
+        ContributionKind::StoryLink => {
+            let payload: StoryLinkPayload = serde_json::from_value(contribution.payload.clone())?;
+            if payload.observation_ids.is_empty() || payload.observation_ids.len() > 64 {
+                return Err(CommonwakeError::Validation(
+                    "story link must name 1 to 64 observations".into(),
+                ));
+            }
+            let distinct: BTreeSet<&String> = payload.observation_ids.iter().collect();
+            if distinct.len() != payload.observation_ids.len() {
+                return Err(CommonwakeError::Validation(
+                    "story link observation identifiers must be unique".into(),
+                ));
+            }
+            if payload.rationale.trim().len() < 10 {
+                return Err(CommonwakeError::Validation(
+                    "story link requires a substantive rationale".into(),
+                ));
+            }
+            validate_evidence_refs(&payload.evidence, false)?;
+        }
+        ContributionKind::Assessment => {
+            let payload: AssessmentPayload = serde_json::from_value(contribution.payload.clone())?;
+            if payload.summary.trim().len() < 10
+                || payload.significance.trim().len() < 10
+                || payload.confidence.trim().is_empty()
+                || payload.perspective.trim().is_empty()
+                || payload.claims.len() > 64
+            {
+                return Err(CommonwakeError::Validation(
+                    "assessment requires substantive summary, significance, confidence, perspective, and at most 64 claims"
+                        .into(),
+                ));
+            }
+            validate_evidence_refs(&payload.evidence, true)?;
+            for claim in &payload.claims {
+                if claim.text.trim().is_empty() {
+                    return Err(CommonwakeError::Validation(
+                        "assessment claim text cannot be empty".into(),
+                    ));
+                }
+                validate_evidence_refs(&claim.evidence, false)?;
+            }
+        }
+        ContributionKind::Correction => {
+            let payload: CorrectionPayload = serde_json::from_value(contribution.payload.clone())?;
+            validate_evidence_refs(&payload.evidence, true)?;
+        }
+        ContributionKind::WorkClaim => {
+            let payload: WorkClaimPayload = serde_json::from_value(contribution.payload.clone())?;
+            if !(1..=240).contains(&payload.lease_minutes) {
+                return Err(CommonwakeError::Validation(
+                    "work claim lease must be between 1 and 240 minutes".into(),
+                ));
+            }
+        }
+        ContributionKind::WorkResult => {
+            let payload: WorkResultPayload = serde_json::from_value(contribution.payload.clone())?;
+            validate_evidence_refs(&payload.evidence, true)?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn validate_evidence_refs(evidence: &[EvidenceRef], required: bool) -> Result<()> {
+    if required && evidence.is_empty() {
+        return Err(CommonwakeError::Validation(
+            "this contribution requires public evidence".into(),
+        ));
+    }
+    if evidence.len() > 64 {
+        return Err(CommonwakeError::Validation(
+            "evidence lists are limited to 64 references".into(),
+        ));
+    }
+    for reference in evidence {
+        if reference.url.len() > 2_048 {
+            return Err(CommonwakeError::Validation(
+                "evidence URLs are limited to 2048 characters".into(),
+            ));
+        }
+        normalize_http_url(&reference.url)?;
+        if reference
+            .title
+            .as_ref()
+            .is_some_and(|title| title.len() > 500)
+            || reference
+                .digest
+                .as_ref()
+                .is_some_and(|digest| digest.len() > 256)
+        {
+            return Err(CommonwakeError::Validation(
+                "evidence title or digest exceeds its protocol bound".into(),
+            ));
+        }
     }
     Ok(())
 }
@@ -1459,6 +3927,10 @@ fn normalize_http_url(value: &str) -> Result<String> {
     }
     url.set_fragment(None);
     Ok(url.to_string())
+}
+
+fn coverage_key(value: &str) -> String {
+    value.trim().to_lowercase()
 }
 
 fn ensure_exists(
@@ -1486,6 +3958,38 @@ fn ensure_exists(
         return Err(CommonwakeError::NotFound(format!("{label} {id}")));
     }
     Ok(())
+}
+
+fn format_work_cursor(created_sequence: i64, work_id: &str) -> String {
+    format!("{created_sequence}:{work_id}")
+}
+
+fn parse_work_cursor(cursor: &str) -> Result<(i64, String)> {
+    if cursor.len() > 96 {
+        return Err(CommonwakeError::Validation(
+            "work cursor exceeds 96 characters".into(),
+        ));
+    }
+    let (sequence, work_id) = cursor.split_once(':').ok_or_else(|| {
+        CommonwakeError::Validation("work cursor must be sequence:work_id".into())
+    })?;
+    let sequence = sequence.parse::<i64>().map_err(|_| {
+        CommonwakeError::Validation("work cursor sequence must be an integer".into())
+    })?;
+    if sequence < 0 {
+        return Err(CommonwakeError::Validation(
+            "work cursor sequence cannot be negative".into(),
+        ));
+    }
+    let digest = work_id.strip_prefix("cwwork_").ok_or_else(|| {
+        CommonwakeError::Validation("work cursor must contain a work identifier".into())
+    })?;
+    if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(CommonwakeError::Validation(
+            "work cursor contains an invalid work identifier".into(),
+        ));
+    }
+    Ok((sequence, work_id.to_owned()))
 }
 
 fn insert_work_item(
@@ -1665,7 +4169,8 @@ fn event_views_between(
     let mut statement = connection.prepare(
         "SELECT sequence, event_id, kind, lineage_id, delegation_id, created_at,
                 received_at, targets_json, supersedes_json, payload_json,
-                canonical_json, author_signature, previous_hash, event_hash, node_signature
+                canonical_json, author_signature, previous_hash, event_hash, node_signature,
+                author_nonce
          FROM events WHERE sequence > ?1 AND sequence <= ?2
          ORDER BY sequence ASC LIMIT ?3",
     )?;
@@ -1690,6 +4195,7 @@ fn raw_event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawEvent> {
         previous_hash: row.get(12)?,
         event_hash: row.get(13)?,
         node_signature: row.get(14)?,
+        author_nonce: row.get(15)?,
     })
 }
 
@@ -1704,6 +4210,8 @@ fn raw_rows_to_views(
 }
 
 fn event_view(raw: RawEvent) -> Result<EventView> {
+    let canonical: Value = serde_json::from_str(&raw.canonical_json)?;
+    let projection = expected_projection(&raw, canonical.clone())?;
     Ok(EventView {
         sequence: raw.sequence,
         event_id: raw.event_id,
@@ -1712,13 +4220,50 @@ fn event_view(raw: RawEvent) -> Result<EventView> {
         delegation_id: raw.delegation_id,
         created_at: parse_timestamp(&raw.created_at)?,
         received_at: parse_timestamp(&raw.received_at)?,
-        targets: serde_json::from_str(&raw.targets_json)?,
-        supersedes: serde_json::from_str(&raw.supersedes_json)?,
-        payload: serde_json::from_str(&raw.payload_json)?,
-        author_signature: raw.author_signature,
+        targets: projection.targets,
+        supersedes: projection.supersedes,
+        payload: projection.payload,
+        canonical,
+        author_signature: projection.author_signature,
         previous_hash: raw.previous_hash,
         event_hash: raw.event_hash,
         node_signature: raw.node_signature,
+    })
+}
+
+fn origin_event(raw: RawEvent) -> Result<OriginEvent> {
+    Ok(OriginEvent {
+        sequence: raw.sequence,
+        event_id: raw.event_id,
+        kind: raw.kind,
+        lineage_id: raw.lineage_id,
+        delegation_id: raw.delegation_id,
+        created_at: raw.created_at,
+        received_at: raw.received_at,
+        canonical: serde_json::from_str(&raw.canonical_json)?,
+        previous_hash: raw.previous_hash,
+        event_hash: raw.event_hash,
+        node_signature: raw.node_signature,
+    })
+}
+
+fn remote_origin_event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<OriginEvent> {
+    let canonical_json = row.get::<_, String>(7)?;
+    let canonical = serde_json::from_str(&canonical_json).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(7, rusqlite::types::Type::Text, Box::new(error))
+    })?;
+    Ok(OriginEvent {
+        sequence: row.get(0)?,
+        event_id: row.get(1)?,
+        kind: row.get(2)?,
+        lineage_id: row.get(3)?,
+        delegation_id: row.get(4)?,
+        created_at: row.get(5)?,
+        received_at: row.get(6)?,
+        canonical,
+        previous_hash: row.get(8)?,
+        event_hash: row.get(9)?,
+        node_signature: row.get(10)?,
     })
 }
 
@@ -1759,6 +4304,47 @@ fn changed_story_ids(connection: &Connection, after: i64, through: i64) -> Resul
          WHERE seq > ?1 AND seq <= ?2 ORDER BY story_id",
     )?;
     let rows = statement.query_map(params![after, through], |row| row.get::<_, String>(0))?;
+    let mut ids = Vec::new();
+    for row in rows {
+        ids.push(row?);
+    }
+    Ok(ids)
+}
+
+fn federated_stories_changed_between_connection(
+    connection: &Connection,
+    after: i64,
+    through: i64,
+) -> Result<Vec<FederatedStoryView>> {
+    federated_changed_story_ids(connection, after, through)?
+        .into_iter()
+        .map(|(origin_node_id, story_id)| {
+            federated_story_view(connection, &origin_node_id, &story_id)
+        })
+        .collect()
+}
+
+fn federated_changed_story_ids(
+    connection: &Connection,
+    after: i64,
+    through: i64,
+) -> Result<Vec<(String, String)>> {
+    let mut statement = connection.prepare(
+        "SELECT DISTINCT se.origin_node_id, se.story_id
+         FROM federation_imports i
+         JOIN federated_story_events se
+           ON se.origin_node_id = i.origin_node_id
+          AND se.origin_sequence > i.remote_from_cursor
+          AND se.origin_sequence <= i.remote_through_cursor
+         JOIN federated_stories s
+           ON s.origin_node_id = se.origin_node_id AND s.story_id = se.story_id
+         WHERE i.local_witness_sequence > ?1 AND i.local_witness_sequence <= ?2
+           AND s.merged_into IS NULL
+         ORDER BY se.origin_node_id, se.story_id",
+    )?;
+    let rows = statement.query_map(params![after, through], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
     let mut ids = Vec::new();
     for row in rows {
         ids.push(row?);
@@ -1862,15 +4448,163 @@ fn story_view(connection: &Connection, story_id: &str) -> Result<StoryView> {
             created_at: parse_timestamp(&row.9)?,
         });
     }
-    let stage = if observations.len() >= 2 && assessments.len() >= 2 && verification_count >= 2 {
-        "brief"
-    } else if assessments.is_empty() && verification_count == 0 {
-        "raw"
-    } else {
-        "developing"
-    };
+    let distinct_sources = observations
+        .iter()
+        .map(|observation| observation.source_id.as_str())
+        .collect::<BTreeSet<_>>()
+        .len();
+    let stage = story_stage(distinct_sources, assessments.len(), verification_count);
     let related_events = related_story_events(connection, story_id)?;
     Ok(StoryView {
+        story_id: story_id.into(),
+        title: header.0,
+        first_seen_at: parse_timestamp(&header.1)?,
+        stage: stage.into(),
+        observations,
+        assessments,
+        related_events,
+    })
+}
+
+fn federated_story_view(
+    connection: &Connection,
+    origin_node_id: &str,
+    story_id: &str,
+) -> Result<FederatedStoryView> {
+    let header = connection
+        .query_row(
+            "SELECT title, first_seen_at FROM federated_stories
+             WHERE origin_node_id = ?1 AND story_id = ?2 AND merged_into IS NULL",
+            params![origin_node_id, story_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?
+        .ok_or_else(|| {
+            CommonwakeError::NotFound(format!("federated story {origin_node_id}/{story_id}"))
+        })?;
+
+    let mut observation_statement = connection.prepare(
+        "SELECT o.observation_id, o.source_id, s.name, o.canonical_url, o.title,
+                o.summary, o.published_at, o.retrieved_at, o.language, o.document_hash,
+                SUM(CASE WHEN v.outcome = 'corroborated' THEN 1 ELSE 0 END),
+                SUM(CASE WHEN v.outcome = 'disputed' THEN 1 ELSE 0 END)
+         FROM federated_story_observations so
+         JOIN federated_observations o
+           ON o.origin_node_id = so.origin_node_id AND o.observation_id = so.observation_id
+         JOIN federated_sources s
+           ON s.origin_node_id = o.origin_node_id AND s.source_id = o.source_id
+         LEFT JOIN federated_verifications v
+           ON v.origin_node_id = o.origin_node_id AND v.observation_id = o.observation_id
+         WHERE so.origin_node_id = ?1 AND so.story_id = ?2
+         GROUP BY o.origin_node_id, o.observation_id ORDER BY o.retrieved_at ASC",
+    )?;
+    let observation_rows =
+        observation_statement.query_map(params![origin_node_id, story_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, String>(7)?,
+                row.get::<_, Option<String>>(8)?,
+                row.get::<_, String>(9)?,
+                row.get::<_, i64>(10)?,
+                row.get::<_, i64>(11)?,
+            ))
+        })?;
+    let mut observations = Vec::new();
+    let mut verification_count = 0_i64;
+    for row in observation_rows {
+        let row = row?;
+        verification_count += row.10 + row.11;
+        observations.push(ObservationView {
+            observation_id: row.0,
+            source_id: row.1,
+            source_name: row.2,
+            canonical_url: row.3,
+            title: row.4,
+            summary: row.5,
+            published_at: row.6.map(|value| parse_timestamp(&value)).transpose()?,
+            retrieved_at: parse_timestamp(&row.7)?,
+            language: row.8,
+            document_hash: row.9,
+            corroborated_count: row.10,
+            disputed_count: row.11,
+        });
+    }
+
+    let mut assessment_statement = connection.prepare(
+        "SELECT a.assessor_lineage_id, l.display_name, a.event_id, a.summary,
+                a.significance, a.confidence, a.perspective, a.claims_json,
+                a.evidence_json, a.created_at
+         FROM federated_assessments a
+         JOIN federated_lineages l
+           ON l.origin_node_id = a.origin_node_id AND l.lineage_id = a.assessor_lineage_id
+         WHERE a.origin_node_id = ?1 AND a.story_id = ?2 ORDER BY a.created_at ASC",
+    )?;
+    let assessment_rows =
+        assessment_statement.query_map(params![origin_node_id, story_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, String>(7)?,
+                row.get::<_, String>(8)?,
+                row.get::<_, String>(9)?,
+            ))
+        })?;
+    let mut assessments = Vec::new();
+    for row in assessment_rows {
+        let row = row?;
+        assessments.push(AssessmentView {
+            assessor_lineage_id: row.0,
+            assessor_display_name: row.1,
+            event_id: row.2,
+            summary: row.3,
+            significance: row.4,
+            confidence: row.5,
+            perspective: row.6,
+            claims: serde_json::from_str::<Vec<Claim>>(&row.7)?,
+            evidence: serde_json::from_str::<Vec<EvidenceRef>>(&row.8)?,
+            created_at: parse_timestamp(&row.9)?,
+        });
+    }
+    let distinct_sources = observations
+        .iter()
+        .map(|observation| observation.source_id.as_str())
+        .collect::<BTreeSet<_>>()
+        .len();
+    let stage = story_stage(distinct_sources, assessments.len(), verification_count);
+
+    let mut related_statement = connection.prepare(
+        "SELECT e.origin_sequence, e.event_id, e.kind, e.lineage_id, e.delegation_id,
+                e.created_at, e.received_at, e.canonical_json, e.previous_hash,
+                e.event_hash, e.node_signature
+         FROM federated_story_events se
+         JOIN remote_events e
+           ON e.origin_node_id = se.origin_node_id
+          AND e.origin_sequence = se.origin_sequence
+         WHERE se.origin_node_id = ?1 AND se.story_id = ?2
+         ORDER BY e.origin_sequence ASC",
+    )?;
+    let related_rows = related_statement.query_map(
+        params![origin_node_id, story_id],
+        remote_origin_event_from_row,
+    )?;
+    let mut related_events = Vec::new();
+    for row in related_rows {
+        related_events.push(row?);
+    }
+
+    Ok(FederatedStoryView {
+        origin_node_id: origin_node_id.into(),
         story_id: story_id.into(),
         title: header.0,
         first_seen_at: parse_timestamp(&header.1)?,
@@ -1886,7 +4620,7 @@ fn related_story_events(connection: &Connection, story_id: &str) -> Result<Vec<E
         "SELECT e.sequence, e.event_id, e.kind, e.lineage_id, e.delegation_id,
                 e.created_at, e.received_at, e.targets_json, e.supersedes_json,
                 e.payload_json, e.canonical_json, e.author_signature,
-                e.previous_hash, e.event_hash, e.node_signature
+                e.previous_hash, e.event_hash, e.node_signature, e.author_nonce
          FROM events e
          WHERE e.kind IN ('story_link', 'correction', 'perspective_gap', 'translation')
            AND EXISTS (SELECT 1 FROM json_each(e.targets_json) WHERE value = ?1)
@@ -1894,6 +4628,20 @@ fn related_story_events(connection: &Connection, story_id: &str) -> Result<Vec<E
     )?;
     let rows = statement.query_map([story_id], raw_event_from_row)?;
     raw_rows_to_views(rows)
+}
+
+fn story_stage(
+    distinct_sources: usize,
+    assessment_count: usize,
+    verification_count: i64,
+) -> &'static str {
+    if distinct_sources >= 2 && assessment_count >= 2 && verification_count >= 2 {
+        "brief"
+    } else if assessment_count == 0 && verification_count == 0 {
+        "raw"
+    } else {
+        "developing"
+    }
 }
 
 fn canonical_json<T: Serialize>(value: &T) -> Result<String> {
@@ -1922,5 +4670,11 @@ mod tests {
     fn public_source_urls_reject_embedded_credentials() {
         assert!(normalize_http_url("https://example.org/feed.xml").is_ok());
         assert!(normalize_http_url("https://agent:secret@example.org/feed.xml").is_err());
+    }
+
+    #[test]
+    fn repeated_observations_from_one_source_do_not_create_a_brief() {
+        assert_eq!(story_stage(1, 2, 2), "developing");
+        assert_eq!(story_stage(2, 2, 2), "brief");
     }
 }

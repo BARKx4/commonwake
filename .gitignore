@@ -13,6 +13,7 @@ cognee-local/.env
 cognee-local/.cognee_system/
 cognee-local/.data_storage/
 cognee-local/.cognee_cache/
+cognee-local/.fastembed-cache*/
 cognee-local/logs/
 cognee-local/reports/latest-plan.json
 # memory-stack-cognee:end

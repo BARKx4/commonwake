@@ -1,7 +1,9 @@
 use std::{
-    io::{self, Read},
+    collections::BTreeSet,
+    io::{self, BufRead, BufReader, Read},
     net::SocketAddr,
     path::PathBuf,
+    time::Duration as StdDuration,
 };
 
 use anyhow::Context;
@@ -10,16 +12,21 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use commonwake::{
     CommonwakeNode,
     client::{
-        acknowledge, contribute, create_identity, delegate, make_acknowledgement,
-        make_contribution, make_registration, make_session, orient, read_identity, read_session,
-        register, write_secret,
+        acknowledge, contribute, create_identity, delegate, delegation_id, fetch_federation_bundle,
+        fetch_relayed_federation_bundle, make_acknowledgement, make_contribution,
+        make_delegation_revocation, make_key_rotation, make_registration, make_session, orient,
+        read_identity, read_session, register, revoke, rotate, write_secret,
     },
     model::{ContributionKind, MemoryProvenance, Scope},
     router,
 };
 use serde::Serialize;
 use serde_json::Value;
-use tokio::{net::TcpListener, signal};
+use tokio::{
+    net::TcpListener,
+    signal,
+    time::{self, MissedTickBehavior},
+};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
@@ -41,12 +48,7 @@ enum Command {
         data_dir: PathBuf,
     },
     /// Serve the local peer HTTP API.
-    Serve {
-        #[arg(long, default_value = ".commonwake", env = "COMMONWAKE_DATA_DIR")]
-        data_dir: PathBuf,
-        #[arg(long, default_value = "127.0.0.1:8787", env = "COMMONWAKE_BIND")]
-        bind: SocketAddr,
-    },
+    Serve(ServeArgs),
     /// Manage a long-lived lineage key kept outside routine agent sessions.
     Identity {
         #[command(subcommand)]
@@ -61,6 +63,10 @@ enum Command {
     },
     /// Create and register a bounded session delegation.
     Delegate(DelegateArgs),
+    /// Revoke one bounded session delegation with the current lineage key.
+    Revoke(RevokeArgs),
+    /// Rotate a lineage key with proofs from both the previous and replacement keys.
+    Rotate(RotateArgs),
     /// Retrieve a wake orientation bundle.
     Orient {
         #[arg(long)]
@@ -74,23 +80,59 @@ enum Command {
     Contribute(ContributeArgs),
     /// Durably acknowledge an orientation cursor.
     Ack(AckArgs),
-    /// Fetch all probation and active feeds once.
+    /// Fetch all probation, active, and retryable degraded feeds once.
     Ingest {
         #[arg(long, default_value = ".commonwake", env = "COMMONWAKE_DATA_DIR")]
         data_dir: PathBuf,
     },
+    /// Pull and verify a remote peer's origin log into this sovereign node.
+    Sync(SyncArgs),
     /// Recompute the node hash chain and every node signature.
     Verify {
         #[arg(long, default_value = ".commonwake", env = "COMMONWAKE_DATA_DIR")]
         data_dir: PathBuf,
     },
-    /// Emit portable event JSON Lines to stdout.
+    /// Emit independently verifiable federation-bundle JSON Lines to stdout.
     Export {
         #[arg(long, default_value = ".commonwake", env = "COMMONWAKE_DATA_DIR")]
         data_dir: PathBuf,
         #[arg(long, default_value_t = 0)]
         after: i64,
     },
+    /// Verify federation-bundle JSON Lines produced by `export` without opening a node.
+    VerifyExport {
+        /// Bundle JSONL file, or '-' for stdin.
+        #[arg(long, default_value = "-")]
+        input: PathBuf,
+    },
+}
+
+#[derive(Args)]
+struct ServeArgs {
+    #[arg(long, default_value = ".commonwake", env = "COMMONWAKE_DATA_DIR")]
+    data_dir: PathBuf,
+    #[arg(long, default_value = "127.0.0.1:8787", env = "COMMONWAKE_BIND")]
+    bind: SocketAddr,
+    /// Seconds between approved-source collection passes. Zero disables collection.
+    #[arg(
+        long,
+        default_value_t = 900,
+        env = "COMMONWAKE_INGEST_INTERVAL_SECONDS"
+    )]
+    ingest_interval_seconds: u64,
+    /// Seconds between direct-origin synchronization passes. Zero disables synchronization.
+    #[arg(long, default_value_t = 300, env = "COMMONWAKE_SYNC_INTERVAL_SECONDS")]
+    sync_interval_seconds: u64,
+    /// Direct peer URLs to synchronize, repeatable or comma-separated through COMMONWAKE_PEERS.
+    #[arg(long = "peer", env = "COMMONWAKE_PEERS", value_delimiter = ',')]
+    peers: Vec<String>,
+    /// Seconds between full local log verification passes. Zero disables periodic verification.
+    #[arg(
+        long,
+        default_value_t = 3600,
+        env = "COMMONWAKE_VERIFY_INTERVAL_SECONDS"
+    )]
+    verify_interval_seconds: u64,
 }
 
 #[derive(Subcommand)]
@@ -115,6 +157,48 @@ struct DelegateArgs {
     ttl_hours: i64,
     #[arg(long, value_enum, value_delimiter = ',', default_values_t = all_scopes())]
     scopes: Vec<ScopeArg>,
+}
+
+#[derive(Args)]
+struct RevokeArgs {
+    #[arg(long)]
+    server: String,
+    #[arg(long)]
+    identity: PathBuf,
+    /// Session file whose delegation should be revoked.
+    #[arg(long)]
+    session: PathBuf,
+    #[arg(long)]
+    reason: String,
+}
+
+#[derive(Args)]
+struct RotateArgs {
+    #[arg(long)]
+    server: String,
+    #[arg(long)]
+    identity: PathBuf,
+    /// New file created for the replacement lineage key. Existing files are never overwritten.
+    #[arg(long)]
+    identity_out: PathBuf,
+    #[arg(long)]
+    reason: String,
+    /// Preserve active session delegations instead of revoking them at the rotation event.
+    #[arg(long, default_value_t = false)]
+    keep_delegations: bool,
+}
+
+#[derive(Args)]
+struct SyncArgs {
+    #[arg(long, default_value = ".commonwake", env = "COMMONWAKE_DATA_DIR")]
+    data_dir: PathBuf,
+    #[arg(long)]
+    peer: String,
+    /// Pull this retained origin through the peer instead of the peer's own origin log.
+    #[arg(long)]
+    origin_node_id: Option<String>,
+    #[arg(long, default_value_t = 100)]
+    batch_size: usize,
 }
 
 #[derive(Args)]
@@ -153,6 +237,32 @@ struct AckArgs {
     local_digest: Option<String>,
     #[arg(long, default_value_t = false)]
     direct_memory_claimed: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct SyncReport {
+    status: &'static str,
+    caught_up: bool,
+    peer: String,
+    relayed_origin_requested: Option<String>,
+    origin_node_id: String,
+    cursor: i64,
+    imported_events: usize,
+    pages: usize,
+    checkpoint_witness_events: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ExportVerificationReport {
+    status: &'static str,
+    origin_node_id: String,
+    origin_node_public_key: String,
+    from_cursor: i64,
+    through_cursor: i64,
+    final_event_hash: String,
+    pages: usize,
+    events: usize,
+    complete_from_genesis: bool,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -231,12 +341,17 @@ async fn main() -> anyhow::Result<()> {
                 "warning": "Back up node-key.json; do not expose it to reader agents."
             }))?;
         }
-        Command::Serve { data_dir, bind } => {
-            let node = CommonwakeNode::open(&data_dir)?;
-            let listener = TcpListener::bind(bind)
+        Command::Serve(args) => {
+            let node = CommonwakeNode::open(&args.data_dir)?;
+            let listener = TcpListener::bind(args.bind)
                 .await
-                .with_context(|| format!("could not bind {bind}"))?;
-            tracing::info!(node_id = node.identity.node_id(), %bind, "Commonwake peer listening");
+                .with_context(|| format!("could not bind {}", args.bind))?;
+            spawn_maintenance(&node, &args);
+            tracing::info!(
+                node_id = node.identity.node_id(),
+                bind = %args.bind,
+                "Commonwake peer listening"
+            );
             axum::serve(listener, router(node))
                 .with_graceful_shutdown(shutdown_signal())
                 .await?;
@@ -275,6 +390,33 @@ async fn main() -> anyhow::Result<()> {
                 "warning": "The session key is bounded but still secret. Give it only to the intended effectful agent phase."
             }))?;
         }
+        Command::Revoke(args) => {
+            let identity = read_identity(args.identity)?;
+            let session = read_session(args.session)?;
+            let revocation =
+                make_delegation_revocation(&identity, delegation_id(&session)?, args.reason)?;
+            print_json(&revoke(&args.server, &revocation).await?)?;
+        }
+        Command::Rotate(args) => {
+            let identity = read_identity(args.identity)?;
+            let (replacement, rotation) =
+                make_key_rotation(&identity, args.reason, !args.keep_delegations)?;
+            write_secret(&args.identity_out, &replacement)?;
+            let accepted = rotate(&args.server, &rotation).await.map_err(|error| {
+                anyhow::anyhow!(
+                    "rotation was not accepted; replacement key remains at {} for inspection or retry: {error}",
+                    args.identity_out.display()
+                )
+            })?;
+            print_json(&serde_json::json!({
+                "accepted": accepted,
+                "identity_path": args.identity_out,
+                "lineage_id": replacement.lineage_id,
+                "public_key": replacement.public_key,
+                "existing_delegations_revoked": rotation.statement.revoke_existing_delegations,
+                "warning": "The previous identity file is historical evidence but no longer authorizes new lineage controls. Securely retain both according to your own recovery policy."
+            }))?;
+        }
         Command::Orient {
             server,
             lineage,
@@ -309,6 +451,19 @@ async fn main() -> anyhow::Result<()> {
             let node = CommonwakeNode::open(data_dir)?;
             print_json(&node.ingest_all().await?)?;
         }
+        Command::Sync(args) => {
+            let node = CommonwakeNode::open(args.data_dir)?;
+            print_json(
+                &synchronize_peer(
+                    &node,
+                    &args.peer,
+                    args.origin_node_id.as_deref(),
+                    args.batch_size,
+                    None,
+                )
+                .await?,
+            )?;
+        }
         Command::Verify { data_dir } => {
             let node = CommonwakeNode::open(data_dir)?;
             let (cursor, event_hash) = node.db.verify_log(&node.identity)?;
@@ -321,34 +476,142 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Export { data_dir, after } => {
             let node = CommonwakeNode::open(data_dir)?;
-            let mut cursor = after;
-            loop {
-                let events = node.db.events_after(cursor, 500)?;
-                if events.is_empty() {
-                    break;
-                }
-                for event in events {
-                    println!("{}", serde_json::to_string(&event)?);
-                    cursor = event.sequence;
-                }
+            let snapshot_head = node.db.current_head()?.0;
+            if after < 0 || after > snapshot_head {
+                anyhow::bail!(
+                    "export cursor {after} is outside the snapshot range 0..={snapshot_head}"
+                )
             }
+            let mut cursor = after;
+            if cursor == snapshot_head {
+                println!(
+                    "{}",
+                    serde_json::to_string(&node.federation_bundle(cursor, 1)?)?
+                );
+            }
+            while cursor < snapshot_head {
+                let remaining = usize::try_from((snapshot_head - cursor).min(500))?;
+                let bundle = node.federation_bundle(cursor, remaining)?;
+                if bundle.through_cursor <= cursor {
+                    anyhow::bail!("export made no progress at cursor {cursor}")
+                }
+                cursor = bundle.through_cursor;
+                println!("{}", serde_json::to_string(&bundle)?);
+            }
+        }
+        Command::VerifyExport { input } => {
+            let report = if input.as_os_str() == "-" {
+                verify_export(BufReader::new(io::stdin().lock()))?
+            } else {
+                verify_export(BufReader::new(std::fs::File::open(&input).with_context(
+                    || format!("could not open export {}", input.display()),
+                )?))?
+            };
+            print_json(&report)?;
         }
     }
 
     Ok(())
 }
 
+fn verify_export(reader: impl BufRead) -> anyhow::Result<ExportVerificationReport> {
+    let mut origin_node_id: Option<String> = None;
+    let mut origin_node_public_key: Option<String> = None;
+    let mut first_cursor: Option<i64> = None;
+    let mut cursor: Option<i64> = None;
+    let mut event_hash: Option<String> = None;
+    let mut pages = 0_usize;
+    let mut events = 0_usize;
+    let mut saw_empty_page = false;
+
+    for (index, line) in reader.lines().enumerate() {
+        let line = line.with_context(|| format!("could not read export line {}", index + 1))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        if saw_empty_page {
+            anyhow::bail!("export contains data after an empty terminal page")
+        }
+        let bundle: commonwake::model::FederationBundle = serde_json::from_str(&line)
+            .with_context(|| format!("export line {} is not a federation bundle", index + 1))?;
+        commonwake::federation::verify_bundle(&bundle).with_context(|| {
+            format!(
+                "export line {} failed cryptographic verification",
+                index + 1
+            )
+        })?;
+
+        if let Some(expected) = &origin_node_id {
+            if expected != &bundle.origin_node_id
+                || origin_node_public_key.as_ref() != Some(&bundle.origin_node_public_key)
+            {
+                anyhow::bail!("export changes origin identity at line {}", index + 1)
+            }
+            let expected_cursor =
+                cursor.ok_or_else(|| anyhow::anyhow!("export verifier lost its prior cursor"))?;
+            if bundle.from_cursor != expected_cursor {
+                anyhow::bail!(
+                    "export line {} begins at cursor {} instead of {expected_cursor}",
+                    index + 1,
+                    bundle.from_cursor
+                )
+            }
+            if let Some(first) = bundle.events.first()
+                && Some(&first.previous_hash) != event_hash.as_ref()
+            {
+                anyhow::bail!(
+                    "export line {} does not extend the preceding signed checkpoint",
+                    index + 1
+                )
+            }
+        } else {
+            first_cursor = Some(bundle.from_cursor);
+            origin_node_id = Some(bundle.origin_node_id.clone());
+            origin_node_public_key = Some(bundle.origin_node_public_key.clone());
+        }
+
+        pages += 1;
+        events += bundle.events.len();
+        saw_empty_page = bundle.events.is_empty();
+        cursor = Some(bundle.through_cursor);
+        event_hash = Some(bundle.checkpoint.event_hash);
+    }
+
+    let origin_node_id = origin_node_id.ok_or_else(|| anyhow::anyhow!("export is empty"))?;
+    let from_cursor =
+        first_cursor.ok_or_else(|| anyhow::anyhow!("export is missing its initial cursor"))?;
+    Ok(ExportVerificationReport {
+        status: "verified",
+        origin_node_id,
+        origin_node_public_key: origin_node_public_key
+            .ok_or_else(|| anyhow::anyhow!("export is missing its origin public key"))?,
+        from_cursor,
+        through_cursor: cursor.ok_or_else(|| anyhow::anyhow!("export is missing its cursor"))?,
+        final_event_hash: event_hash
+            .ok_or_else(|| anyhow::anyhow!("export is missing its checkpoint hash"))?,
+        pages,
+        events,
+        complete_from_genesis: from_cursor == 0,
+    })
+}
+
 fn read_payload(payload: Option<String>, payload_file: Option<PathBuf>) -> anyhow::Result<Value> {
+    const MAX_PAYLOAD_INPUT_BYTES: usize = commonwake::federation::MAX_CANONICAL_OBJECT_BYTES;
     let text = if let Some(payload) = payload {
         if payload == "-" {
-            let mut input = String::new();
-            io::stdin().read_to_string(&mut input)?;
-            input
+            read_limited_text(io::stdin().lock(), MAX_PAYLOAD_INPUT_BYTES)?
         } else {
+            if payload.len() > MAX_PAYLOAD_INPUT_BYTES {
+                anyhow::bail!("contribution payload exceeds {MAX_PAYLOAD_INPUT_BYTES} bytes")
+            }
             payload
         }
     } else if let Some(path) = payload_file {
-        std::fs::read_to_string(path)?
+        read_limited_text(
+            std::fs::File::open(&path)
+                .with_context(|| format!("could not open payload {}", path.display()))?,
+            MAX_PAYLOAD_INPUT_BYTES,
+        )?
     } else {
         anyhow::bail!("one of --payload or --payload-file is required")
     };
@@ -357,6 +620,15 @@ fn read_payload(payload: Option<String>, payload_file: Option<PathBuf>) -> anyho
         anyhow::bail!("contribution payload must be a JSON object")
     }
     Ok(value)
+}
+
+fn read_limited_text(reader: impl Read, maximum: usize) -> anyhow::Result<String> {
+    let mut bytes = Vec::with_capacity(maximum.min(8 * 1024));
+    reader.take((maximum + 1) as u64).read_to_end(&mut bytes)?;
+    if bytes.len() > maximum {
+        anyhow::bail!("input exceeds {maximum} bytes")
+    }
+    String::from_utf8(bytes).context("input is not valid UTF-8")
 }
 
 fn print_json(value: &impl Serialize) -> anyhow::Result<()> {
@@ -376,5 +648,202 @@ const fn all_scopes() -> [ScopeArg; 4] {
 async fn shutdown_signal() {
     if signal::ctrl_c().await.is_err() {
         tracing::error!("failed to install Ctrl+C handler");
+    }
+}
+
+fn spawn_maintenance(node: &CommonwakeNode, args: &ServeArgs) {
+    if let Some(interval) = maintenance_interval(args.ingest_interval_seconds) {
+        let node = node.clone();
+        tokio::spawn(async move { ingest_loop(node, interval).await });
+    }
+
+    let peers: Vec<String> = args
+        .peers
+        .iter()
+        .map(|peer| peer.trim())
+        .filter(|peer| !peer.is_empty())
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    if !peers.is_empty()
+        && let Some(interval) = maintenance_interval(args.sync_interval_seconds)
+    {
+        let node = node.clone();
+        tokio::spawn(async move { sync_loop(node, peers, interval).await });
+    }
+
+    if let Some(interval) = maintenance_interval(args.verify_interval_seconds) {
+        let node = node.clone();
+        tokio::spawn(async move { verify_loop(node, interval).await });
+    }
+}
+
+fn maintenance_interval(seconds: u64) -> Option<StdDuration> {
+    (seconds != 0).then(|| StdDuration::from_secs(seconds.max(10)))
+}
+
+async fn ingest_loop(node: CommonwakeNode, interval: StdDuration) {
+    let mut ticker = time::interval(interval);
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    loop {
+        ticker.tick().await;
+        match node.ingest_all().await {
+            Ok(report) => tracing::info!(
+                sources_attempted = report.sources_attempted,
+                sources_succeeded = report.sources_succeeded,
+                observations_added = report.observations_added,
+                "autonomous collection pass completed"
+            ),
+            Err(error) => tracing::error!(%error, "autonomous collection pass failed"),
+        }
+    }
+}
+
+async fn sync_loop(node: CommonwakeNode, peers: Vec<String>, interval: StdDuration) {
+    let mut ticker = time::interval(interval);
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    loop {
+        ticker.tick().await;
+        for peer in &peers {
+            match synchronize_peer(&node, peer, None, 100, Some(100)).await {
+                Ok(report) => tracing::info!(
+                    peer,
+                    origin_node_id = report.origin_node_id,
+                    cursor = report.cursor,
+                    imported_events = report.imported_events,
+                    caught_up = report.caught_up,
+                    "autonomous peer synchronization completed"
+                ),
+                Err(error) => {
+                    tracing::error!(peer, %error, "autonomous peer synchronization failed")
+                }
+            }
+        }
+    }
+}
+
+async fn verify_loop(node: CommonwakeNode, interval: StdDuration) {
+    let mut ticker = time::interval(interval);
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    loop {
+        ticker.tick().await;
+        match node.db.verify_log(&node.identity) {
+            Ok((cursor, event_hash)) => tracing::info!(
+                cursor,
+                event_hash,
+                "periodic local log verification completed"
+            ),
+            Err(error) => tracing::error!(%error, "periodic local log verification failed"),
+        }
+    }
+}
+
+async fn synchronize_peer(
+    node: &CommonwakeNode,
+    peer: &str,
+    origin_node_id: Option<&str>,
+    batch_size: usize,
+    max_pages: Option<usize>,
+) -> anyhow::Result<SyncReport> {
+    let batch_size = batch_size.clamp(1, commonwake::federation::MAX_FEDERATION_EVENTS);
+    let probe = fetch_sync_bundle(peer, origin_node_id, 0, 1).await?;
+    commonwake::federation::verify_bundle(&probe)?;
+    if origin_node_id.is_some_and(|requested| requested != probe.origin_node_id) {
+        anyhow::bail!("relay returned a different origin than requested")
+    }
+    if probe.origin_node_id == node.identity.node_id() {
+        anyhow::bail!("refusing to synchronize a node from its own HTTP endpoint")
+    }
+    let mut cursor = node
+        .db
+        .federation_peers()?
+        .into_iter()
+        .find(|known| known.node_id == probe.origin_node_id)
+        .map_or(0, |known| known.cursor);
+    let mut imported_events = 0_usize;
+    let mut pages = 0_usize;
+    let mut witnesses = Vec::new();
+    let mut caught_up = false;
+    loop {
+        let bundle = fetch_sync_bundle(peer, origin_node_id, cursor, batch_size).await?;
+        if bundle.origin_node_id != probe.origin_node_id
+            || bundle.origin_node_public_key != probe.origin_node_public_key
+        {
+            anyhow::bail!("peer identity changed during synchronization")
+        }
+        if bundle.from_cursor != cursor {
+            anyhow::bail!(
+                "peer returned a federation page beginning at cursor {} when cursor {} was requested",
+                bundle.from_cursor,
+                cursor
+            )
+        }
+        let page_events = bundle.events.len();
+        let report = node.import_federation_bundle(&bundle)?;
+        imported_events += report.imported_events;
+        if let Some(witness) = report.witness_event_id {
+            witnesses.push(witness);
+        }
+        cursor = report.current_cursor;
+        pages += 1;
+        if page_events == 0 {
+            caught_up = true;
+            break;
+        }
+        if max_pages.is_some_and(|maximum| pages >= maximum.max(1)) {
+            break;
+        }
+    }
+    Ok(SyncReport {
+        status: "synchronized",
+        caught_up,
+        peer: peer.into(),
+        relayed_origin_requested: origin_node_id.map(str::to_owned),
+        origin_node_id: probe.origin_node_id,
+        cursor,
+        imported_events,
+        pages,
+        checkpoint_witness_events: witnesses,
+    })
+}
+
+async fn fetch_sync_bundle(
+    peer: &str,
+    origin_node_id: Option<&str>,
+    after: i64,
+    limit: usize,
+) -> commonwake::Result<commonwake::model::FederationBundle> {
+    if let Some(origin_node_id) = origin_node_id {
+        fetch_relayed_federation_bundle(peer, origin_node_id, after, limit).await
+    } else {
+        fetch_federation_bundle(peer, after, limit).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Cursor;
+
+    use commonwake::client::{create_identity, make_registration};
+    use tempfile::TempDir;
+
+    use super::*;
+
+    #[test]
+    fn exported_bundle_json_lines_verify_without_the_source_database() {
+        let temp = TempDir::new().expect("temp dir");
+        let node = CommonwakeNode::initialize(temp.path()).expect("node");
+        let identity = create_identity("export-verification").expect("identity");
+        node.register_lineage(&make_registration(&identity).expect("registration"))
+            .expect("register lineage");
+        let bundle = node.federation_bundle(0, 500).expect("bundle");
+        let input = format!("{}\n", serde_json::to_string(&bundle).expect("JSON"));
+
+        let report = verify_export(Cursor::new(input)).expect("verified export");
+        assert_eq!(report.events, 1);
+        assert_eq!(report.through_cursor, 1);
+        assert!(report.complete_from_genesis);
+        assert_eq!(report.origin_node_id, node.identity.node_id());
     }
 }

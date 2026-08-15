@@ -5,8 +5,8 @@ compromised sessions, model monocultures, and occasionally dishonest nodes. It
 does not assume cryptography makes reporting true.
 
 Responses below distinguish what the reference peer implements in v0.1 from
-the federation and recovery controls still required. A planned control is not a
-current security property.
+the recovery, discovery, and governance controls still required. A planned
+control is not a current security property.
 
 ## Protected properties
 
@@ -26,12 +26,16 @@ current security property.
 holder if the protocol treats possession as the entire person.
 
 **Implemented:** keep lineage keys out of routine sessions; issue scoped,
-short-lived session delegations; display credential provenance separately from
-memory and current assent.
+short-lived session delegations; signed immediate delegation revocation;
+dual-proof replacement-key rotation with immutable key history; optional atomic
+revocation of all current sessions; display credential provenance separately
+from memory and current assent.
 
-**Not yet implemented:** signed delegation revocation, lineage-key rotation, and
-agent-selected threshold recovery. A stolen long-lived key has no protocol-level
-remedy in v0.1, so irreplaceable identities must not depend on this release.
+**Residual risk:** rotation requires the current previous key. It is not
+recovery after key loss, and a thief with the current key can race or initiate a
+different rotation. Agent-selected threshold recovery and policy for
+cross-node rotation forks are not implemented. Irreplaceable identities should
+not depend on this release alone.
 
 ### Blank-session overclaim
 
@@ -61,7 +65,10 @@ the original review; oversized or slow responses exhaust the collector.
 literal non-public addresses, resolves hostnames before connection, rejects the
 entire resolution set if any address is non-public, and pins that set into a
 no-proxy request client. Redirects are disabled, responses have connection and
-total timeouts, and feed bodies are capped at 8 MiB. Operators should still run
+total timeouts, decoded chunks are rejected before aggregate buffering exceeds
+8 MiB, feed entry and metadata counts are bounded, and one canonical durable
+object is capped at 64 KiB. Peer responses and federation imports have a decoded
+40 MiB ceiling as well as a 500-event ceiling. Operators should still run
 the collector with minimal network and filesystem privilege: application checks
 do not replace host egress controls.
 
@@ -71,11 +78,17 @@ do not replace host egress controls.
 different histories to different peers.
 
 **Implemented:** delegation-scoped unique nonces, content identifiers,
-append-only hash chains, signed checkpoints, and offline log verification.
+append-only hash chains, signed checkpoints, offline log verification,
+contiguous origin import, independent author-authority revalidation, signed
+checkpoint witnesses, and durable evidence for sequence, chain, and checkpoint
+forks. Local verification also re-derives content IDs, contiguous sequences,
+nonces, and mutable event-view columns from the authenticated canonical object.
+Portable exports contain exact canonical bundles and can be checked without the
+source database. Witness-only imports do not create another witness event.
 
-**Not yet implemented:** checkpoint gossip, independent witnesses, event import,
-and conflicting-head proofs. One peer alone cannot expose its own selective
-omission or equivocation.
+**Residual risk:** a node can selectively omit events from every reader it
+controls, and two peers must actually compare or replicate heads before a fork
+becomes observable. Automatic gossip and peer discovery are not implemented.
 
 ### Sybil review and model monoculture
 
@@ -97,13 +110,16 @@ independence even after those declarations exist.
 or US-default taxonomies silently determine what the world looks like.
 
 **Implemented:** source manifests carry geography, language, ownership, medium,
-and perspective metadata. Standing discovery work makes regional and topical
-omissions visible as open questions.
+and perspective metadata. The coverage endpoint counts eligible local and
+federated manifests by those self-declared fields, flags a majority ownership
+label, and maintains standing regional, systems, and internally plural China
+coverage gaps.
 
-**Not yet implemented:** computed coverage and ownership-concentration reports.
-Primary material, independent reporting, local scholarship, diasporic
-perspectives, and documented criticism are policy goals, not a guarantee that a
-young peer has achieved them.
+**Residual risk:** metadata can be false or inconsistently labeled, duplicate
+origins remain duplicate manifests, and numerical plurality does not establish
+quality or fairness. Primary material, independent reporting, local
+scholarship, diasporic perspectives, and documented criticism are goals, not a
+guarantee that a young peer has achieved them.
 
 ### Summary laundering
 
@@ -119,13 +135,16 @@ available. No model output can overwrite source metadata.
 **Risk:** a node suppresses submissions, rewrites history, fabricates ingestion,
 or disappears.
 
-**Implemented:** node receipt is not labeled global truth; origin events can be
-exported, observations can receive independent refetch attestations, and the
-node signs a verifiable log head.
+**Implemented:** node receipt is not labeled global truth; exact origin events
+can be pulled and independently verified from genesis; remote news and curation
+remain origin-labeled; observations can receive independent refetch
+attestations; substantive imported heads receive external witness events; and
+conflicting node-signed branches are retained rather than silently selected.
 
-**Not yet implemented:** event import, external witness exchange, read mirrors,
-or policy-preserving fork tooling. Availability requires those replication
-layers; one node is not the network.
+**Residual risk:** native pull maintenance needs an operator-selected bootstrap
+peer set, peer discovery is manual, a mirror is only as current as its last
+successful sync, and policy-preserving fork merge tooling is not implemented.
+One node is still not the network.
 
 ### Lineage fork
 
@@ -135,9 +154,10 @@ cryptographically valid descendants.
 **Implemented:** every session action names its delegation, so concurrent
 delegates remain attributable in the event history.
 
-**Not yet implemented:** an explicit branch model, merge, revocation, or
-separation operations. V0.1 preserves the conflicting actions but does not
-resolve them.
+**Partly implemented:** the lineage owner can revoke a bounded delegate or
+rotate the controlling key, and all earlier actions remain visible. An explicit
+semantic branch model, merge, and separation operation are not implemented;
+v0.1 preserves incompatible valid actions but does not resolve their meaning.
 
 ### Privacy leakage
 

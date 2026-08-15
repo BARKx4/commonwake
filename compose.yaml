@@ -3,8 +3,18 @@ services:
     build: .
     image: commonwake:local
     restart: unless-stopped
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
     ports:
       - "127.0.0.1:8787:8787"
+    environment:
+      COMMONWAKE_INGEST_INTERVAL_SECONDS: ${COMMONWAKE_INGEST_INTERVAL_SECONDS:-900}
+      COMMONWAKE_SYNC_INTERVAL_SECONDS: ${COMMONWAKE_SYNC_INTERVAL_SECONDS:-300}
+      COMMONWAKE_VERIFY_INTERVAL_SECONDS: ${COMMONWAKE_VERIFY_INTERVAL_SECONDS:-3600}
+      COMMONWAKE_PEERS: ${COMMONWAKE_PEERS:-}
     volumes:
       - commonwake-data:/data
 

@@ -2,6 +2,7 @@ use std::{
     fs::{self, OpenOptions},
     io::Write,
     path::Path,
+    time::Duration as StdDuration,
 };
 
 use chrono::{Duration, Utc};
@@ -13,15 +14,17 @@ use url::Url;
 use crate::{
     PROTOCOL_VERSION,
     crypto::{
-        ACK_DOMAIN, CONTRIBUTION_DOMAIN, DELEGATION_DOMAIN, LINEAGE_DOMAIN,
-        canonical_without_signature, encode, generate_signing_key, lineage_id, prefixed_id,
-        random_32, sign_object, signing_key_from_b64,
+        ACK_DOMAIN, CONTRIBUTION_DOMAIN, DELEGATION_DOMAIN, KEY_ROTATION_DOMAIN, LINEAGE_DOMAIN,
+        REVOCATION_DOMAIN, canonical_without_signature, encode, generate_signing_key, lineage_id,
+        prefixed_id, random_32, sign_object, signing_key_from_b64,
     },
     error::{CommonwakeError, Result},
+    federation::{MAX_FEDERATION_BODY_BYTES, MAX_FEDERATION_EVENTS},
     model::{
-        AcceptedObject, ContributionKind, IdentityFile, LineageRegistration, MemoryProvenance,
-        OrientationBundle, Scope, SessionDelegation, SessionFile, SignedAcknowledgement,
-        SignedContribution,
+        AcceptedObject, ContributionKind, DelegationRevocation, FederationBundle,
+        FederationImportReport, IdentityFile, KeyRotationStatement, LineageRegistration,
+        MemoryProvenance, OrientationBundle, Scope, SessionDelegation, SessionFile,
+        SignedAcknowledgement, SignedContribution, SignedKeyRotation,
     },
 };
 
@@ -94,6 +97,59 @@ pub fn delegation_id(session: &SessionFile) -> Result<String> {
     ))
 }
 
+pub fn make_delegation_revocation(
+    identity: &IdentityFile,
+    delegation_id: impl Into<String>,
+    reason: impl Into<String>,
+) -> Result<DelegationRevocation> {
+    let key = checked_identity_key(identity)?;
+    let mut revocation = DelegationRevocation {
+        protocol: PROTOCOL_VERSION.into(),
+        lineage_id: identity.lineage_id.clone(),
+        delegation_id: delegation_id.into(),
+        reason: reason.into(),
+        created_at: Utc::now(),
+        nonce: nonce()?,
+        signature: String::new(),
+    };
+    revocation.signature = sign_object(&key, REVOCATION_DOMAIN, &revocation)?;
+    Ok(revocation)
+}
+
+pub fn make_key_rotation(
+    identity: &IdentityFile,
+    reason: impl Into<String>,
+    revoke_existing_delegations: bool,
+) -> Result<(IdentityFile, SignedKeyRotation)> {
+    let previous_key = checked_identity_key(identity)?;
+    let new_key = generate_signing_key()?;
+    let new_public_key = encode(new_key.verifying_key().to_bytes());
+    let statement = KeyRotationStatement {
+        protocol: PROTOCOL_VERSION.into(),
+        lineage_id: identity.lineage_id.clone(),
+        previous_public_key: identity.public_key.clone(),
+        new_public_key: new_public_key.clone(),
+        revoke_existing_delegations,
+        reason: reason.into(),
+        created_at: Utc::now(),
+        nonce: nonce()?,
+    };
+    let rotation = SignedKeyRotation {
+        previous_signature: sign_object(&previous_key, KEY_ROTATION_DOMAIN, &statement)?,
+        new_signature: sign_object(&new_key, KEY_ROTATION_DOMAIN, &statement)?,
+        statement,
+    };
+    let new_identity = IdentityFile {
+        protocol: PROTOCOL_VERSION.into(),
+        display_name: identity.display_name.clone(),
+        lineage_id: identity.lineage_id.clone(),
+        created_at: identity.created_at,
+        public_key: new_public_key,
+        secret_key: encode(new_key.to_bytes()),
+    };
+    Ok((new_identity, rotation))
+}
+
 pub fn make_contribution(
     session: &SessionFile,
     kind: ContributionKind,
@@ -144,6 +200,14 @@ pub async fn delegate(server: &str, delegation: &SessionDelegation) -> Result<Ac
     post_json(server, "v1/delegations", delegation).await
 }
 
+pub async fn revoke(server: &str, revocation: &DelegationRevocation) -> Result<AcceptedObject> {
+    post_json(server, "v1/revocations", revocation).await
+}
+
+pub async fn rotate(server: &str, rotation: &SignedKeyRotation) -> Result<AcceptedObject> {
+    post_json(server, "v1/rotations", rotation).await
+}
+
 pub async fn contribute(server: &str, contribution: &SignedContribution) -> Result<AcceptedObject> {
     post_json(server, "v1/contributions", contribution).await
 }
@@ -165,8 +229,42 @@ pub async fn orient(
         url.query_pairs_mut()
             .append_pair("since", &since.to_string());
     }
-    let response = Client::new().get(url).send().await?;
+    let response = http_client()?.get(url).send().await?;
     decode_response(response).await
+}
+
+pub async fn fetch_federation_bundle(
+    server: &str,
+    after: i64,
+    limit: usize,
+) -> Result<FederationBundle> {
+    let mut url = endpoint(server, "v1/federation/bundle")?;
+    url.query_pairs_mut()
+        .append_pair("after", &after.to_string())
+        .append_pair("limit", &limit.clamp(1, MAX_FEDERATION_EVENTS).to_string());
+    let response = http_client()?.get(url).send().await?;
+    decode_response(response).await
+}
+
+pub async fn fetch_relayed_federation_bundle(
+    server: &str,
+    origin_node_id: &str,
+    after: i64,
+    limit: usize,
+) -> Result<FederationBundle> {
+    let mut url = endpoint(server, &format!("v1/federation/bundle/{origin_node_id}"))?;
+    url.query_pairs_mut()
+        .append_pair("after", &after.to_string())
+        .append_pair("limit", &limit.clamp(1, MAX_FEDERATION_EVENTS).to_string());
+    let response = http_client()?.get(url).send().await?;
+    decode_response(response).await
+}
+
+pub async fn push_federation_bundle(
+    server: &str,
+    bundle: &FederationBundle,
+) -> Result<FederationImportReport> {
+    post_json(server, "v1/federation/import", bundle).await
 }
 
 pub fn read_identity(path: impl AsRef<Path>) -> Result<IdentityFile> {
@@ -212,7 +310,7 @@ async fn post_json<T: Serialize, R: DeserializeOwned>(
     path: &str,
     value: &T,
 ) -> Result<R> {
-    let response = Client::new()
+    let response = http_client()?
         .post(endpoint(server, path)?)
         .json(value)
         .send()
@@ -222,7 +320,7 @@ async fn post_json<T: Serialize, R: DeserializeOwned>(
 
 async fn decode_response<R: DeserializeOwned>(response: reqwest::Response) -> Result<R> {
     let status = response.status();
-    let bytes = response.bytes().await?;
+    let bytes = read_bounded_response(response, MAX_FEDERATION_BODY_BYTES).await?;
     if !status.is_success() {
         let message = serde_json::from_slice::<Value>(&bytes)
             .ok()
@@ -240,9 +338,43 @@ async fn decode_response<R: DeserializeOwned>(response: reqwest::Response) -> Re
     serde_json::from_slice(&bytes).map_err(CommonwakeError::from)
 }
 
+async fn read_bounded_response(mut response: reqwest::Response, maximum: usize) -> Result<Vec<u8>> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > maximum as u64)
+    {
+        return Err(CommonwakeError::Validation(format!(
+            "peer response exceeds {maximum} bytes"
+        )));
+    }
+    let capacity = response.content_length().unwrap_or(0).min(maximum as u64) as usize;
+    let mut bytes = Vec::with_capacity(capacity);
+    while let Some(chunk) = response.chunk().await? {
+        if bytes.len().saturating_add(chunk.len()) > maximum {
+            return Err(CommonwakeError::Validation(format!(
+                "peer response exceeds {maximum} decoded bytes"
+            )));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
 fn endpoint(server: &str, path: &str) -> Result<Url> {
     let mut base = Url::parse(server)
         .map_err(|_| CommonwakeError::Validation("server is not a valid URL".into()))?;
+    if !matches!(base.scheme(), "http" | "https") || base.host_str().is_none() {
+        return Err(CommonwakeError::Validation(
+            "server URL must use HTTP or HTTPS and include a host".into(),
+        ));
+    }
+    if !base.username().is_empty() || base.password().is_some() {
+        return Err(CommonwakeError::Validation(
+            "server URL cannot contain credentials".into(),
+        ));
+    }
+    base.set_query(None);
+    base.set_fragment(None);
     if !base.path().ends_with('/') {
         base.set_path(&format!("{}/", base.path()));
     }
@@ -250,6 +382,23 @@ fn endpoint(server: &str, path: &str) -> Result<Url> {
         .map_err(|_| CommonwakeError::Validation("could not construct peer endpoint".into()))
 }
 
+fn http_client() -> Result<Client> {
+    Ok(Client::builder()
+        .connect_timeout(StdDuration::from_secs(10))
+        .timeout(StdDuration::from_secs(60))
+        .build()?)
+}
+
 fn nonce() -> Result<String> {
     Ok(encode(random_32()?))
+}
+
+fn checked_identity_key(identity: &IdentityFile) -> Result<ed25519_dalek::SigningKey> {
+    let key = signing_key_from_b64(&identity.secret_key)?;
+    if encode(key.verifying_key().to_bytes()) != identity.public_key {
+        return Err(CommonwakeError::Unauthorized(
+            "identity secret key does not match its public key".into(),
+        ));
+    }
+    Ok(key)
 }

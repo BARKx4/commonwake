@@ -10,10 +10,13 @@ use crate::error::{CommonwakeError, Result};
 
 pub const LINEAGE_DOMAIN: &str = "commonwake.lineage.v1";
 pub const DELEGATION_DOMAIN: &str = "commonwake.delegation.v1";
+pub const REVOCATION_DOMAIN: &str = "commonwake.delegation-revocation.v1";
+pub const KEY_ROTATION_DOMAIN: &str = "commonwake.key-rotation.v1";
 pub const CONTRIBUTION_DOMAIN: &str = "commonwake.contribution.v1";
 pub const ACK_DOMAIN: &str = "commonwake.ack.v1";
 pub const LOG_DOMAIN: &[u8] = b"commonwake.log.v1\0";
 pub const CHECKPOINT_DOMAIN: &str = "commonwake.checkpoint.v1";
+pub const WITNESS_DOMAIN: &str = "commonwake.checkpoint-witness.v1";
 
 pub fn random_32() -> Result<[u8; 32]> {
     let mut bytes = [0_u8; 32];

@@ -1,6 +1,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::BTreeMap;
 
 use crate::PROTOCOL_VERSION;
 
@@ -44,6 +45,39 @@ pub struct SessionDelegation {
     pub expires_at: DateTime<Utc>,
     pub nonce: String,
     pub signature: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DelegationRevocation {
+    pub protocol: String,
+    pub lineage_id: String,
+    pub delegation_id: String,
+    pub reason: String,
+    pub created_at: DateTime<Utc>,
+    pub nonce: String,
+    pub signature: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KeyRotationStatement {
+    pub protocol: String,
+    pub lineage_id: String,
+    pub previous_public_key: String,
+    pub new_public_key: String,
+    pub revoke_existing_delegations: bool,
+    pub reason: String,
+    pub created_at: DateTime<Utc>,
+    pub nonce: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SignedKeyRotation {
+    pub statement: KeyRotationStatement,
+    pub previous_signature: String,
+    pub new_signature: String,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -359,6 +393,7 @@ pub struct LineageView {
     pub public_key: String,
     pub created_at: DateTime<Utc>,
     pub registered_sequence: i64,
+    pub key_version: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -391,6 +426,10 @@ pub struct EventView {
     pub targets: Vec<String>,
     pub supersedes: Vec<String>,
     pub payload: Value,
+    /// Exact authenticated protocol object used to derive the event id and
+    /// node hash. Projection fields above are conveniences, not a substitute
+    /// for this object when independently verifying provenance.
+    pub canonical: Value,
     pub author_signature: Option<String>,
     pub previous_hash: String,
     pub event_hash: String,
@@ -398,6 +437,7 @@ pub struct EventView {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Checkpoint {
     pub node_id: String,
     pub node_public_key: String,
@@ -405,6 +445,147 @@ pub struct Checkpoint {
     pub event_hash: String,
     pub created_at: DateTime<Utc>,
     pub signature: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OriginEvent {
+    pub sequence: i64,
+    pub event_id: String,
+    pub kind: String,
+    pub lineage_id: Option<String>,
+    pub delegation_id: Option<String>,
+    pub created_at: String,
+    pub received_at: String,
+    pub canonical: Value,
+    pub previous_hash: String,
+    pub event_hash: String,
+    pub node_signature: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FederationBundle {
+    pub protocol: String,
+    pub origin_node_id: String,
+    pub origin_node_public_key: String,
+    pub from_cursor: i64,
+    pub through_cursor: i64,
+    pub events: Vec<OriginEvent>,
+    pub checkpoint: Checkpoint,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CheckpointWitness {
+    pub protocol: String,
+    pub witness_node_id: String,
+    pub witness_node_public_key: String,
+    pub origin_node_id: String,
+    pub origin_node_public_key: String,
+    pub cursor: i64,
+    pub event_hash: String,
+    pub origin_checkpoint: Checkpoint,
+    pub observed_at: DateTime<Utc>,
+    pub signature: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FederationImportReport {
+    pub origin_node_id: String,
+    pub previously_known_cursor: i64,
+    pub imported_events: usize,
+    pub current_cursor: i64,
+    pub current_event_hash: String,
+    pub witness_event_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FederationPeerView {
+    pub node_id: String,
+    pub node_public_key: String,
+    pub first_seen_at: DateTime<Utc>,
+    pub last_seen_at: DateTime<Utc>,
+    pub cursor: i64,
+    pub event_hash: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EquivocationEvidenceView {
+    pub evidence_id: String,
+    pub origin_node_id: String,
+    pub conflict_kind: String,
+    pub cursor: i64,
+    pub existing_hash: String,
+    pub incoming_hash: String,
+    pub existing: Value,
+    pub incoming: Value,
+    pub detected_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FederatedStoryView {
+    pub origin_node_id: String,
+    pub story_id: String,
+    pub title: String,
+    pub first_seen_at: DateTime<Utc>,
+    pub stage: String,
+    pub observations: Vec<ObservationView>,
+    pub assessments: Vec<AssessmentView>,
+    pub related_events: Vec<OriginEvent>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NetworkFeed {
+    pub local: FeedPage,
+    pub federated: FederatedFeedPage,
+    pub provenance_notice: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FederatedFeedPage {
+    /// Present when this is a stable, cursor-paginable page for one origin.
+    pub origin_node_id: Option<String>,
+    pub stories: Vec<FederatedStoryView>,
+    /// Origin sequence cursor. Aggregate multi-origin previews deliberately do
+    /// not invent a global cursor and therefore return `None` here.
+    pub after: Option<i64>,
+    pub next_cursor: Option<i64>,
+    pub has_more: bool,
+    pub pagination_notice: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CoverageGapView {
+    pub coverage_area: String,
+    pub eligible_sources: usize,
+    pub proposed_sources: usize,
+    pub status: String,
+    pub standing_work_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OwnershipConcentrationView {
+    pub ownership_label: String,
+    pub source_manifests: usize,
+    pub eligible_source_manifests: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CoverageReport {
+    pub generated_at: DateTime<Utc>,
+    pub local_source_manifests: usize,
+    pub federated_source_manifests: usize,
+    pub eligible_source_manifests: usize,
+    pub by_status: BTreeMap<String, usize>,
+    pub by_region_or_coverage_tag: BTreeMap<String, usize>,
+    pub by_language: BTreeMap<String, usize>,
+    pub by_medium: BTreeMap<String, usize>,
+    pub by_ownership: BTreeMap<String, usize>,
+    pub missing_ownership_manifests: usize,
+    pub dominant_ownership: Option<OwnershipConcentrationView>,
+    pub standing_gaps: Vec<CoverageGapView>,
+    pub methodology_notice: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -426,6 +607,7 @@ pub struct OrientationBundle {
     pub open_commitments: Vec<EventView>,
     pub corrections: Vec<EventView>,
     pub world_changes: Vec<StoryView>,
+    pub federated_world_changes: Vec<FederatedStoryView>,
     pub next_cursor: i64,
     pub has_more: bool,
 }
@@ -454,6 +636,9 @@ pub struct SourceView {
     pub proposer_lineage_id: String,
     pub approval_count: i64,
     pub rejection_count: i64,
+    pub successful_fetches: i64,
+    pub consecutive_failures: i64,
+    pub last_fetched_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -516,4 +701,13 @@ pub struct WorkItemView {
     pub received_results: i64,
     pub active_claims: i64,
     pub created_sequence: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkPage {
+    pub items: Vec<WorkItemView>,
+    pub after: Option<String>,
+    pub next_cursor: Option<String>,
+    pub has_more: bool,
+    pub kind: Option<String>,
 }

@@ -11,10 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     CONSTITUTION_VERSION, PROTOCOL_VERSION,
-    crypto::{
-        CHECKPOINT_DOMAIN, encode, generate_signing_key, prefixed_id, sha256_hex, sign_object,
-        signing_key_from_b64,
-    },
+    crypto::{encode, generate_signing_key, prefixed_id, sha256_hex, signing_key_from_b64},
     db::Database,
     error::{CommonwakeError, Result},
     model::{Checkpoint, PolicyView},
@@ -142,18 +139,8 @@ impl CommonwakeNode {
     }
 
     pub fn checkpoint(&self) -> Result<Checkpoint> {
-        let (cursor, event_hash) = self.db.current_head()?;
-        let mut checkpoint = Checkpoint {
-            node_id: self.identity.node_id().into(),
-            node_public_key: self.identity.public_key().into(),
-            cursor,
-            event_hash,
-            created_at: Utc::now(),
-            signature: String::new(),
-        };
-        checkpoint.signature =
-            sign_object(self.identity.signing_key(), CHECKPOINT_DOMAIN, &checkpoint)?;
-        Ok(checkpoint)
+        let (cursor, _) = self.db.current_head()?;
+        self.checkpoint_at(cursor)
     }
 
     pub fn created_at(&self) -> DateTime<Utc> {

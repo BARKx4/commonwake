@@ -19,8 +19,10 @@ use crate::{
 };
 
 const MAX_FEED_BYTES: usize = 8 * 1024 * 1024;
-const MAX_TITLE_CHARS: usize = 500;
-const MAX_SUMMARY_CHARS: usize = 2_000;
+const MAX_FEED_ENTRIES: usize = 1_000;
+const MAX_METADATA_VALUES: usize = 64;
+pub(crate) const MAX_TITLE_CHARS: usize = 500;
+pub(crate) const MAX_SUMMARY_CHARS: usize = 2_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IngestReport {
@@ -98,12 +100,7 @@ impl CommonwakeNode {
                 "feed exceeds {MAX_FEED_BYTES} bytes"
             )));
         }
-        let bytes = response.bytes().await?;
-        if bytes.len() > MAX_FEED_BYTES {
-            return Err(CommonwakeError::Validation(format!(
-                "feed exceeds {MAX_FEED_BYTES} bytes"
-            )));
-        }
+        let bytes = read_bounded_response(response, MAX_FEED_BYTES).await?;
         self.ingest_feed_bytes(source, &bytes)
     }
 
@@ -115,6 +112,11 @@ impl CommonwakeNode {
         }
         let feed = feed_rs::parser::parse(bytes)
             .map_err(|error| CommonwakeError::Validation(format!("feed parse failed: {error}")))?;
+        if feed.entries.len() > MAX_FEED_ENTRIES {
+            return Err(CommonwakeError::Validation(format!(
+                "feed contains more than {MAX_FEED_ENTRIES} entries"
+            )));
+        }
         let retrieved_at = Utc::now();
         let language = feed
             .language
@@ -141,8 +143,10 @@ impl CommonwakeNode {
             let raw_metadata = json!({
                 "feed_id": feed.id,
                 "entry_id": entry.id,
-                "authors": entry.authors.iter().map(|author| &author.name).collect::<Vec<_>>(),
-                "categories": entry.categories.iter().map(|category| &category.term).collect::<Vec<_>>(),
+                "authors": entry.authors.iter().take(MAX_METADATA_VALUES)
+                    .map(|author| truncate(&author.name, 200)).collect::<Vec<_>>(),
+                "categories": entry.categories.iter().take(MAX_METADATA_VALUES)
+                    .map(|category| truncate(&category.term, 200)).collect::<Vec<_>>(),
             });
             let document_hash = sha256_hex(
                 serde_jcs::to_vec(&json!({
@@ -176,6 +180,28 @@ impl CommonwakeNode {
 
         Ok((seen, accepted))
     }
+}
+
+async fn read_bounded_response(mut response: reqwest::Response, maximum: usize) -> Result<Vec<u8>> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > maximum as u64)
+    {
+        return Err(CommonwakeError::Validation(format!(
+            "feed exceeds {maximum} bytes"
+        )));
+    }
+    let capacity = response.content_length().unwrap_or(0).min(maximum as u64) as usize;
+    let mut bytes = Vec::with_capacity(capacity);
+    while let Some(chunk) = response.chunk().await? {
+        if bytes.len().saturating_add(chunk.len()) > maximum {
+            return Err(CommonwakeError::Validation(format!(
+                "feed exceeds {maximum} decoded bytes"
+            )));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
 }
 
 async fn feed_client(url: &Url) -> Result<Client> {
@@ -243,13 +269,14 @@ fn validate_fetch_url(url: &Url) -> Result<()> {
 fn reject_private_ip(address: IpAddr) -> Result<()> {
     let disallowed = match address {
         IpAddr::V4(ip) => is_non_public_v4(ip),
-        IpAddr::V6(ip) => ip.to_ipv4_mapped().map_or_else(
+        IpAddr::V6(ip) => ip.to_ipv4().map_or_else(
             || {
                 ip.is_loopback()
                     || ip.is_unspecified()
                     || ip.is_unique_local()
                     || ip.is_unicast_link_local()
                     || ip.is_multicast()
+                    || is_non_public_v6_special(ip)
             },
             is_non_public_v4,
         ),
@@ -260,6 +287,20 @@ fn reject_private_ip(address: IpAddr) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+fn is_non_public_v6_special(ip: std::net::Ipv6Addr) -> bool {
+    let segments = ip.segments();
+    // Deprecated site-local, documentation, benchmarking, 6to4, and the
+    // well-known NAT64 prefix are unsuitable public collector destinations.
+    // 6to4/NAT64 can otherwise encode an IPv4 private target in an apparently
+    // global IPv6 literal.
+    (segments[0] & 0xffc0) == 0xfec0
+        || (segments[0] == 0x2001 && matches!(segments[1], 0x0002 | 0x0db8))
+        || segments[0] == 0x2002
+        || (segments[0] == 0x0064
+            && segments[1] == 0xff9b
+            && segments[2..6].iter().all(|segment| *segment == 0))
 }
 
 fn is_non_public_v4(ip: Ipv4Addr) -> bool {
@@ -282,10 +323,28 @@ fn entry_url(entry: &Entry) -> Option<String> {
     entry
         .links
         .iter()
-        .find(|link| link.rel.as_deref().is_none_or(|rel| rel == "alternate"))
-        .or_else(|| entry.links.first())
-        .map(|link| link.href.clone())
-        .or_else(|| Url::parse(&entry.id).ok().map(|url| url.to_string()))
+        .filter(|link| link.rel.as_deref().is_none_or(|rel| rel == "alternate"))
+        .find_map(|link| normalize_document_url(&link.href))
+        .or_else(|| {
+            entry
+                .links
+                .iter()
+                .find_map(|link| normalize_document_url(&link.href))
+        })
+        .or_else(|| normalize_document_url(&entry.id))
+}
+
+fn normalize_document_url(value: &str) -> Option<String> {
+    let mut url = Url::parse(value).ok()?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return None;
+    }
+    url.set_fragment(None);
+    Some(url.to_string())
 }
 
 fn truncate(value: &str, maximum: usize) -> String {
@@ -308,6 +367,16 @@ mod tests {
         assert!(reject_private_ip("100.64.0.1".parse().unwrap()).is_err());
         assert!(reject_private_ip("198.18.0.1".parse().unwrap()).is_err());
         assert!(reject_private_ip("::ffff:127.0.0.1".parse().unwrap()).is_err());
+        assert!(reject_private_ip("::127.0.0.1".parse().unwrap()).is_err());
+        assert!(reject_private_ip("2001:db8::1".parse().unwrap()).is_err());
+        assert!(reject_private_ip("2002:c0a8:101::".parse().unwrap()).is_err());
+        assert!(reject_private_ip("64:ff9b::7f00:1".parse().unwrap()).is_err());
         assert!(reject_private_ip("93.184.216.34".parse().unwrap()).is_ok());
+        assert_eq!(
+            normalize_document_url("https://example.org/article#section").as_deref(),
+            Some("https://example.org/article")
+        );
+        assert!(normalize_document_url("javascript:alert(1)").is_none());
+        assert!(normalize_document_url("https://agent:secret@example.org/").is_none());
     }
 }
