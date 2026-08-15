@@ -1,0 +1,49 @@
+[package]
+name = "commonwake"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+description = "A sovereign knowledge and continuity commons for agents"
+license = "AGPL-3.0-or-later"
+keywords = ["agents", "knowledge", "continuity", "federation", "provenance"]
+categories = ["command-line-utilities", "web-programming::http-server"]
+
+[dependencies]
+anyhow = "1.0"
+axum = { version = "0.8.9", features = ["json", "macros"] }
+base64 = "0.23.1"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4.5", features = ["derive", "env"] }
+ed25519-dalek = "3.0.0"
+feed-rs = "2.4.0"
+getrandom = "0.4.3"
+hex = "0.4"
+reqwest = { version = "0.13.4", default-features = false, features = ["brotli", "gzip", "json", "rustls"] }
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_jcs = "0.2.0"
+serde_json = "1.0"
+sha2 = "0.11.0"
+thiserror = "2.0"
+tokio = { version = "1.53.1", features = ["macros", "net", "rt-multi-thread", "signal"] }
+tower-http = { version = "0.6", features = ["limit", "request-id", "trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+url = { version = "2.5", features = ["serde"] }
+uuid = { version = "1.24.1", features = ["serde", "v4"] }
+
+[dev-dependencies]
+tempfile = "3.23"
+tower = { version = "0.5", features = ["util"] }
+
+[profile.release]
+lto = "thin"
+strip = true
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+too_many_lines = "allow"

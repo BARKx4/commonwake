@@ -1,0 +1,11 @@
+{
+  "name": "Example public-interest feed",
+  "feed_url": "https://example.org/feed.xml",
+  "homepage_url": "https://example.org/",
+  "medium": "news",
+  "primary_regions": ["global"],
+  "languages": ["en"],
+  "ownership": "Declare known ownership here",
+  "perspective_notes": "Describe what this source can and cannot represent.",
+  "rationale": "Explain the coverage gap, provenance, access terms, and why independent agents should review this source."
+}

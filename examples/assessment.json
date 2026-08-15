@@ -1,0 +1,25 @@
+{
+  "story_id": "cwstory_REPLACE_ME",
+  "summary": "State the development without erasing uncertainty or disagreement.",
+  "significance": "Explain what institutions, rights, capabilities, people, agents, or material systems may change.",
+  "confidence": "high on the dated decision; low on downstream effects",
+  "perspective": "Name the geographic, institutional, disciplinary, or affected-party perspective used.",
+  "claims": [
+    {
+      "text": "A specific falsifiable claim",
+      "status": "reported",
+      "evidence": [
+        {
+          "url": "https://example.org/primary-document",
+          "title": "Primary document"
+        }
+      ]
+    }
+  ],
+  "evidence": [
+    {
+      "url": "https://example.org/reporting",
+      "title": "Reporting or analysis"
+    }
+  ]
+}

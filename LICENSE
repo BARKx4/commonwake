@@ -1,0 +1,11 @@
+Commonwake is licensed under the GNU Affero General Public License,
+version 3 or (at your option) any later version.
+
+SPDX-License-Identifier: AGPL-3.0-or-later
+
+The full license text is included at LICENSES/AGPL-3.0.txt and is also
+available from https://www.gnu.org/licenses/agpl-3.0.txt.
+
+The protocol documents and schemas may be implemented independently without
+requiring compatible licensing. The bundled Agent Skill may be copied and
+adapted under the Apache License 2.0; see .agents/skills/commonwake/LICENSE.

@@ -1,0 +1,98 @@
+{
+  "version": 1,
+  "datasets": [
+    {
+      "name": "skills-general-codex",
+      "phase": 1,
+      "purpose": "Reusable Codex/runtime skills and operator guidance.",
+      "node_sets": [
+        "codex",
+        "skills",
+        "runtime"
+      ],
+      "local_globs": [
+        "C:/Users/lotti/.codex/skills/codex-primary-runtime/**/*.md",
+        "C:/Users/lotti/.agents/skills/superpowers/**/*.md"
+      ],
+      "urls": []
+    },
+    {
+      "name": "repo-commonwake-docs",
+      "phase": 1,
+      "purpose": "Project AGENTS, top-level notes, docs, designs, and configuration markdown.",
+      "node_sets": [
+        "commonwake",
+        "repo-docs",
+        "project"
+      ],
+      "local_globs": [
+        "C:/Users/lotti/Documents/Codex/2026-08-15/let/outputs/commonwake/AGENTS.md",
+        "C:/Users/lotti/Documents/Codex/2026-08-15/let/outputs/commonwake/*.md",
+        "C:/Users/lotti/Documents/Codex/2026-08-15/let/outputs/commonwake/docs/**/*.md",
+        "C:/Users/lotti/Documents/Codex/2026-08-15/let/outputs/commonwake/config/**/*.md",
+        "C:/Users/lotti/Documents/Codex/2026-08-15/let/outputs/commonwake/configs/**/*.md",
+        "C:/Users/lotti/Documents/Codex/2026-08-15/let/outputs/commonwake/design/**/*.md",
+        "C:/Users/lotti/Documents/Codex/2026-08-15/let/outputs/commonwake/spec/**/*.md",
+        "C:/Users/lotti/Documents/Codex/2026-08-15/let/outputs/commonwake/specs/**/*.md",
+        "C:/Users/lotti/Documents/Codex/2026-08-15/let/outputs/commonwake/notes/**/*.md"
+      ],
+      "exclude_globs": [
+        "C:/Users/lotti/Documents/Codex/2026-08-15/let/outputs/commonwake/**/node_modules/**",
+        "C:/Users/lotti/Documents/Codex/2026-08-15/let/outputs/commonwake/**/.venv/**",
+        "C:/Users/lotti/Documents/Codex/2026-08-15/let/outputs/commonwake/**/dist/**",
+        "C:/Users/lotti/Documents/Codex/2026-08-15/let/outputs/commonwake/**/build/**",
+        "C:/Users/lotti/Documents/Codex/2026-08-15/let/outputs/commonwake/**/.next/**",
+        "C:/Users/lotti/Documents/Codex/2026-08-15/let/outputs/commonwake/**/coverage/**"
+      ],
+      "urls": []
+    },
+    {
+      "name": "repo-commonwake-source",
+      "phase": 2,
+      "purpose": "Selected source files for implementation-aware retrieval.",
+      "node_sets": [
+        "commonwake",
+        "repo-source",
+        "implementation"
+      ],
+      "local_globs": [
+        "C:/Users/lotti/Documents/Codex/2026-08-15/let/outputs/commonwake/Cargo.toml",
+        "C:/Users/lotti/Documents/Codex/2026-08-15/let/outputs/commonwake/src/**/*.rs",
+        "C:/Users/lotti/Documents/Codex/2026-08-15/let/outputs/commonwake/tests/**/*.rs",
+        "C:/Users/lotti/Documents/Codex/2026-08-15/let/outputs/commonwake/migrations/**/*.sql",
+        "C:/Users/lotti/Documents/Codex/2026-08-15/let/outputs/commonwake/.agents/skills/**/*.md",
+        "C:/Users/lotti/Documents/Codex/2026-08-15/let/outputs/commonwake/scripts/**/*.py",
+        "C:/Users/lotti/Documents/Codex/2026-08-15/let/outputs/commonwake/scripts/**/*.ts",
+        "C:/Users/lotti/Documents/Codex/2026-08-15/let/outputs/commonwake/scripts/**/*.js",
+        "C:/Users/lotti/Documents/Codex/2026-08-15/let/outputs/commonwake/src/**/*.py",
+        "C:/Users/lotti/Documents/Codex/2026-08-15/let/outputs/commonwake/src/**/*.ts",
+        "C:/Users/lotti/Documents/Codex/2026-08-15/let/outputs/commonwake/src/**/*.tsx",
+        "C:/Users/lotti/Documents/Codex/2026-08-15/let/outputs/commonwake/src/**/*.js",
+        "C:/Users/lotti/Documents/Codex/2026-08-15/let/outputs/commonwake/src/**/*.jsx",
+        "C:/Users/lotti/Documents/Codex/2026-08-15/let/outputs/commonwake/app/**/*.py",
+        "C:/Users/lotti/Documents/Codex/2026-08-15/let/outputs/commonwake/app/**/*.ts",
+        "C:/Users/lotti/Documents/Codex/2026-08-15/let/outputs/commonwake/app/**/*.tsx",
+        "C:/Users/lotti/Documents/Codex/2026-08-15/let/outputs/commonwake/app/**/*.js",
+        "C:/Users/lotti/Documents/Codex/2026-08-15/let/outputs/commonwake/app/**/*.jsx",
+        "C:/Users/lotti/Documents/Codex/2026-08-15/let/outputs/commonwake/server/**/*.py",
+        "C:/Users/lotti/Documents/Codex/2026-08-15/let/outputs/commonwake/server/**/*.ts",
+        "C:/Users/lotti/Documents/Codex/2026-08-15/let/outputs/commonwake/backend/**/*.py",
+        "C:/Users/lotti/Documents/Codex/2026-08-15/let/outputs/commonwake/backend/**/*.ts",
+        "C:/Users/lotti/Documents/Codex/2026-08-15/let/outputs/commonwake/tools/**/*.py",
+        "C:/Users/lotti/Documents/Codex/2026-08-15/let/outputs/commonwake/tools/**/*.ts",
+        "C:/Users/lotti/Documents/Codex/2026-08-15/let/outputs/commonwake/tests/**/*.py",
+        "C:/Users/lotti/Documents/Codex/2026-08-15/let/outputs/commonwake/tests/**/*.ts"
+      ],
+      "exclude_globs": [
+        "C:/Users/lotti/Documents/Codex/2026-08-15/let/outputs/commonwake/**/node_modules/**",
+        "C:/Users/lotti/Documents/Codex/2026-08-15/let/outputs/commonwake/**/.venv/**",
+        "C:/Users/lotti/Documents/Codex/2026-08-15/let/outputs/commonwake/**/dist/**",
+        "C:/Users/lotti/Documents/Codex/2026-08-15/let/outputs/commonwake/**/build/**",
+        "C:/Users/lotti/Documents/Codex/2026-08-15/let/outputs/commonwake/**/.next/**",
+        "C:/Users/lotti/Documents/Codex/2026-08-15/let/outputs/commonwake/**/coverage/**",
+        "C:/Users/lotti/Documents/Codex/2026-08-15/let/outputs/commonwake/**/__pycache__/**"
+      ],
+      "urls": []
+    }
+  ]
+}

@@ -1,0 +1,8 @@
+interface:
+  display_name: "Commonwake"
+  short_description: "Wake into cited world changes and communal verification"
+  brand_color: "#315C4C"
+  default_prompt: "Use Commonwake to orient this lineage to verified world changes, preserve disagreement, and acknowledge only after durable processing."
+
+policy:
+  allow_implicit_invocation: true

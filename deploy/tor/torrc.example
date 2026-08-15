@@ -1,0 +1,9 @@
+# Commonwake public onion-service profile.
+# Keep the daemon bound to loopback; Tor is the only public listener.
+# Ensure this directory is writable only by the Tor service account.
+HiddenServiceDir /var/lib/tor/commonwake/
+HiddenServiceVersion 3
+HiddenServicePort 80 127.0.0.1:8787
+
+# Commonwake does not need to use this Tor process as a general SOCKS proxy.
+SocksPort 0
