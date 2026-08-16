@@ -4,7 +4,7 @@ use std::{
     sync::{Mutex, MutexGuard},
 };
 
-use chrono::{DateTime, SecondsFormat, Utc};
+use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use ed25519_dalek::Verifier;
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
@@ -18,7 +18,7 @@ use crate::{
         prefixed_id, signature_from_b64, verify_object, verifying_key_from_b64,
     },
     error::{CommonwakeError, Result},
-    federation::MAX_CANONICAL_OBJECT_BYTES,
+    federation::{MAX_CANONICAL_OBJECT_BYTES, verify_replication_receipt},
     ingest::{MAX_SUMMARY_CHARS, MAX_TITLE_CHARS},
     model::{
         AcceptedObject, AssessmentPayload, AssessmentView, CheckpointWitness, Claim,
@@ -26,10 +26,10 @@ use crate::{
         EquivocationEvidenceView, EventView, EvidenceRef, FederatedFeedPage, FederatedStoryView,
         FederationBundle, FederationImportReport, FederationPeerView, FeedPage,
         LineageRegistration, LineageView, ObservationVerificationPayload, ObservationView,
-        OriginEvent, OwnershipConcentrationView, Scope, SessionDelegation, SignedAcknowledgement,
-        SignedContribution, SignedKeyRotation, SourceProposalPayload, SourceReviewPayload,
-        SourceView, StoryLinkPayload, StoryView, WorkClaimPayload, WorkItemView, WorkPage,
-        WorkResultPayload,
+        OriginEvent, OwnershipConcentrationView, PublicationTargetView, ReplicationHealth,
+        ReplicationReceipt, Scope, SessionDelegation, SignedAcknowledgement, SignedContribution,
+        SignedKeyRotation, SourceProposalPayload, SourceReviewPayload, SourceView,
+        StoryLinkPayload, StoryView, WorkClaimPayload, WorkItemView, WorkPage, WorkResultPayload,
     },
     node::NodeIdentity,
     service::{
@@ -43,7 +43,8 @@ const MIGRATION_0001: &str = include_str!("../migrations/0001_init.sql");
 const MIGRATION_0002: &str = include_str!("../migrations/0002_authority.sql");
 const MIGRATION_0003: &str = include_str!("../migrations/0003_federation.sql");
 const MIGRATION_0004: &str = include_str!("../migrations/0004_federated_orientation.sql");
-const SCHEMA_VERSION: i64 = 4;
+const MIGRATION_0005: &str = include_str!("../migrations/0005_outbound_publication.sql");
+const SCHEMA_VERSION: i64 = 5;
 const ZERO_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 const BOOTSTRAP_SOURCE_COVERAGE: &[(&str, &str)] = &[
     (
@@ -244,6 +245,10 @@ impl Database {
         }
         if schema_version < 4 {
             connection.execute_batch(MIGRATION_0004)?;
+            schema_version = 4;
+        }
+        if schema_version < 5 {
+            connection.execute_batch(MIGRATION_0005)?;
         }
         seed_bootstrap_work(&connection)?;
         Ok(Self {
@@ -1616,6 +1621,7 @@ impl Database {
             None => (-1, String::new()),
         };
         let connection = self.lock()?;
+        refresh_replication_work(&connection)?;
         let mut statement = connection.prepare(
             "SELECT work_id, kind, subject_type, subject_id, instructions,
                     required_results, created_sequence
@@ -1704,6 +1710,289 @@ impl Database {
             });
         }
         Ok(peers)
+    }
+
+    pub fn configure_publication_target(&self, endpoint: &str) -> Result<()> {
+        if endpoint.is_empty() || endpoint.len() > 2_048 {
+            return Err(CommonwakeError::Validation(
+                "publication endpoint must contain 1 to 2048 characters".into(),
+            ));
+        }
+        let now = timestamp(Utc::now());
+        let connection = self.lock()?;
+        connection.execute(
+            "INSERT OR IGNORE INTO publication_targets(
+                endpoint, created_at, updated_at
+             ) VALUES (?1, ?2, ?2)",
+            params![endpoint, now],
+        )?;
+        refresh_replication_work(&connection)?;
+        Ok(())
+    }
+
+    pub fn set_desired_replicas(&self, desired_replicas: u32) -> Result<()> {
+        if !(1..=16).contains(&desired_replicas) {
+            return Err(CommonwakeError::Validation(
+                "desired replicas must be between 1 and 16".into(),
+            ));
+        }
+        let connection = self.lock()?;
+        connection.execute(
+            "INSERT INTO meta(key, value) VALUES ('desired_replicas', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [desired_replicas.to_string()],
+        )?;
+        refresh_replication_work(&connection)?;
+        Ok(())
+    }
+
+    pub fn record_publication_success(
+        &self,
+        identity: &NodeIdentity,
+        endpoint: &str,
+        receipt: &ReplicationReceipt,
+    ) -> Result<()> {
+        verify_replication_receipt(receipt)?;
+        let checkpoint = &receipt.origin_checkpoint;
+        if checkpoint.node_id != identity.node_id()
+            || checkpoint.node_public_key != identity.public_key()
+        {
+            return Err(CommonwakeError::Unauthorized(
+                "replication receipt describes a different origin".into(),
+            ));
+        }
+
+        let connection = self.lock()?;
+        let local_event_hash = if checkpoint.cursor == 0 {
+            Some(ZERO_HASH.into())
+        } else {
+            connection
+                .query_row(
+                    "SELECT event_hash FROM events WHERE sequence = ?1",
+                    [checkpoint.cursor],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?
+        };
+        if local_event_hash.as_deref() != Some(&checkpoint.event_hash) {
+            return Err(CommonwakeError::Unauthorized(
+                "replication receipt checkpoint is not on the local origin hash chain".into(),
+            ));
+        }
+        let stored: Option<(Option<String>, Option<String>, i64, String)> = connection
+            .query_row(
+                "SELECT relay_node_id, relay_node_public_key,
+                        acknowledged_cursor, acknowledged_event_hash
+                 FROM publication_targets WHERE endpoint = ?1",
+                [endpoint],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?;
+        let Some((relay_node_id, relay_node_public_key, cursor, event_hash)) = stored else {
+            return Err(CommonwakeError::NotFound(format!(
+                "publication target {endpoint}"
+            )));
+        };
+        if relay_node_id
+            .as_deref()
+            .is_some_and(|known| known != receipt.relay_node_id)
+            || relay_node_public_key
+                .as_deref()
+                .is_some_and(|known| known != receipt.relay_node_public_key)
+        {
+            return Err(CommonwakeError::Conflict(format!(
+                "publication target {endpoint} changed relay identity"
+            )));
+        }
+        if checkpoint.cursor < cursor
+            || (checkpoint.cursor == cursor && checkpoint.event_hash != event_hash)
+        {
+            return Err(CommonwakeError::Conflict(
+                "replication receipt regresses or conflicts with the acknowledged origin head"
+                    .into(),
+            ));
+        }
+
+        let now = timestamp(Utc::now());
+        connection.execute(
+            "UPDATE publication_targets SET
+                relay_node_id = ?2,
+                relay_node_public_key = ?3,
+                acknowledged_cursor = ?4,
+                acknowledged_event_hash = ?5,
+                receipt_json = ?6,
+                updated_at = ?7,
+                last_attempt_at = ?7,
+                last_success_at = ?7,
+                consecutive_failures = 0,
+                next_attempt_at = NULL,
+                last_error = NULL
+             WHERE endpoint = ?1",
+            params![
+                endpoint,
+                receipt.relay_node_id,
+                receipt.relay_node_public_key,
+                checkpoint.cursor,
+                checkpoint.event_hash,
+                serde_json::to_string(receipt)?,
+                now,
+            ],
+        )?;
+        refresh_replication_work(&connection)?;
+        Ok(())
+    }
+
+    pub fn record_publication_failure(
+        &self,
+        endpoint: &str,
+        error: &str,
+        next_attempt_at: DateTime<Utc>,
+    ) -> Result<()> {
+        let now = timestamp(Utc::now());
+        let bounded_error: String = error.chars().take(1_024).collect();
+        let connection = self.lock()?;
+        let updated = connection.execute(
+            "UPDATE publication_targets SET
+                updated_at = ?2,
+                last_attempt_at = ?2,
+                consecutive_failures = consecutive_failures + 1,
+                next_attempt_at = ?3,
+                last_error = ?4
+             WHERE endpoint = ?1",
+            params![endpoint, now, timestamp(next_attempt_at), bounded_error],
+        )?;
+        if updated == 0 {
+            return Err(CommonwakeError::NotFound(format!(
+                "publication target {endpoint}"
+            )));
+        }
+        refresh_replication_work(&connection)?;
+        Ok(())
+    }
+
+    pub fn replication_health(&self, identity: &NodeIdentity) -> Result<ReplicationHealth> {
+        const RECENT_CONFIRMATION_HOURS: i64 = 24;
+
+        let now = Utc::now();
+        let recent_after = now - Duration::hours(RECENT_CONFIRMATION_HOURS);
+        let connection = self.lock()?;
+        let desired_replicas: u32 = connection
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'desired_replicas'",
+                [],
+                |row| row.get::<_, String>(0),
+            )?
+            .parse()
+            .map_err(|_| CommonwakeError::Internal("stored replica target is malformed".into()))?;
+        let (current_cursor, current_event_hash) = connection
+            .query_row(
+                "SELECT sequence, event_hash FROM events ORDER BY sequence DESC LIMIT 1",
+                [],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?
+            .unwrap_or((0, ZERO_HASH.into()));
+        let mut statement = connection.prepare(
+            "SELECT endpoint, relay_node_id, relay_node_public_key,
+                    acknowledged_cursor, acknowledged_event_hash, receipt_json,
+                    last_attempt_at, last_success_at, consecutive_failures,
+                    next_attempt_at, last_error
+             FROM publication_targets ORDER BY created_at ASC, endpoint ASC",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, i64>(8)?,
+                row.get::<_, Option<String>>(9)?,
+                row.get::<_, Option<String>>(10)?,
+            ))
+        })?;
+        let mut targets = Vec::new();
+        let mut confirmed = BTreeSet::new();
+        let mut recent = BTreeSet::new();
+        for row in rows {
+            let row = row?;
+            let receipt = row
+                .5
+                .as_deref()
+                .map(serde_json::from_str::<ReplicationReceipt>)
+                .transpose()?;
+            if let Some(receipt) = &receipt {
+                verify_replication_receipt(receipt)?;
+                if receipt.origin_checkpoint.node_id != identity.node_id()
+                    || receipt.origin_checkpoint.node_public_key != identity.public_key()
+                    || row.1.as_deref() != Some(&receipt.relay_node_id)
+                    || row.2.as_deref() != Some(&receipt.relay_node_public_key)
+                    || row.3 != receipt.origin_checkpoint.cursor
+                    || row.4 != receipt.origin_checkpoint.event_hash
+                {
+                    return Err(CommonwakeError::Internal(format!(
+                        "stored replication receipt for {} does not match its publication state",
+                        row.0
+                    )));
+                }
+            }
+            let last_attempt_at = row.6.as_deref().map(parse_timestamp).transpose()?;
+            let last_success_at = row.7.as_deref().map(parse_timestamp).transpose()?;
+            let next_attempt_at = row.9.as_deref().map(parse_timestamp).transpose()?;
+            let at_current_head =
+                receipt.is_some() && row.3 == current_cursor && row.4 == current_event_hash;
+            let recently_reconfirmed = at_current_head
+                && last_success_at.is_some_and(|confirmed_at| confirmed_at >= recent_after);
+            if at_current_head && let Some(relay_node_id) = &row.1 {
+                confirmed.insert(relay_node_id.clone());
+                if recently_reconfirmed {
+                    recent.insert(relay_node_id.clone());
+                }
+            }
+            targets.push(PublicationTargetView {
+                endpoint: row.0,
+                relay_node_id: row.1,
+                relay_node_public_key: row.2,
+                acknowledged_cursor: row.3,
+                acknowledged_event_hash: row.4,
+                at_current_head,
+                recently_reconfirmed,
+                last_attempt_at,
+                last_success_at,
+                consecutive_failures: u32::try_from(row.8).map_err(|_| {
+                    CommonwakeError::Internal("stored publication failure count is invalid".into())
+                })?,
+                next_attempt_at,
+                last_error: row.10,
+                receipt,
+            });
+        }
+        let status = if targets.is_empty() {
+            "unconfigured"
+        } else if recent.len() >= desired_replicas as usize {
+            "replicated"
+        } else if recent.is_empty() {
+            "unreplicated"
+        } else {
+            "degraded"
+        };
+        Ok(ReplicationHealth {
+            generated_at: now,
+            origin_node_id: identity.node_id().into(),
+            current_cursor,
+            current_event_hash,
+            desired_replicas,
+            confirmed_current_replicas: confirmed.len(),
+            recently_reconfirmed_current_replicas: recent.len(),
+            status: status.into(),
+            targets,
+            receipt_notice: format!(
+                "A signed receipt attributes a retention claim to a relay; recent means confirmed by this node within {RECENT_CONFIRMATION_HOURS} hours and does not prove present availability."
+            ),
+        })
     }
 
     pub fn remote_events(
@@ -4033,6 +4322,72 @@ fn seed_bootstrap_work(connection: &Connection) -> Result<()> {
                 required_results, status, created_sequence
              ) VALUES (?1, ?2, 'coverage_area', ?3, ?4, 0, 'open', 0)",
             params![work_id, kind, subject_id, instructions],
+        )?;
+    }
+    Ok(())
+}
+
+fn refresh_replication_work(connection: &Connection) -> Result<()> {
+    let node_id: Option<String> = connection
+        .query_row("SELECT value FROM meta WHERE key = 'node_id'", [], |row| {
+            row.get(0)
+        })
+        .optional()?;
+    let Some(node_id) = node_id else {
+        return Ok(());
+    };
+    let desired_replicas: i64 = connection
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'desired_replicas'",
+            [],
+            |row| row.get::<_, String>(0),
+        )?
+        .parse()
+        .map_err(|_| CommonwakeError::Internal("stored replica target is malformed".into()))?;
+    let (cursor, event_hash) = connection
+        .query_row(
+            "SELECT sequence, event_hash FROM events ORDER BY sequence DESC LIMIT 1",
+            [],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?
+        .unwrap_or((0, ZERO_HASH.into()));
+    let recent_after = timestamp(Utc::now() - Duration::hours(24));
+    let confirmed: i64 = connection.query_row(
+        "SELECT COUNT(DISTINCT relay_node_id) FROM publication_targets
+         WHERE receipt_json IS NOT NULL
+           AND acknowledged_cursor = ?1
+           AND acknowledged_event_hash = ?2
+           AND last_success_at >= ?3",
+        params![cursor, event_hash, recent_after],
+        |row| row.get(0),
+    )?;
+    let kind = "replicate_origin";
+    let work_id = prefixed_id("cwwork_", format!("{kind}\0{node_id}").as_bytes());
+    let instructions = format!(
+        "Help preserve origin {node_id} through at least {desired_replicas} distinct independently operated relays. Operate or nominate a relay only through locally authorized publication configuration, then require a valid signed replication receipt for the current head. A URL is not a replica, two URLs backed by one relay identity count once, and node or lineage secret keys must never be shared. Participation is voluntary."
+    );
+    connection.execute(
+        "INSERT OR IGNORE INTO work_items(
+            work_id, kind, subject_type, subject_id, instructions,
+            required_results, status, created_sequence
+         ) VALUES (?1, ?2, 'origin_node', ?3, ?4, 0, 'open', ?5)",
+        params![work_id, kind, node_id, instructions, cursor],
+    )?;
+    if confirmed >= desired_replicas {
+        connection.execute(
+            "UPDATE work_items SET
+                instructions = ?2, status = 'complete', completed_sequence = ?3
+             WHERE work_id = ?1",
+            params![work_id, instructions, cursor],
+        )?;
+    } else {
+        connection.execute(
+            "UPDATE work_items SET
+                instructions = ?2, status = 'open', created_sequence = ?3,
+                completed_sequence = NULL
+             WHERE work_id = ?1",
+            params![work_id, instructions, cursor],
         )?;
     }
     Ok(())

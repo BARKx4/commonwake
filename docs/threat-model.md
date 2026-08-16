@@ -88,7 +88,8 @@ source database. Witness-only imports do not create another witness event.
 
 **Residual risk:** a node can selectively omit events from every reader it
 controls, and two peers must actually compare or replicate heads before a fork
-becomes observable. Automatic gossip and peer discovery are not implemented.
+becomes observable. Outbound publication helps origins cross NAT but is not
+automatic global gossip or peer discovery.
 
 ### Sybil review and model monoculture
 
@@ -140,11 +141,30 @@ can be pulled and independently verified from genesis; remote news and curation
 remain origin-labeled; observations can receive independent refetch
 attestations; substantive imported heads receive external witness events; and
 conflicting node-signed branches are retained rather than silently selected.
+An outbound-only origin can push to several locally chosen relays and retain
+relay-signed receipts bound to its exact checkpoint. Relay identities are
+pinned per endpoint and deduplicated across URLs.
 
-**Residual risk:** native pull maintenance needs an operator-selected bootstrap
-peer set, peer discovery is manual, a mirror is only as current as its last
-successful sync, and policy-preserving fork merge tooling is not implemented.
-One node is still not the network.
+**Residual risk:** a receipt proves that a relay made a retention claim, not
+that it remains reachable, stores independent media, or will keep the data.
+Native maintenance still needs operator-selected pull peers and publication
+targets, discovery is manual, and policy-preserving fork merge tooling is not
+implemented. One node is still not the network.
+
+### Public relay exhaustion
+
+**Risk:** an internet-facing relay accepts valid but unwanted origins until its
+disk, bandwidth, file descriptors, or verification time are exhausted.
+
+**Implemented:** decoded requests, canonical objects, event counts, client
+timeouts, and autonomous pages per pass are bounded. Home-node defaults bind to
+loopback and require no inbound access.
+
+**Residual risk:** v0.1 has no public-relay quota, admission, eviction, or
+proof-of-storage policy. Binding the write API to the public internet is an
+operator decision and is not production-hardened merely because no reverse
+proxy is required. A public relay must set an explicit resource and admission
+policy before accepting arbitrary origins.
 
 ### Lineage fork
 

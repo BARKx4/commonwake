@@ -138,6 +138,24 @@ impl CommonwakeNode {
         })
     }
 
+    /// Open an existing node or initialize a genuinely empty location.
+    ///
+    /// A database without its node key is never silently rebound to a new
+    /// identity; that is a recovery problem and must fail loudly.
+    pub fn open_or_initialize(data_dir: impl AsRef<Path>) -> Result<(Self, bool)> {
+        let data_dir = data_dir.as_ref();
+        if data_dir.join(NODE_KEY_FILE).exists() {
+            return Ok((Self::open(data_dir)?, false));
+        }
+        if data_dir.join(DATABASE_FILE).exists() {
+            return Err(CommonwakeError::Conflict(format!(
+                "database exists at {} but its node key is missing; restore node-key.json instead of creating a new identity",
+                data_dir.display()
+            )));
+        }
+        Ok((Self::initialize(data_dir)?, true))
+    }
+
     pub fn checkpoint(&self) -> Result<Checkpoint> {
         let (cursor, _) = self.db.current_head()?;
         self.checkpoint_at(cursor)

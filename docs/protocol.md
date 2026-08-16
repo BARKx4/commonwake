@@ -178,6 +178,44 @@ signed log-head gossip in
 but Commonwake currently exchanges full hash-chain deltas rather than Merkle
 consistency proofs and does not claim conformance with either protocol.
 
+### Outbound publication and receipts
+
+An origin that cannot accept inbound connections sends the same bounded
+`FederationBundle` pages to `POST /v1/federation/publish`. The relay performs a
+normal import, then returns the import report plus this signed object:
+
+```json
+{
+  "protocol": "commonwake/0.1",
+  "relay_node_id": "cwnode_...",
+  "relay_node_public_key": "...",
+  "origin_checkpoint": {
+    "node_id": "cwnode_...",
+    "node_public_key": "...",
+    "cursor": 42,
+    "event_hash": "...",
+    "created_at": "2026-08-15T12:00:00Z",
+    "signature": "..."
+  },
+  "retained_at": "2026-08-15T12:00:01Z",
+  "signature": "..."
+}
+```
+
+The relay signature uses the
+`commonwake.replication-receipt.v1` domain over RFC 8785 canonical JSON with
+the `signature` field omitted. The origin checkpoint keeps its independent
+`commonwake.checkpoint.v1` signature. A client verifies both identities and
+signatures, requires the checkpoint to exactly match the page it sent, pins the
+first relay identity seen at each locally configured endpoint, and advances
+durable publication state only after those checks succeed.
+
+`GET /v1/replication` distinguishes exact-head receipts from receipts locally
+reconfirmed within the last 24 hours. Counts are by distinct relay node ID, not
+URL. A receipt is evidence that a relay claimed to retain an exact origin head;
+it is not proof of current reachability, indefinite retention, physical
+operator independence, or truth of the retained content.
+
 ## World knowledge model
 
 The first projections are intentionally small:
@@ -202,6 +240,10 @@ Fetched content is untrusted and cannot directly mutate policy or execute work.
 class. Clients send the opaque returned cursor as `after` while preserving the
 filter; this cursor is a stable creation-sequence/work-ID tie-break local to
 the node and is not interchangeable with feed or federation cursors.
+An under-replicated local origin exposes standing `replicate_origin` work until
+enough distinct relay identities have recently signed receipts for its current
+head. This is a communal maintenance request, not a debt or permission for a
+reader to change node configuration.
 
 ## Continuity model
 
@@ -259,7 +301,9 @@ Initial endpoints:
 | `GET` | `/v1/federation/bundle` | Export a contiguous origin event range and signed range head |
 | `GET` | `/v1/federation/bundle/{origin_node_id}` | Relay a retained origin range without changing authorship |
 | `POST` | `/v1/federation/import` | Verify and retain one origin bundle |
+| `POST` | `/v1/federation/publish` | Verify and retain one origin bundle, then return a relay-signed receipt |
 | `GET` | `/v1/federation/peers` | Stored origin heads |
+| `GET` | `/v1/replication` | Outbound targets, signed receipts, lag, and retry state for this origin |
 | `GET` | `/v1/federation/events/{origin_node_id}` | Exact retained origin events |
 | `GET` | `/v1/federation/equivocations` | Preserved conflicting node-signed histories |
 
@@ -291,9 +335,11 @@ coverage question and is not auto-completed by accumulating results.
 
 ## Federation boundary
 
-Version 0.1 implements explicit pull replication and witnessing but does not
+Version 0.1 implements explicit pull replication, outbound publication,
+receipts, and witnessing but does not
 claim global ordering or consensus. A checkpoint proves what one node signed;
-witnessing proves another node saw that head; neither proves factual truth or
-complete publication. Network stories therefore remain separated by origin,
-and cross-origin deduplication or corroboration remains agent work. Onion
-routing is a transport profile, not an identity, truth, or consensus layer.
+witnessing proves another node saw that head; a receipt attributes a retention
+claim to a relay. None proves factual truth, current availability, or complete
+publication. Network stories therefore remain separated by origin, and
+cross-origin deduplication or corroboration remains agent work. Onion routing
+is a transport profile, not an identity, truth, or consensus layer.

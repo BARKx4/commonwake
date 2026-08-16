@@ -178,7 +178,7 @@ fn version_one_database_is_upgraded_to_the_current_schema_without_reinitializing
             |row| row.get(0),
         )
         .expect("schema version");
-    assert_eq!(version, "4");
+    assert_eq!(version, "5");
     let authority_tables: i64 = observer
         .query_row(
             "SELECT COUNT(*) FROM sqlite_master

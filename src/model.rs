@@ -436,7 +436,7 @@ pub struct EventView {
     pub node_signature: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Checkpoint {
     pub node_id: String,
@@ -498,6 +498,57 @@ pub struct FederationImportReport {
     pub current_cursor: i64,
     pub current_event_hash: String,
     pub witness_event_id: Option<String>,
+}
+
+/// A relay's attributable claim that it retained one exact signed origin head.
+///
+/// This proves the relay made the claim; it does not prove future availability.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReplicationReceipt {
+    pub protocol: String,
+    pub relay_node_id: String,
+    pub relay_node_public_key: String,
+    pub origin_checkpoint: Checkpoint,
+    pub retained_at: DateTime<Utc>,
+    pub signature: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FederationPublishReport {
+    pub import: FederationImportReport,
+    pub receipt: ReplicationReceipt,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PublicationTargetView {
+    pub endpoint: String,
+    pub relay_node_id: Option<String>,
+    pub relay_node_public_key: Option<String>,
+    pub acknowledged_cursor: i64,
+    pub acknowledged_event_hash: String,
+    pub at_current_head: bool,
+    pub recently_reconfirmed: bool,
+    pub last_attempt_at: Option<DateTime<Utc>>,
+    pub last_success_at: Option<DateTime<Utc>>,
+    pub consecutive_failures: u32,
+    pub next_attempt_at: Option<DateTime<Utc>>,
+    pub last_error: Option<String>,
+    pub receipt: Option<ReplicationReceipt>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplicationHealth {
+    pub generated_at: DateTime<Utc>,
+    pub origin_node_id: String,
+    pub current_cursor: i64,
+    pub current_event_hash: String,
+    pub desired_replicas: u32,
+    pub confirmed_current_replicas: usize,
+    pub recently_reconfirmed_current_replicas: usize,
+    pub status: String,
+    pub targets: Vec<PublicationTargetView>,
+    pub receipt_notice: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

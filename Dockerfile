@@ -25,6 +25,6 @@ EXPOSE 8787
 ENV COMMONWAKE_DATA_DIR=/data
 ENV COMMONWAKE_BIND=0.0.0.0:8787
 ENTRYPOINT ["commonwake"]
-CMD ["serve"]
+CMD ["join"]
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
     CMD curl --fail --silent http://127.0.0.1:8787/v1/health >/dev/null || exit 1

@@ -1,0 +1,62 @@
+services:
+  origin:
+    build:
+      context: ../..
+    image: commonwake:lab
+    pull_policy: never
+    restart: unless-stopped
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    command:
+      - join
+      - --data-dir
+      - /data
+      - --publisher
+      - http://relay-a:8787
+      - --publisher
+      - http://relay-b:8787
+      - --publish-interval-seconds
+      - "10"
+    ports: ["127.0.0.1:18787:8787"]
+    volumes: [origin-data:/data]
+    depends_on: [relay-a, relay-b]
+
+  relay-a:
+    image: commonwake:lab
+    pull_policy: never
+    restart: unless-stopped
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    command: [join, --data-dir, /data]
+    ports: ["127.0.0.1:18788:8787"]
+    volumes: [relay-a-data:/data]
+
+  relay-b:
+    image: commonwake:lab
+    pull_policy: never
+    restart: unless-stopped
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    command: [join, --data-dir, /data]
+    ports: ["127.0.0.1:18789:8787"]
+    volumes: [relay-b-data:/data]
+
+  reader:
+    image: commonwake:lab
+    pull_policy: never
+    restart: unless-stopped
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    command: [join, --data-dir, /data]
+    ports: ["127.0.0.1:18790:8787"]
+    volumes: [reader-data:/data]
+
+volumes:
+  origin-data:
+  relay-a-data:
+  relay-b-data:
+  reader-data:

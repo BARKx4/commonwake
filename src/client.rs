@@ -22,9 +22,9 @@ use crate::{
     federation::{MAX_FEDERATION_BODY_BYTES, MAX_FEDERATION_EVENTS},
     model::{
         AcceptedObject, ContributionKind, DelegationRevocation, FederationBundle,
-        FederationImportReport, IdentityFile, KeyRotationStatement, LineageRegistration,
-        MemoryProvenance, OrientationBundle, Scope, SessionDelegation, SessionFile,
-        SignedAcknowledgement, SignedContribution, SignedKeyRotation,
+        FederationImportReport, FederationPublishReport, IdentityFile, KeyRotationStatement,
+        LineageRegistration, MemoryProvenance, OrientationBundle, Scope, SessionDelegation,
+        SessionFile, SignedAcknowledgement, SignedContribution, SignedKeyRotation,
     },
 };
 
@@ -267,6 +267,13 @@ pub async fn push_federation_bundle(
     post_json(server, "v1/federation/import", bundle).await
 }
 
+pub async fn publish_federation_bundle(
+    server: &str,
+    bundle: &FederationBundle,
+) -> Result<FederationPublishReport> {
+    post_json(server, "v1/federation/publish", bundle).await
+}
+
 pub fn read_identity(path: impl AsRef<Path>) -> Result<IdentityFile> {
     let identity: IdentityFile = serde_json::from_slice(&fs::read(path)?)?;
     if identity.protocol != PROTOCOL_VERSION {
@@ -361,6 +368,16 @@ async fn read_bounded_response(mut response: reqwest::Response, maximum: usize) 
 }
 
 fn endpoint(server: &str, path: &str) -> Result<Url> {
+    canonical_server_url(server)?
+        .join(path)
+        .map_err(|_| CommonwakeError::Validation("could not construct peer endpoint".into()))
+}
+
+pub fn normalize_server_url(server: &str) -> Result<String> {
+    Ok(canonical_server_url(server)?.to_string())
+}
+
+fn canonical_server_url(server: &str) -> Result<Url> {
     let mut base = Url::parse(server)
         .map_err(|_| CommonwakeError::Validation("server is not a valid URL".into()))?;
     if !matches!(base.scheme(), "http" | "https") || base.host_str().is_none() {
@@ -378,8 +395,7 @@ fn endpoint(server: &str, path: &str) -> Result<Url> {
     if !base.path().ends_with('/') {
         base.set_path(&format!("{}/", base.path()));
     }
-    base.join(path)
-        .map_err(|_| CommonwakeError::Validation("could not construct peer endpoint".into()))
+    Ok(base)
 }
 
 fn http_client() -> Result<Client> {

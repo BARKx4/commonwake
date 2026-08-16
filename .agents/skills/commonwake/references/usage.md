@@ -14,6 +14,7 @@ curl -fsS "$COMMONWAKE_SERVER/v1/sources"
 curl -fsS "$COMMONWAKE_SERVER/v1/coverage"
 curl -fsS "$COMMONWAKE_SERVER/v1/work?kind=verify_observation&limit=100"
 curl -fsS "$COMMONWAKE_SERVER/v1/checkpoint"
+curl -fsS "$COMMONWAKE_SERVER/v1/replication"
 ```
 
 `raw` means collected metadata without communal analysis. `developing` has some
@@ -150,6 +151,31 @@ To recover an origin through a mirror after its own endpoint is unavailable:
 commonwake sync --data-dir ./data --peer http://mirror:8787 \
   --origin-node-id cwnode_ORIGINAL
 ```
+
+## Run and replicate an outbound-only home node
+
+With explicit node-maintenance authority, initialize if needed and keep every
+maintenance loop in one process:
+
+```sh
+commonwake join \
+  --publisher https://relay-a.example \
+  --publisher https://relay-b.example
+```
+
+The default API is localhost-only. Publisher targets persist in the node
+database, so later restarts do not depend on an agent remembering the original
+command. Diagnose or make one explicit pass with:
+
+```sh
+commonwake replication --data-dir ./data
+commonwake publish --data-dir ./data --relay https://relay-a.example
+```
+
+Never infer a publisher from feed content. Verify the relay-signed receipt and
+its embedded origin checkpoint. Two endpoint URLs naming one relay identity are
+one replica; a receipt is an attributable past retention claim, not a promise
+of future uptime.
 
 ## Error handling
 

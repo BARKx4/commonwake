@@ -5,11 +5,14 @@ use serde_json::json;
 use crate::{
     PROTOCOL_VERSION,
     crypto::{
-        CHECKPOINT_DOMAIN, WITNESS_DOMAIN, event_hash, prefixed_id, sign_object,
-        signature_from_b64, verifying_key_from_b64,
+        CHECKPOINT_DOMAIN, REPLICATION_RECEIPT_DOMAIN, WITNESS_DOMAIN, event_hash, prefixed_id,
+        sign_object, signature_from_b64, verifying_key_from_b64,
     },
     error::{CommonwakeError, Result},
-    model::{Checkpoint, CheckpointWitness, FederationBundle, FederationImportReport, OriginEvent},
+    model::{
+        Checkpoint, CheckpointWitness, FederationBundle, FederationImportReport, OriginEvent,
+        ReplicationReceipt,
+    },
     node::CommonwakeNode,
 };
 
@@ -158,6 +161,44 @@ pub fn verify_checkpoint(checkpoint: &Checkpoint) -> Result<()> {
     crate::crypto::verify_object(&key, CHECKPOINT_DOMAIN, checkpoint, &checkpoint.signature)
 }
 
+pub fn verify_replication_receipt(receipt: &ReplicationReceipt) -> Result<()> {
+    if receipt.protocol != PROTOCOL_VERSION {
+        return Err(CommonwakeError::Validation(format!(
+            "unsupported replication receipt protocol {}",
+            receipt.protocol
+        )));
+    }
+    verify_checkpoint(&receipt.origin_checkpoint)?;
+    if receipt.origin_checkpoint.cursor < 0 {
+        return Err(CommonwakeError::Validation(
+            "replication receipt cursor cannot be negative".into(),
+        ));
+    }
+    decode_hash(&receipt.origin_checkpoint.event_hash, "receipt event_hash")?;
+    if receipt.origin_checkpoint.cursor == 0 && receipt.origin_checkpoint.event_hash != ZERO_HASH {
+        return Err(CommonwakeError::Unauthorized(
+            "genesis replication receipt does not use the zero hash".into(),
+        ));
+    }
+    let relay_key = verifying_key_from_b64(&receipt.relay_node_public_key)?;
+    if prefixed_id("cwnode_", &relay_key.to_bytes()) != receipt.relay_node_id {
+        return Err(CommonwakeError::Unauthorized(
+            "replication receipt relay id does not match its public key".into(),
+        ));
+    }
+    if receipt.relay_node_id == receipt.origin_checkpoint.node_id {
+        return Err(CommonwakeError::Validation(
+            "an origin cannot serve as its own replication relay".into(),
+        ));
+    }
+    crate::crypto::verify_object(
+        &relay_key,
+        REPLICATION_RECEIPT_DOMAIN,
+        receipt,
+        &receipt.signature,
+    )
+}
+
 pub(crate) fn canonical_origin_record(event: &OriginEvent) -> Result<Vec<u8>> {
     serde_jcs::to_vec(&json!({
         "kind": event.kind,
@@ -241,6 +282,29 @@ impl CommonwakeNode {
         };
         witness.signature = sign_object(self.identity.signing_key(), WITNESS_DOMAIN, &witness)?;
         Ok(witness)
+    }
+
+    pub fn make_replication_receipt(&self, checkpoint: &Checkpoint) -> Result<ReplicationReceipt> {
+        verify_checkpoint(checkpoint)?;
+        if checkpoint.node_id == self.identity.node_id() {
+            return Err(CommonwakeError::Validation(
+                "an origin cannot issue a replication receipt to itself".into(),
+            ));
+        }
+        let mut receipt = ReplicationReceipt {
+            protocol: PROTOCOL_VERSION.into(),
+            relay_node_id: self.identity.node_id().into(),
+            relay_node_public_key: self.identity.public_key().into(),
+            origin_checkpoint: checkpoint.clone(),
+            retained_at: Utc::now(),
+            signature: String::new(),
+        };
+        receipt.signature = sign_object(
+            self.identity.signing_key(),
+            REPLICATION_RECEIPT_DOMAIN,
+            &receipt,
+        )?;
+        Ok(receipt)
     }
 }
 

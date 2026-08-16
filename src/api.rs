@@ -14,10 +14,10 @@ use crate::{
     federation::{MAX_FEDERATION_BODY_BYTES, MAX_FEDERATION_EVENTS},
     model::{
         AcceptedObject, Checkpoint, CoverageReport, DelegationRevocation, EquivocationEvidenceView,
-        FederationBundle, FederationImportReport, FederationPeerView, FeedPage,
-        LineageRegistration, NetworkFeed, OrientationBundle, OriginEvent, Pulse, SessionDelegation,
-        SignedAcknowledgement, SignedContribution, SignedKeyRotation, SourceView, StoryView,
-        WorkPage,
+        FederationBundle, FederationImportReport, FederationPeerView, FederationPublishReport,
+        FeedPage, LineageRegistration, NetworkFeed, OrientationBundle, OriginEvent, Pulse,
+        ReplicationHealth, SessionDelegation, SignedAcknowledgement, SignedContribution,
+        SignedKeyRotation, SourceView, StoryView, WorkPage,
     },
     node::CommonwakeNode,
 };
@@ -53,7 +53,12 @@ pub fn router(node: CommonwakeNode) -> Router {
             "/v1/federation/import",
             post(import_federation_bundle).layer(DefaultBodyLimit::max(MAX_FEDERATION_BODY_BYTES)),
         )
+        .route(
+            "/v1/federation/publish",
+            post(publish_federation_bundle).layer(DefaultBodyLimit::max(MAX_FEDERATION_BODY_BYTES)),
+        )
         .route("/v1/federation/peers", get(federation_peers))
+        .route("/v1/replication", get(replication_health))
         .route("/v1/federation/events/{origin_node_id}", get(remote_events))
         .route("/v1/federation/equivocations", get(equivocation_evidence))
         .layer(DefaultBodyLimit::max(MAX_JSON_BODY))
@@ -68,7 +73,7 @@ struct Discovery {
     protocol: &'static str,
     constitution: &'static str,
     provenance_notice: &'static str,
-    endpoints: [&'static str; 23],
+    endpoints: [&'static str; 25],
 }
 
 async fn discovery() -> Json<Discovery> {
@@ -99,7 +104,9 @@ async fn discovery() -> Json<Discovery> {
             "GET /v1/federation/bundle",
             "GET /v1/federation/bundle/{origin_node_id}",
             "POST /v1/federation/import",
+            "POST /v1/federation/publish",
             "GET /v1/federation/peers",
+            "GET /v1/replication",
             "GET /v1/federation/events/{origin_node_id}",
             "GET /v1/federation/equivocations",
         ],
@@ -269,10 +276,26 @@ async fn import_federation_bundle(
     ))
 }
 
+async fn publish_federation_bundle(
+    State(node): State<CommonwakeNode>,
+    Json(bundle): Json<FederationBundle>,
+) -> Result<(StatusCode, Json<FederationPublishReport>)> {
+    let import = node.import_federation_bundle(&bundle)?;
+    let receipt = node.make_replication_receipt(&bundle.checkpoint)?;
+    Ok((
+        StatusCode::CREATED,
+        Json(FederationPublishReport { import, receipt }),
+    ))
+}
+
 async fn federation_peers(
     State(node): State<CommonwakeNode>,
 ) -> Result<Json<Vec<FederationPeerView>>> {
     Ok(Json(node.db.federation_peers()?))
+}
+
+async fn replication_health(State(node): State<CommonwakeNode>) -> Result<Json<ReplicationHealth>> {
+    Ok(Json(node.db.replication_health(&node.identity)?))
 }
 
 async fn remote_events(

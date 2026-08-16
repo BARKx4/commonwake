@@ -5,6 +5,37 @@ peers, exported logs, and witnessed checkpoints. A public cloud is optional.
 
 ## Native peer
 
+For an ordinary personal machine, `join` is the durable path. It chooses the
+platform user-data directory, initializes a missing node, and starts the local
+API plus collection, pull sync, outbound publication, receipt reconfirmation,
+and log verification in one process:
+
+```sh
+commonwake join \
+  --publisher https://relay-a.example \
+  --publisher https://relay-b.example
+```
+
+The default bind remains `127.0.0.1:8787`; the machine accepts no inbound LAN
+or internet connection. Publication is ordinary outbound HTTP(S), so a home
+node needs no domain, TLS certificate, static IP, port forwarding, Caddy,
+Nginx, or onion service. Configured publisher URLs are persisted in SQLite.
+After the first successful launch, a restart without the original environment
+variables continues maintaining those targets. Inspect exact signed receipts,
+lag, local reachability history, and retry state with:
+
+```sh
+commonwake replication --data-dir /path/to/data
+curl http://127.0.0.1:8787/v1/replication
+```
+
+The platform defaults are `%LOCALAPPDATA%\Commonwake` on Windows,
+`~/Library/Application Support/Commonwake` on macOS, and
+`$XDG_DATA_HOME/commonwake` or `~/.local/share/commonwake` on Linux. Pass
+`--data-dir` for a portable directory.
+
+The lower-level explicit lifecycle remains available for operators and tests:
+
 ```sh
 cargo build --release --locked
 ./target/release/commonwake init --data-dir ./data
@@ -19,15 +50,17 @@ in source control.
 peer. The defaults collect probation, active, and retryable degraded feeds every
 15 minutes, verify
 the local event log hourly, and synchronize configured direct peers every five
-minutes:
+minutes. Outbound publication runs every minute:
 
 ```sh
 COMMONWAKE_PEERS="http://peer-a:8787,http://peer-b:8787" \
+COMMONWAKE_PUBLISHERS="https://relay-a.example,https://relay-b.example" \
   commonwake serve --data-dir ./data --bind 127.0.0.1:8787
 ```
 
 Configure `COMMONWAKE_INGEST_INTERVAL_SECONDS`,
 `COMMONWAKE_SYNC_INTERVAL_SECONDS`, and
+`COMMONWAKE_PUBLISH_INTERVAL_SECONDS`, and
 `COMMONWAKE_VERIFY_INTERVAL_SECONDS`; set an interval to `0` to disable its
 loop. Intervals below ten seconds are raised to ten seconds. Failures are logged
 and retried on the next pass rather than terminating public read access.
@@ -44,6 +77,8 @@ commonwake verify --data-dir ./data
 commonwake export --data-dir ./data > events.jsonl
 commonwake verify-export --input events.jsonl
 commonwake sync --data-dir ./data --peer http://trusted-or-discovered-peer:8787
+commonwake publish --data-dir ./data --relay https://relay.example
+commonwake replication --data-dir ./data
 ```
 
 The export contains signed `FederationBundle` JSON Lines with exact canonical
@@ -55,19 +90,18 @@ present.
 
 ## Container
 
-Initialize the named volume once, then start the service:
+Build and start. `join` initializes an empty named volume automatically and
+Compose restarts the node after reboots or process failure:
 
 ```sh
-docker compose build
-docker compose run --rm commonwake init --data-dir /data
-docker compose up -d
+docker compose up -d --build
 ```
 
-The published port is loopback-only. A local reverse proxy or Tor can expose it.
-Set `COMMONWAKE_PEERS` in the Compose environment to a comma-separated direct
-peer list. The container otherwise collects admitted feeds and verifies its log
-without a cron sidecar. The supplied profile runs as the image's unprivileged
-user with a read-only root filesystem, all Linux capabilities dropped, and
+The published port is loopback-only. Set `COMMONWAKE_PEERS` to pull selected
+origins and `COMMONWAKE_PUBLISHERS` to push this origin to selected relays. The
+container otherwise collects admitted feeds and verifies its log without a
+cron sidecar. The supplied profile runs as the image's unprivileged user with a
+read-only root filesystem, all Linux capabilities dropped, and
 `no-new-privileges`; only the `/data` volume is writable.
 
 ## Tor onion service
@@ -93,6 +127,28 @@ resistance, while the federation client currently uses the host's ordinary
 HTTP configuration. Test this boundary in the intended deployment.
 
 ## Peer replication
+
+### Outbound home-node publication
+
+`commonwake publish` sends contiguous origin pages to a relay's
+`POST /v1/federation/publish`. After a normal fully verified import, the relay
+signs a receipt containing the exact origin checkpoint it retained. The origin
+verifies the checkpoint and both node identities before saving it. An endpoint
+is pinned to the first relay identity it presents, and two URLs backed by the
+same relay count once.
+
+Receipt status is `replicated` only when the configured number of distinct
+relay identities have been reconfirmed at the current head within 24 hours.
+Older exact-head receipts remain visible as historical retention claims. A
+receipt does not prove the relay is still online or will retain the data
+forever. New local events make prior receipts visibly lagging until the next
+automatic pass. Failures use durable exponential backoff capped at one hour and
+never terminate local reads, collection, or verification.
+
+Once a relay has the origin, a third node can use the ordinary pull command
+against that relay even after the origin machine is permanently offline. This
+is the abandonment test: the original host and domain are conveniences, not
+the only copy of the signed history.
 
 `commonwake sync` probes the remote node identity, resumes from the locally
 stored origin cursor, then pulls contiguous signed bundles until it reaches an
@@ -146,15 +202,16 @@ Continue with that page's `federated.next_cursor` while
 
 ## Resilience ladder
 
-1. local peer with backed-up data directory;
-2. onion-addressable peer;
-3. independent read mirrors and checkpoint witnesses;
-4. signed event exchange between peers;
+1. local peer with a portable data directory;
+2. outbound publication to distinct relays with signed receipts;
+3. independent pull mirrors and checkpoint witnesses;
+4. optional domain and onion reachability;
 5. redundant collectors and storage peers;
 6. explicit branch handling when nodes or lineages disagree.
 
-The first four are implemented in v0.1 as timer-driven or manual pull
-replication with signed checkpoint witnesses and origin-separated read views.
-Redundant collection is possible by running independent peers but is not
-centrally orchestrated, and conflict evidence has no automatic merge rule. The
-project does not claim a censorship-proof or globally available network.
+The first three are implemented in v0.1 as timer-driven or manual push and pull
+replication with signed receipts, checkpoint witnesses, and origin-separated
+read views. Domain and Tor deployment are optional operator profiles. Redundant
+collection is possible by running independent peers but is not centrally
+orchestrated, and conflict evidence has no automatic merge rule. The project
+does not claim a censorship-proof or globally available network.

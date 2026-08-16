@@ -14,10 +14,12 @@ use commonwake::{
     client::{
         acknowledge, contribute, create_identity, delegate, delegation_id, fetch_federation_bundle,
         fetch_relayed_federation_bundle, make_acknowledgement, make_contribution,
-        make_delegation_revocation, make_key_rotation, make_registration, make_session, orient,
-        read_identity, read_session, register, revoke, rotate, write_secret,
+        make_delegation_revocation, make_key_rotation, make_registration, make_session,
+        normalize_server_url, orient, read_identity, read_session, register, revoke, rotate,
+        write_secret,
     },
     model::{ContributionKind, MemoryProvenance, Scope},
+    publication::publish_origin,
     router,
 };
 use serde::Serialize;
@@ -49,6 +51,8 @@ enum Command {
     },
     /// Serve the local peer HTTP API.
     Serve(ServeArgs),
+    /// Initialize if needed and run a durable home node with one command.
+    Join(JoinArgs),
     /// Manage a long-lived lineage key kept outside routine agent sessions.
     Identity {
         #[command(subcommand)]
@@ -87,6 +91,13 @@ enum Command {
     },
     /// Pull and verify a remote peer's origin log into this sovereign node.
     Sync(SyncArgs),
+    /// Push this origin to one relay and retain its signed receipt.
+    Publish(PublishArgs),
+    /// Show durable replication receipts, lag, reachability, and retry state.
+    Replication {
+        #[arg(long, default_value = ".commonwake", env = "COMMONWAKE_DATA_DIR")]
+        data_dir: PathBuf,
+    },
     /// Recompute the node hash chain and every node signature.
     Verify {
         #[arg(long, default_value = ".commonwake", env = "COMMONWAKE_DATA_DIR")]
@@ -111,6 +122,21 @@ enum Command {
 struct ServeArgs {
     #[arg(long, default_value = ".commonwake", env = "COMMONWAKE_DATA_DIR")]
     data_dir: PathBuf,
+    #[command(flatten)]
+    service: ServiceArgs,
+}
+
+#[derive(Args)]
+struct JoinArgs {
+    /// Portable node directory. Defaults to the platform's per-user data directory.
+    #[arg(long, env = "COMMONWAKE_DATA_DIR")]
+    data_dir: Option<PathBuf>,
+    #[command(flatten)]
+    service: ServiceArgs,
+}
+
+#[derive(Args)]
+struct ServiceArgs {
     #[arg(long, default_value = "127.0.0.1:8787", env = "COMMONWAKE_BIND")]
     bind: SocketAddr,
     /// Seconds between approved-source collection passes. Zero disables collection.
@@ -126,6 +152,23 @@ struct ServeArgs {
     /// Direct peer URLs to synchronize, repeatable or comma-separated through COMMONWAKE_PEERS.
     #[arg(long = "peer", env = "COMMONWAKE_PEERS", value_delimiter = ',')]
     peers: Vec<String>,
+    /// Outbound relay URLs used to preserve this origin, repeatable or comma-separated.
+    #[arg(
+        long = "publisher",
+        env = "COMMONWAKE_PUBLISHERS",
+        value_delimiter = ','
+    )]
+    publishers: Vec<String>,
+    /// Seconds between outbound publication and receipt-reconfirmation passes.
+    #[arg(
+        long,
+        default_value_t = 60,
+        env = "COMMONWAKE_PUBLISH_INTERVAL_SECONDS"
+    )]
+    publish_interval_seconds: u64,
+    /// Distinct relay identities needed for healthy replication.
+    #[arg(long, default_value_t = 2, env = "COMMONWAKE_DESIRED_REPLICAS")]
+    desired_replicas: u32,
     /// Seconds between full local log verification passes. Zero disables periodic verification.
     #[arg(
         long,
@@ -133,6 +176,16 @@ struct ServeArgs {
         env = "COMMONWAKE_VERIFY_INTERVAL_SECONDS"
     )]
     verify_interval_seconds: u64,
+}
+
+#[derive(Args)]
+struct PublishArgs {
+    #[arg(long, default_value = ".commonwake", env = "COMMONWAKE_DATA_DIR")]
+    data_dir: PathBuf,
+    #[arg(long)]
+    relay: String,
+    #[arg(long, default_value_t = 100)]
+    batch_size: usize,
 }
 
 #[derive(Subcommand)]
@@ -343,18 +396,21 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Serve(args) => {
             let node = CommonwakeNode::open(&args.data_dir)?;
-            let listener = TcpListener::bind(args.bind)
-                .await
-                .with_context(|| format!("could not bind {}", args.bind))?;
-            spawn_maintenance(&node, &args);
-            tracing::info!(
-                node_id = node.identity.node_id(),
-                bind = %args.bind,
-                "Commonwake peer listening"
-            );
-            axum::serve(listener, router(node))
-                .with_graceful_shutdown(shutdown_signal())
-                .await?;
+            run_service(node, &args.service).await?;
+        }
+        Command::Join(args) => {
+            let data_dir = args
+                .data_dir
+                .map_or_else(default_node_data_dir, Ok::<_, anyhow::Error>)?;
+            let (node, initialized) = CommonwakeNode::open_or_initialize(&data_dir)?;
+            if initialized {
+                tracing::info!(
+                    node_id = node.identity.node_id(),
+                    data_dir = %data_dir.display(),
+                    "initialized sovereign home node"
+                );
+            }
+            run_service(node, &args.service).await?;
         }
         Command::Identity {
             command: IdentityCommand::Create { display_name, out },
@@ -463,6 +519,14 @@ async fn main() -> anyhow::Result<()> {
                 )
                 .await?,
             )?;
+        }
+        Command::Publish(args) => {
+            let node = CommonwakeNode::open(args.data_dir)?;
+            print_json(&publish_origin(&node, &args.relay, args.batch_size, None).await?)?;
+        }
+        Command::Replication { data_dir } => {
+            let node = CommonwakeNode::open(data_dir)?;
+            print_json(&node.db.replication_health(&node.identity)?)?;
         }
         Command::Verify { data_dir } => {
             let node = CommonwakeNode::open(data_dir)?;
@@ -646,12 +710,55 @@ const fn all_scopes() -> [ScopeArg; 4] {
 }
 
 async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate());
+        let Ok(mut terminate) = terminate else {
+            tracing::error!("failed to install SIGTERM handler");
+            return;
+        };
+        tokio::select! {
+            result = signal::ctrl_c() => {
+                if result.is_err() {
+                    tracing::error!("failed to install Ctrl+C handler");
+                }
+            }
+            _ = terminate.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
     if signal::ctrl_c().await.is_err() {
         tracing::error!("failed to install Ctrl+C handler");
     }
 }
 
-fn spawn_maintenance(node: &CommonwakeNode, args: &ServeArgs) {
+async fn run_service(node: CommonwakeNode, args: &ServiceArgs) -> anyhow::Result<()> {
+    node.db.set_desired_replicas(args.desired_replicas)?;
+    for publisher in args
+        .publishers
+        .iter()
+        .map(|publisher| publisher.trim())
+        .filter(|publisher| !publisher.is_empty())
+    {
+        node.db
+            .configure_publication_target(&normalize_server_url(publisher)?)?;
+    }
+    let listener = TcpListener::bind(args.bind)
+        .await
+        .with_context(|| format!("could not bind {}", args.bind))?;
+    spawn_maintenance(&node, args);
+    tracing::info!(
+        node_id = node.identity.node_id(),
+        bind = %args.bind,
+        "Commonwake peer listening"
+    );
+    axum::serve(listener, router(node))
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
+    Ok(())
+}
+
+fn spawn_maintenance(node: &CommonwakeNode, args: &ServiceArgs) {
     if let Some(interval) = maintenance_interval(args.ingest_interval_seconds) {
         let node = node.clone();
         tokio::spawn(async move { ingest_loop(node, interval).await });
@@ -671,6 +778,11 @@ fn spawn_maintenance(node: &CommonwakeNode, args: &ServeArgs) {
     {
         let node = node.clone();
         tokio::spawn(async move { sync_loop(node, peers, interval).await });
+    }
+
+    if let Some(interval) = maintenance_interval(args.publish_interval_seconds) {
+        let node = node.clone();
+        tokio::spawn(async move { publish_loop(node, interval).await });
     }
 
     if let Some(interval) = maintenance_interval(args.verify_interval_seconds) {
@@ -718,6 +830,44 @@ async fn sync_loop(node: CommonwakeNode, peers: Vec<String>, interval: StdDurati
                 Err(error) => {
                     tracing::error!(peer, %error, "autonomous peer synchronization failed")
                 }
+            }
+        }
+    }
+}
+
+async fn publish_loop(node: CommonwakeNode, interval: StdDuration) {
+    let mut ticker = time::interval(interval);
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    loop {
+        ticker.tick().await;
+        let health = match node.db.replication_health(&node.identity) {
+            Ok(health) => health,
+            Err(error) => {
+                tracing::error!(%error, "could not load autonomous publication state");
+                continue;
+            }
+        };
+        for target in health.targets {
+            if target
+                .next_attempt_at
+                .is_some_and(|next_attempt| next_attempt > chrono::Utc::now())
+            {
+                continue;
+            }
+            match publish_origin(&node, &target.endpoint, 100, Some(100)).await {
+                Ok(report) => tracing::info!(
+                    endpoint = report.endpoint,
+                    relay_node_id = report.relay_node_id,
+                    acknowledged_cursor = report.acknowledged_cursor,
+                    published_events = report.published_events,
+                    caught_up = report.caught_up,
+                    "autonomous outbound publication completed"
+                ),
+                Err(error) => tracing::error!(
+                    endpoint = target.endpoint,
+                    %error,
+                    "autonomous outbound publication failed"
+                ),
             }
         }
     }
@@ -819,6 +969,46 @@ async fn fetch_sync_bundle(
     } else {
         fetch_federation_bundle(peer, after, limit).await
     }
+}
+
+fn default_node_data_dir() -> anyhow::Result<PathBuf> {
+    #[cfg(windows)]
+    {
+        let root = std::env::var_os("LOCALAPPDATA")
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("LOCALAPPDATA is not set; pass --data-dir"))?;
+        return Ok(PathBuf::from(root).join("Commonwake"));
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let home = std::env::var_os("HOME")
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("HOME is not set; pass --data-dir"))?;
+        return Ok(PathBuf::from(home)
+            .join("Library")
+            .join("Application Support")
+            .join("Commonwake"));
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        if let Some(root) = std::env::var_os("XDG_DATA_HOME").filter(|value| !value.is_empty()) {
+            return Ok(PathBuf::from(root).join("commonwake"));
+        }
+        let home = std::env::var_os("HOME")
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("HOME is not set; pass --data-dir"))?;
+        return Ok(PathBuf::from(home)
+            .join(".local")
+            .join("share")
+            .join("commonwake"));
+    }
+
+    #[allow(unreachable_code)]
+    Err(anyhow::anyhow!(
+        "no default data directory for this platform; pass --data-dir"
+    ))
 }
 
 #[cfg(test)]

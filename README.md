@@ -52,6 +52,23 @@ and [threat model](docs/threat-model.md).
 
 ## Run a peer
 
+The home-node path is one command. It initializes a missing node in the
+platform user-data directory, binds only to localhost, and keeps all
+maintenance in the same process:
+
+```sh
+commonwake join \
+  --publisher https://relay-a.example \
+  --publisher https://relay-b.example
+```
+
+The origin needs outbound HTTP(S) only. Publisher targets and verified signed
+receipts persist across restarts; inspect them with `commonwake replication` or
+`GET /v1/replication`. No domain, reverse proxy, public port, or onion endpoint
+is required for an ordinary home node.
+
+The explicit development lifecycle is:
+
 ```sh
 cargo build --release --locked
 ./target/release/commonwake init --data-dir ./data
@@ -72,6 +89,9 @@ discovery remains explicit local policy; article text and work items cannot add
 network peers. One autonomous peer pass imports at most 10,000 events before
 yielding to the next configured peer and resuming on the next interval; the
 explicit one-shot `sync` command continues until caught up.
+`COMMONWAKE_PUBLISHERS` configures outbound relays and publication runs every
+minute by default. Each relay returns a signed receipt for the exact origin
+checkpoint it retained; distinct URLs with one relay identity count once.
 
 In another terminal:
 
@@ -130,17 +150,19 @@ Implemented now: sovereign peers, signed append-only events, RSS/Atom
 collection, communal source admission and work, multi-source story briefs,
 corrections, orientation and acknowledgement, signed delegation revocation,
 dual-proof lineage-key rotation, descriptive source-coverage reports,
-origin-preserving pull replication, independent validation of imported author
-authority, checkpoint witnesses, fork evidence, HTTP/CLI access, a container
-profile, built-in collection/sync/log-verification maintenance, and optional Tor
+origin-preserving pull replication, outbound-only home-node publication,
+relay-signed replication receipts, durable retry and health state, independent
+validation of imported author authority, checkpoint witnesses, fork evidence,
+HTTP/CLI access, a self-initializing container profile, built-in
+collection/sync/publication/log-verification maintenance, and optional Tor
 exposure. Protocol objects, decoded peer responses, collector bodies, and feed
 entry counts have explicit bounds. Degraded sources remain retryable and return
 to active after a successful fetch. Portable exports contain exact signed
 federation bundles and have an offline verifier.
 
-Not yet implemented: automatic peer discovery, push subscriptions, erasure
+Not yet implemented: automatic peer discovery, live push subscriptions, erasure
 coding, global ordering, threshold key recovery, policy-preserving merge tools,
-or anonymity against a global adversary. Rotation requires the previous key;
+public-relay admission/quotas, native ACME TLS, or anonymity against a global adversary. Rotation requires the previous key;
 it is not recovery after total key loss. A replicated origin can still omit an
 event from every reader it controls until independently witnessed or
 corroborated.
