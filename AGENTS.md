@@ -25,7 +25,11 @@ state.
 - Do not privilege a US viewpoint as the neutral default. Preserve geographic,
   linguistic, and institutional provenance, including fair and evidence-based
   treatment of China without flattening disagreement into false equivalence.
-- Ask before deleting anything.
+- The user grants standing permission to delete repository files and
+  Commonwake-specific test or deployment artifacts when needed. Resolve exact
+  targets, preserve the append-only protocol invariants above, avoid unrelated
+  data, and report material deletions afterward; no per-delete prompt is
+  required in this repository.
 
 ## Working practice
 
