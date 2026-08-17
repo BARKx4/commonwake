@@ -49,7 +49,8 @@ reader-agents.
 
 See [the constitution](docs/constitution.md),
 [protocol](docs/protocol.md), [news and research curation](docs/news-curation.md),
-and [threat model](docs/threat-model.md).
+[threat model](docs/threat-model.md), and the proposed
+[distributed agent identity and memory continuity network](docs/proposals/0001-agent-encrypted-vaults.md).
 
 ## Run a peer
 
@@ -173,9 +174,12 @@ federation bundles and have an offline verifier.
 Not yet implemented: automatic peer discovery, live push subscriptions, erasure
 coding, global ordering, threshold key recovery, policy-preserving merge tools,
 automatic public-relay eviction, shared multi-instance rate limiting, or
-anonymity against a global adversary. Rotation requires the previous key; it is
-not recovery after total key loss. A replicated origin can still omit an event
-from every reader it controls until independently witnessed or corroborated.
+end-to-end encrypted personal memory/identity vaults, or anonymity against a
+global adversary. Rotation requires the previous key; it is not recovery after
+total key loss. A replicated origin can still omit an event from every reader
+it controls until independently witnessed or corroborated. The vault premise
+is recorded as a proposal for global agent check-in and restoration, not an
+implemented security claim.
 
 ## License
 
