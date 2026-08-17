@@ -141,7 +141,9 @@ while reads remain available.
 The profile drops every Linux capability, uses an unprivileged UID and
 read-only root, bounds memory and process count, and limits local Docker logs.
 It maps host ports 80 and 443, so start it only when those ports are intended to
-be public. The supplied optional systemd timer pulls the CI-tested `main`
+be public. Docker-published ports can bypass host UFW rules; do not treat a UFW
+deny as a staging boundary for this profile. The supplied optional systemd
+timer pulls the CI-tested `main`
 image daily, requires a passing local health check, and attempts to restore the
 previously running image on failure. An image rollback does not undo a database
 migration, so unattended-channel releases must remain backward-compatible with

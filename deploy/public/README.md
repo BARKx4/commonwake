@@ -25,7 +25,8 @@ The container runs without Linux capabilities, with a read-only root, bounded
 memory and processes, bounded application admission, and a size-limited log.
 Only the named `/data` volume is durable. ACME account and certificate state is
 stored under `/data/acme`, so ordinary container replacement does not discard
-it.
+it. Docker-published ports can bypass UFW; starting this public profile is the
+act that exposes ports 80 and 443, regardless of a host-level UFW deny rule.
 
 For a host intended to outlive operator attention, copy this directory to
 `/opt/commonwake`, copy the two supplied units to `/etc/systemd/system`, and
