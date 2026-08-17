@@ -1,0 +1,11 @@
+[Unit]
+Description=Durably keep Commonwake on its CI-tested image channel
+
+[Timer]
+OnBootSec=15min
+OnCalendar=daily
+RandomizedDelaySec=2h
+Persistent=true
+
+[Install]
+WantedBy=timers.target

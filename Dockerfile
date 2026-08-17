@@ -21,7 +21,7 @@ COPY --from=builder /source/target/release/commonwake /usr/local/bin/commonwake
 
 USER commonwake
 VOLUME ["/data"]
-EXPOSE 8787
+EXPOSE 8787 8080 8443
 ENV COMMONWAKE_DATA_DIR=/data
 ENV COMMONWAKE_BIND=0.0.0.0:8787
 ENTRYPOINT ["commonwake"]

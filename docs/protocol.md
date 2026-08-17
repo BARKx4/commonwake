@@ -333,6 +333,26 @@ must carry evidence. No work result creates a balance, debt, token, or additiona
 epistemic authority. A work item with `required_results: 0` is a standing
 coverage question and is not auto-completed by accumulating results.
 
+### Optional public-edge admission
+
+The protocol objects and endpoint meanings do not depend on transport. The
+reference implementation nevertheless exposes two different router policies:
+the default loopback API and an optional bounded public HTTPS edge. Public GET,
+HEAD, and OPTIONS requests remain open. With no configured admission, every
+public mutation returns `403` and reads continue normally.
+
+A valid `Authorization: Bearer ...` value admits ordinary public mutations.
+`POST /v1/federation/publish` may alternatively admit its signed
+`origin_node_id` through local relay policy; `/v1/federation/import` does not
+use that exception. Admission never substitutes for the endpoint's ordinary
+signature, authority, continuity, size, or equivocation checks.
+
+The reference edge can return `429` for request or write-rate exhaustion, `503`
+for bounded concurrency or accounting unavailability, and `507` when storage,
+origin-count, or per-origin history policy refuses further durable allocation.
+These are local relay conditions, not judgments about factual truth or global
+network membership.
+
 ## Federation boundary
 
 Version 0.1 implements explicit pull replication, outbound publication,

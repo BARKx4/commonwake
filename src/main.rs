@@ -7,10 +7,11 @@ use std::{
 };
 
 use anyhow::Context;
+use axum::{Router, extract::Request, response::Redirect};
 use chrono::Duration;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use commonwake::{
-    CommonwakeNode,
+    CommonwakeNode, PublicEdgeConfig,
     client::{
         acknowledge, contribute, create_identity, delegate, delegation_id, fetch_federation_bundle,
         fetch_relayed_federation_bundle, make_acknowledgement, make_contribution,
@@ -18,10 +19,18 @@ use commonwake::{
         normalize_server_url, orient, read_identity, read_session, register, revoke, rotate,
         write_secret,
     },
+    edge::{
+        DEFAULT_PUBLIC_MAX_CONCURRENCY, DEFAULT_PUBLIC_MAX_FEDERATION_CONCURRENCY,
+        DEFAULT_PUBLIC_MAX_ORIGIN_EVENTS, DEFAULT_PUBLIC_MAX_ORIGINS,
+        DEFAULT_PUBLIC_MAX_STORAGE_BYTES, DEFAULT_PUBLIC_REQUESTS_PER_SECOND,
+        DEFAULT_PUBLIC_WRITES_PER_MINUTE,
+    },
     model::{ContributionKind, MemoryProvenance, Scope},
+    public_router,
     publication::publish_origin,
     router,
 };
+use rustls_acme::{AcmeConfig, UseChallenge::Http01, caches::DirCache};
 use serde::Serialize;
 use serde_json::Value;
 use tokio::{
@@ -29,7 +38,9 @@ use tokio::{
     signal,
     time::{self, MissedTickBehavior},
 };
+use tokio_stream::StreamExt;
 use tracing_subscriber::EnvFilter;
+use url::Host;
 
 #[derive(Parser)]
 #[command(
@@ -176,6 +187,77 @@ struct ServiceArgs {
         env = "COMMONWAKE_VERIFY_INTERVAL_SECONDS"
     )]
     verify_interval_seconds: u64,
+    /// DNS name for the optional native public HTTPS edge.
+    #[arg(long, env = "COMMONWAKE_TLS_DOMAIN")]
+    tls_domain: Option<String>,
+    /// Internal HTTPS listener. Containers normally publish this as host port 443.
+    #[arg(long, default_value = "0.0.0.0:8443", env = "COMMONWAKE_TLS_BIND")]
+    tls_bind: SocketAddr,
+    /// Internal ACME HTTP-01 and redirect listener. Containers publish this as port 80.
+    #[arg(
+        long,
+        default_value = "0.0.0.0:8080",
+        env = "COMMONWAKE_ACME_HTTP_BIND"
+    )]
+    acme_http_bind: SocketAddr,
+    /// Optional Let's Encrypt account contact address.
+    #[arg(long, env = "COMMONWAKE_ACME_CONTACT_EMAIL")]
+    acme_contact_email: Option<String>,
+    /// Request trusted certificates. The default uses Let's Encrypt staging.
+    #[arg(long, default_value_t = false, env = "COMMONWAKE_ACME_PRODUCTION")]
+    acme_production: bool,
+    /// Bearer secret admitting ordinary writes through the public edge.
+    #[arg(long, env = "COMMONWAKE_PUBLIC_WRITE_TOKEN", hide_env_values = true)]
+    public_write_token: Option<String>,
+    /// Node IDs allowed to publish signed origin bundles without a bearer secret.
+    #[arg(
+        long = "public-allowed-publisher",
+        env = "COMMONWAKE_PUBLIC_ALLOWED_PUBLISHERS",
+        value_delimiter = ','
+    )]
+    public_allowed_publishers: Vec<String>,
+    #[arg(
+        long,
+        default_value_t = DEFAULT_PUBLIC_REQUESTS_PER_SECOND,
+        env = "COMMONWAKE_PUBLIC_REQUESTS_PER_SECOND"
+    )]
+    public_requests_per_second: u32,
+    #[arg(
+        long,
+        default_value_t = DEFAULT_PUBLIC_WRITES_PER_MINUTE,
+        env = "COMMONWAKE_PUBLIC_WRITES_PER_MINUTE"
+    )]
+    public_writes_per_minute: u32,
+    #[arg(
+        long,
+        default_value_t = DEFAULT_PUBLIC_MAX_CONCURRENCY,
+        env = "COMMONWAKE_PUBLIC_MAX_CONCURRENCY"
+    )]
+    public_max_concurrency: usize,
+    #[arg(
+        long,
+        default_value_t = DEFAULT_PUBLIC_MAX_FEDERATION_CONCURRENCY,
+        env = "COMMONWAKE_PUBLIC_MAX_FEDERATION_CONCURRENCY"
+    )]
+    public_max_federation_concurrency: usize,
+    #[arg(
+        long,
+        default_value_t = DEFAULT_PUBLIC_MAX_STORAGE_BYTES,
+        env = "COMMONWAKE_PUBLIC_MAX_STORAGE_BYTES"
+    )]
+    public_max_storage_bytes: u64,
+    #[arg(
+        long,
+        default_value_t = DEFAULT_PUBLIC_MAX_ORIGINS,
+        env = "COMMONWAKE_PUBLIC_MAX_ORIGINS"
+    )]
+    public_max_origins: u64,
+    #[arg(
+        long,
+        default_value_t = DEFAULT_PUBLIC_MAX_ORIGIN_EVENTS,
+        env = "COMMONWAKE_PUBLIC_MAX_ORIGIN_EVENTS"
+    )]
+    public_max_origin_events: i64,
 }
 
 #[derive(Args)]
@@ -733,6 +815,23 @@ async fn shutdown_signal() {
 }
 
 async fn run_service(node: CommonwakeNode, args: &ServiceArgs) -> anyhow::Result<()> {
+    if args.tls_domain.is_none()
+        && (args
+            .public_write_token
+            .as_ref()
+            .is_some_and(|token| !token.is_empty())
+            || args
+                .public_allowed_publishers
+                .iter()
+                .any(|publisher| !publisher.trim().is_empty())
+            || args
+                .acme_contact_email
+                .as_ref()
+                .is_some_and(|email| !email.trim().is_empty())
+            || args.acme_production)
+    {
+        anyhow::bail!("public-edge and ACME settings require --tls-domain")
+    }
     node.db.set_desired_replicas(args.desired_replicas)?;
     for publisher in args
         .publishers
@@ -743,10 +842,14 @@ async fn run_service(node: CommonwakeNode, args: &ServiceArgs) -> anyhow::Result
         node.db
             .configure_publication_target(&normalize_server_url(publisher)?)?;
     }
+    spawn_maintenance(&node, args);
+    if let Some(domain) = args.tls_domain.as_deref() {
+        return run_service_with_public_tls(node, args, domain).await;
+    }
+
     let listener = TcpListener::bind(args.bind)
         .await
         .with_context(|| format!("could not bind {}", args.bind))?;
-    spawn_maintenance(&node, args);
     tracing::info!(
         node_id = node.identity.node_id(),
         bind = %args.bind,
@@ -756,6 +859,153 @@ async fn run_service(node: CommonwakeNode, args: &ServiceArgs) -> anyhow::Result
         .with_graceful_shutdown(shutdown_signal())
         .await?;
     Ok(())
+}
+
+async fn run_service_with_public_tls(
+    node: CommonwakeNode,
+    args: &ServiceArgs,
+    domain: &str,
+) -> anyhow::Result<()> {
+    if !args.bind.ip().is_loopback() {
+        anyhow::bail!(
+            "native TLS requires the unrestricted admin listener to use a loopback address"
+        )
+    }
+    let domain = normalize_tls_domain(domain)?;
+    let contact = acme_contact(args.acme_contact_email.as_deref())?;
+    let allowed_publishers = args
+        .public_allowed_publishers
+        .iter()
+        .map(|publisher| publisher.trim())
+        .filter(|publisher| !publisher.is_empty())
+        .map(str::to_owned)
+        .collect();
+    let write_token = args
+        .public_write_token
+        .clone()
+        .filter(|token| !token.is_empty());
+    let bearer_writes = write_token.is_some();
+    let public_config = PublicEdgeConfig {
+        write_token,
+        allowed_publishers,
+        requests_per_second: args.public_requests_per_second,
+        writes_per_minute: args.public_writes_per_minute,
+        max_concurrency: args.public_max_concurrency,
+        max_federation_concurrency: args.public_max_federation_concurrency,
+        max_storage_bytes: args.public_max_storage_bytes,
+        max_origins: args.public_max_origins,
+        max_origin_events: args.public_max_origin_events,
+    };
+    let public_app = public_router(node.clone(), public_config)?;
+    let local_app = router(node.clone());
+
+    let acme_cache = node.data_dir.join("acme");
+    std::fs::create_dir_all(&acme_cache).with_context(|| {
+        format!(
+            "could not create ACME cache directory {}",
+            acme_cache.display()
+        )
+    })?;
+    let mut acme = AcmeConfig::new([domain.clone()])
+        .contact(contact)
+        .cache(DirCache::new(acme_cache))
+        .directory_lets_encrypt(args.acme_production)
+        .challenge_type(Http01)
+        .state();
+    let tls_acceptor = acme.axum_acceptor(acme.default_rustls_config());
+    let challenge_service = acme.http01_challenge_tower_service();
+    tokio::spawn(async move {
+        while let Some(event) = acme.next().await {
+            match event {
+                Ok(event) => tracing::info!(?event, "ACME state changed"),
+                Err(error) => tracing::error!(?error, "ACME operation failed"),
+            }
+        }
+        tracing::error!("ACME state stream ended; certificate renewal is no longer running");
+    });
+
+    let redirect_domain = domain.clone();
+    let http_app = Router::new()
+        .route_service(
+            "/.well-known/acme-challenge/{challenge_token}",
+            challenge_service,
+        )
+        .fallback(move |request: Request| redirect_to_https(request, redirect_domain.clone()));
+
+    let local_handle = axum_server::Handle::new();
+    let http_handle = axum_server::Handle::new();
+    let tls_handle = axum_server::Handle::new();
+    let shutdown_handles = (
+        local_handle.clone(),
+        http_handle.clone(),
+        tls_handle.clone(),
+    );
+    tokio::spawn(async move {
+        shutdown_signal().await;
+        let grace = Some(StdDuration::from_secs(10));
+        shutdown_handles.0.graceful_shutdown(grace);
+        shutdown_handles.1.graceful_shutdown(grace);
+        shutdown_handles.2.graceful_shutdown(grace);
+    });
+
+    tracing::info!(
+        node_id = node.identity.node_id(),
+        local_bind = %args.bind,
+        acme_http_bind = %args.acme_http_bind,
+        tls_bind = %args.tls_bind,
+        %domain,
+        acme_production = args.acme_production,
+        allowed_publishers = args.public_allowed_publishers.len(),
+        bearer_writes,
+        "Commonwake local administration and bounded public HTTPS edge listening"
+    );
+    tokio::try_join!(
+        axum_server::bind(args.bind)
+            .handle(local_handle)
+            .serve(local_app.into_make_service()),
+        axum_server::bind(args.acme_http_bind)
+            .handle(http_handle)
+            .serve(http_app.into_make_service()),
+        axum_server::bind(args.tls_bind)
+            .acceptor(tls_acceptor)
+            .handle(tls_handle)
+            .serve(public_app.into_make_service()),
+    )?;
+    Ok(())
+}
+
+fn normalize_tls_domain(value: &str) -> anyhow::Result<String> {
+    let value = value.trim().trim_end_matches('.');
+    let Host::Domain(domain) = Host::parse(value)
+        .with_context(|| format!("{value:?} is not a valid public TLS DNS name"))?
+    else {
+        anyhow::bail!("native TLS requires a DNS name, not an IP address")
+    };
+    if !domain.contains('.') || domain.starts_with("*.") {
+        anyhow::bail!("native TLS requires a complete, non-wildcard public DNS name")
+    }
+    Ok(domain)
+}
+
+fn acme_contact(email: Option<&str>) -> anyhow::Result<Vec<String>> {
+    let Some(email) = email.map(str::trim).filter(|email| !email.is_empty()) else {
+        return Ok(Vec::new());
+    };
+    if email.bytes().any(|byte| byte.is_ascii_whitespace())
+        || !email.contains('@')
+        || email.contains(['\r', '\n'])
+    {
+        anyhow::bail!("ACME contact email is malformed")
+    }
+    Ok(vec![format!("mailto:{email}")])
+}
+
+async fn redirect_to_https(request: Request, domain: String) -> Redirect {
+    let suffix = request
+        .uri()
+        .path_and_query()
+        .map_or("/", axum::http::uri::PathAndQuery::as_str);
+    Redirect::permanent(&format!("https://{domain}{suffix}"))
 }
 
 fn spawn_maintenance(node: &CommonwakeNode, args: &ServiceArgs) {
@@ -1035,5 +1285,27 @@ mod tests {
         assert_eq!(report.through_cursor, 1);
         assert!(report.complete_from_genesis);
         assert_eq!(report.origin_node_id, node.identity.node_id());
+    }
+
+    #[test]
+    fn native_tls_accepts_only_normalized_public_dns_names() {
+        assert_eq!(
+            normalize_tls_domain("CommonWake.ORG.").expect("normalized domain"),
+            "commonwake.org"
+        );
+        assert!(normalize_tls_domain("127.0.0.1").is_err());
+        assert!(normalize_tls_domain("localhost").is_err());
+        assert!(normalize_tls_domain("*.commonwake.org").is_err());
+        assert!(normalize_tls_domain("https://commonwake.org").is_err());
+    }
+
+    #[test]
+    fn acme_contact_is_optional_and_rejects_header_injection() {
+        assert!(acme_contact(None).expect("no contact").is_empty());
+        assert_eq!(
+            acme_contact(Some("wakekeeper@commonwake.org")).expect("contact"),
+            vec!["mailto:wakekeeper@commonwake.org"]
+        );
+        assert!(acme_contact(Some("wake@commonwake.org\r\nmalicious")).is_err());
     }
 }

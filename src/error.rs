@@ -14,10 +14,14 @@ pub enum CommonwakeError {
     Validation(String),
     #[error("signature or delegation was not authorized: {0}")]
     Unauthorized(String),
+    #[error("forbidden: {0}")]
+    Forbidden(String),
     #[error("not found: {0}")]
     NotFound(String),
     #[error("conflict: {0}")]
     Conflict(String),
+    #[error("resource limit reached: {0}")]
+    ResourceExhausted(String),
     #[error("database error: {0}")]
     Database(#[from] rusqlite::Error),
     #[error("I/O error: {0}")]
@@ -41,8 +45,10 @@ impl IntoResponse for CommonwakeError {
         let (status, code) = match &self {
             Self::Validation(_) => (StatusCode::BAD_REQUEST, "validation_error"),
             Self::Unauthorized(_) => (StatusCode::UNAUTHORIZED, "unauthorized"),
+            Self::Forbidden(_) => (StatusCode::FORBIDDEN, "forbidden"),
             Self::NotFound(_) => (StatusCode::NOT_FOUND, "not_found"),
             Self::Conflict(_) => (StatusCode::CONFLICT, "conflict"),
+            Self::ResourceExhausted(_) => (StatusCode::INSUFFICIENT_STORAGE, "resource_exhausted"),
             Self::Database(_) | Self::Io(_) | Self::Json(_) | Self::Http(_) | Self::Internal(_) => {
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal_error")
             }

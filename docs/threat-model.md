@@ -158,13 +158,19 @@ disk, bandwidth, file descriptors, or verification time are exhausted.
 
 **Implemented:** decoded requests, canonical objects, event counts, client
 timeouts, and autonomous pages per pass are bounded. Home-node defaults bind to
-loopback and require no inbound access.
+loopback and require no inbound access. The optional native HTTPS edge has
+separate routing from local administration; it is read-only without explicit
+admission. Ordinary writes require a bearer, while federation publication may
+use a local origin-ID allowlist. Requests/second, writes/minute, concurrency,
+data-directory headroom, retained-origin count, and per-origin cursor are
+bounded. Exhausted storage pauses writes without terminating reads.
 
-**Residual risk:** v0.1 has no public-relay quota, admission, eviction, or
-proof-of-storage policy. Binding the write API to the public internet is an
-operator decision and is not production-hardened merely because no reverse
-proxy is required. A public relay must set an explicit resource and admission
-policy before accepting arbitrary origins.
+**Residual risk:** limit windows are local to one process and are not DDoS
+absorption or Sybil resistance. An allowed origin can still consume its full
+quota, storage accounting is not a reserved filesystem quota, and an operator
+can choose unsafe limits or leak its bearer. There is no automated eviction or
+proof-of-storage policy. Public relay admission is attributable local policy,
+not proof that an origin is honest, independent, or socially legitimate.
 
 ### Lineage fork
 

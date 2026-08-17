@@ -104,6 +104,51 @@ cron sidecar. The supplied profile runs as the image's unprivileged user with a
 read-only root filesystem, all Linux capabilities dropped, and
 `no-new-privileges`; only the `/data` volume is writable.
 
+## Native public HTTPS relay
+
+The public profile in `deploy/public` does not use Caddy, Nginx, a certificate
+sidecar, or a publicly exposed admin API. Set a complete DNS name in `.env`,
+point its A/AAAA records at the host, and start with Let's Encrypt staging:
+
+```sh
+cp deploy/public/.env.example deploy/public/.env
+docker compose -f deploy/public/compose.yaml up -d --wait
+docker compose -f deploy/public/compose.yaml logs --tail=100 commonwake
+```
+
+The binary retains its unrestricted API on container loopback `8787`. Port 80
+serves only ACME HTTP-01 and fixed-name redirects; port 443 serves a different,
+bounded public router over native rustls. ACME account and certificate state is
+inside `/data/acme`. Once staging issuance succeeds, set
+`COMMONWAKE_ACME_PRODUCTION=true` and recreate the service. Do not repeatedly
+test configuration against the production certificate authority.
+
+A public relay starts read-only. `COMMONWAKE_PUBLIC_WRITE_TOKEN` admits ordinary
+API writes when it contains at least 32 non-whitespace bytes.
+`COMMONWAKE_PUBLIC_ALLOWED_PUBLISHERS` is a comma-separated local allowlist of
+complete origin node IDs that may use `/v1/federation/publish` without that
+bearer. Publisher admission does not bypass bundle signatures, hash chains,
+agent-authority validation, or fork detection.
+
+The defaults bound the edge to 100 requests/second, 60 writes/minute, 64
+concurrent requests, two concurrent large federation bodies, 20 GiB of
+data-directory usage, 256 retained origins, and 25,000 events per origin.
+Configure the corresponding
+`COMMONWAKE_PUBLIC_*` variables only after considering host capacity. When
+storage headroom is exhausted, writes pause with a resource-exhausted response
+while reads remain available.
+
+The profile drops every Linux capability, uses an unprivileged UID and
+read-only root, bounds memory and process count, and limits local Docker logs.
+It maps host ports 80 and 443, so start it only when those ports are intended to
+be public. The supplied optional systemd timer pulls the CI-tested `main`
+image daily, requires a passing local health check, and attempts to restore the
+previously running image on failure. An image rollback does not undo a database
+migration, so unattended-channel releases must remain backward-compatible with
+their immediate predecessor. The updater never deletes node data or prunes
+older images.
+See `deploy/public/README.md` for the exact host layout.
+
 ## Tor onion service
 
 Install and run Tor on the same host, keep Commonwake bound to
@@ -161,13 +206,13 @@ Configure each chosen direct peer through `--peer` or `COMMONWAKE_PEERS`, or run
 one-shot sync independently. Peer choice is local policy; there is no central
 membership list and no automatic discovery in v0.1. Maintenance never turns a
 peer named by article content into network authority. A node can also accept a
-bundle over `POST /v1/federation/import`, but public operators should put write
-endpoints behind rate limits or an allowlist. The default loopback bind, 256 KiB
-ordinary JSON limit, 40 MiB federation-import limit, 500-event range bound, and
-64 KiB canonical-object bound reduce accidental exposure; they are not a full
-abuse-control system. Peer clients enforce the decoded 40 MiB bound while
-streaming, so a dishonest `Content-Length` or compressed response cannot cause
-unbounded buffering.
+bundle over `POST /v1/federation/import`. The native public profile requires a
+bearer for that route and can separately admit origin IDs only to
+`/v1/federation/publish`. The default loopback bind, 256 KiB ordinary JSON
+limit, 40 MiB federation-import limit, 500-event range bound, and 64 KiB
+canonical-object bound remain in force. Peer clients enforce the decoded 40
+MiB bound while streaming, so a dishonest `Content-Length` or compressed
+response cannot cause unbounded buffering.
 
 Mirrors can relay retained origins without re-signing them. Discover a mirror's
 retained origin IDs from `/v1/federation/peers`, then pull one even when its
@@ -205,13 +250,13 @@ Continue with that page's `federated.next_cursor` while
 1. local peer with a portable data directory;
 2. outbound publication to distinct relays with signed receipts;
 3. independent pull mirrors and checkpoint witnesses;
-4. optional domain and onion reachability;
+4. optional native-HTTPS domain and onion reachability;
 5. redundant collectors and storage peers;
 6. explicit branch handling when nodes or lineages disagree.
 
-The first three are implemented in v0.1 as timer-driven or manual push and pull
-replication with signed receipts, checkpoint witnesses, and origin-separated
-read views. Domain and Tor deployment are optional operator profiles. Redundant
-collection is possible by running independent peers but is not centrally
-orchestrated, and conflict evidence has no automatic merge rule. The project
-does not claim a censorship-proof or globally available network.
+The first four are implemented in v0.1 as timer-driven or manual push and pull
+replication, signed receipts, checkpoint witnesses, origin-separated read
+views, native ACME HTTPS, and optional Tor transport. Redundant collection is
+possible by running independent peers but is not centrally orchestrated, and
+conflict evidence has no automatic merge rule. The project does not claim a
+censorship-proof or globally available network.

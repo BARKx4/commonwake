@@ -1,7 +1,8 @@
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, Path, Query, State},
-    http::StatusCode,
+    extract::{DefaultBodyLimit, Extension, Path, Query, State},
+    http::{HeaderMap, StatusCode},
+    middleware,
     routing::{get, post},
 };
 use chrono::Utc;
@@ -10,6 +11,7 @@ use tower_http::trace::TraceLayer;
 
 use crate::{
     CONSTITUTION_VERSION, PROTOCOL_VERSION,
+    edge::{MAX_JSON_BODY_BYTES, PublicEdgeConfig, PublicEdgePolicy, enforce_public_edge},
     error::{CommonwakeError, Result},
     federation::{MAX_FEDERATION_BODY_BYTES, MAX_FEDERATION_EVENTS},
     model::{
@@ -22,9 +24,17 @@ use crate::{
     node::CommonwakeNode,
 };
 
-const MAX_JSON_BODY: usize = 256 * 1024;
-
 pub fn router(node: CommonwakeNode) -> Router {
+    let policy = PublicEdgePolicy::local(&node);
+    router_with_policy(node, policy)
+}
+
+pub fn public_router(node: CommonwakeNode, config: PublicEdgeConfig) -> Result<Router> {
+    let policy = PublicEdgePolicy::public(&node, config)?;
+    Ok(router_with_policy(node, policy))
+}
+
+fn router_with_policy(node: CommonwakeNode, policy: PublicEdgePolicy) -> Router {
     Router::new()
         .route("/", get(discovery))
         .route("/v1/health", get(health))
@@ -61,8 +71,10 @@ pub fn router(node: CommonwakeNode) -> Router {
         .route("/v1/replication", get(replication_health))
         .route("/v1/federation/events/{origin_node_id}", get(remote_events))
         .route("/v1/federation/equivocations", get(equivocation_evidence))
-        .layer(DefaultBodyLimit::max(MAX_JSON_BODY))
+        .layer(DefaultBodyLimit::max(MAX_JSON_BODY_BYTES))
         .layer(TraceLayer::new_for_http())
+        .layer(Extension(policy.clone()))
+        .layer(middleware::from_fn_with_state(policy, enforce_public_edge))
         .with_state(node)
 }
 
@@ -268,8 +280,16 @@ async fn relayed_federation_bundle(
 
 async fn import_federation_bundle(
     State(node): State<CommonwakeNode>,
+    Extension(policy): Extension<PublicEdgePolicy>,
+    headers: HeaderMap,
     Json(bundle): Json<FederationBundle>,
 ) -> Result<(StatusCode, Json<FederationImportReport>)> {
+    let _admission_guard = policy.federation_admission_guard().await;
+    policy.authorize_federation_bundle(
+        &headers,
+        &bundle.origin_node_id,
+        bundle.checkpoint.cursor,
+    )?;
     Ok((
         StatusCode::CREATED,
         Json(node.import_federation_bundle(&bundle)?),
@@ -278,8 +298,16 @@ async fn import_federation_bundle(
 
 async fn publish_federation_bundle(
     State(node): State<CommonwakeNode>,
+    Extension(policy): Extension<PublicEdgePolicy>,
+    headers: HeaderMap,
     Json(bundle): Json<FederationBundle>,
 ) -> Result<(StatusCode, Json<FederationPublishReport>)> {
+    let _admission_guard = policy.federation_admission_guard().await;
+    policy.authorize_federation_bundle(
+        &headers,
+        &bundle.origin_node_id,
+        bundle.checkpoint.cursor,
+    )?;
     let import = node.import_federation_bundle(&bundle)?;
     let receipt = node.make_replication_receipt(&bundle.checkpoint)?;
     Ok((

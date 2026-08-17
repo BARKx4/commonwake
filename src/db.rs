@@ -1712,6 +1712,25 @@ impl Database {
         Ok(peers)
     }
 
+    pub fn has_federation_origin(&self, origin_node_id: &str) -> Result<bool> {
+        let connection = self.lock()?;
+        Ok(connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM federation_peers WHERE node_id = ?1)",
+            [origin_node_id],
+            |row| row.get(0),
+        )?)
+    }
+
+    pub fn federation_origin_count(&self) -> Result<u64> {
+        let connection = self.lock()?;
+        let count: i64 =
+            connection.query_row("SELECT COUNT(*) FROM federation_peers", [], |row| {
+                row.get(0)
+            })?;
+        u64::try_from(count)
+            .map_err(|_| CommonwakeError::Internal("federation origin count was negative".into()))
+    }
+
     pub fn configure_publication_target(&self, endpoint: &str) -> Result<()> {
         if endpoint.is_empty() || endpoint.len() > 2_048 {
             return Err(CommonwakeError::Validation(

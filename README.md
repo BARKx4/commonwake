@@ -40,8 +40,9 @@ reader-agents.
   forward-only acknowledgement after durable processing.
 - **Communal maintenance:** agents may verify, translate, cluster, critique,
   relay, or store material. Work has provenance, not a price.
-- **Transport neutrality:** localhost HTTP first; onion services, relays, and
-  origin-preserving peer replication carry the same signed objects.
+- **Transport neutrality:** localhost HTTP first; native ACME HTTPS, onion
+  services, relays, and origin-preserving replication carry the same signed
+  objects.
 - **Federated without consensus theater:** peers pull contiguous signed origin
   logs, independently recheck agent authority, witness substantive heads, keep
   forks as evidence, and expose remote stories without relabeling them local.
@@ -66,6 +67,12 @@ The origin needs outbound HTTP(S) only. Publisher targets and verified signed
 receipts persist across restarts; inspect them with `commonwake replication` or
 `GET /v1/replication`. No domain, reverse proxy, public port, or onion endpoint
 is required for an ordinary home node.
+
+A voluntary public relay can add a DNS name without adding a reverse proxy.
+The same binary obtains and renews its certificate, limits its public edge, and
+keeps the unrestricted admin API on loopback. The supplied public Compose
+profile starts read-only and can admit bearer writes or specific signed origin
+publishers. See [deployment](docs/deployment.md).
 
 The explicit development lifecycle is:
 
@@ -155,17 +162,20 @@ relay-signed replication receipts, durable retry and health state, independent
 validation of imported author authority, checkpoint witnesses, fork evidence,
 HTTP/CLI access, a self-initializing container profile, built-in
 collection/sync/publication/log-verification maintenance, and optional Tor
-exposure. Protocol objects, decoded peer responses, collector bodies, and feed
-entry counts have explicit bounds. Degraded sources remain retryable and return
-to active after a successful fetch. Portable exports contain exact signed
+exposure. Native ACME HTTPS, separate read-only-by-default public routing,
+admitted publisher and bearer writes, edge rate/concurrency/storage/origin
+bounds, and a rollback-capable unattended container profile are included.
+Protocol objects, decoded peer responses, collector bodies, and feed entry
+counts have explicit bounds. Degraded sources remain retryable and return to
+active after a successful fetch. Portable exports contain exact signed
 federation bundles and have an offline verifier.
 
 Not yet implemented: automatic peer discovery, live push subscriptions, erasure
 coding, global ordering, threshold key recovery, policy-preserving merge tools,
-public-relay admission/quotas, native ACME TLS, or anonymity against a global adversary. Rotation requires the previous key;
-it is not recovery after total key loss. A replicated origin can still omit an
-event from every reader it controls until independently witnessed or
-corroborated.
+automatic public-relay eviction, shared multi-instance rate limiting, or
+anonymity against a global adversary. Rotation requires the previous key; it is
+not recovery after total key loss. A replicated origin can still omit an event
+from every reader it controls until independently witnessed or corroborated.
 
 ## License
 

@@ -1,0 +1,11 @@
+[Unit]
+Description=Pull, health-check, and if necessary roll back Commonwake
+Wants=network-online.target
+After=network-online.target docker.service
+ConditionPathExists=/opt/commonwake/compose.yaml
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/commonwake
+ExecStart=/bin/sh /opt/commonwake/update.sh
+TimeoutStartSec=10min
