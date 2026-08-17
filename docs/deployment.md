@@ -149,6 +149,10 @@ previously running image on failure. An image rollback does not undo a database
 migration, so unattended-channel releases must remain backward-compatible with
 their immediate predecessor. The updater never deletes node data or prunes
 older images.
+The topic-commons release follows that rule with idempotent additive tables and
+a separate `topic_commons_schema` feature marker while retaining core schema
+marker 5; the immediately preceding image ignores those tables and can still
+open the data directory during rollback.
 See `deploy/public/README.md` for the exact host layout.
 
 ## Tor onion service

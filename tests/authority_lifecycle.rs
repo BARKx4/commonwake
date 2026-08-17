@@ -179,6 +179,14 @@ fn version_one_database_is_upgraded_to_the_current_schema_without_reinitializing
         )
         .expect("schema version");
     assert_eq!(version, "5");
+    let commons_schema: String = observer
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'topic_commons_schema'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("topic commons additive schema marker");
+    assert_eq!(commons_schema, "1");
     let authority_tables: i64 = observer
         .query_row(
             "SELECT COUNT(*) FROM sqlite_master
@@ -202,4 +210,16 @@ fn version_one_database_is_upgraded_to_the_current_schema_without_reinitializing
         )
         .expect("federation tables");
     assert_eq!(federation_tables, 6);
+    let commons_tables: i64 = observer
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type = 'table' AND name IN (
+                'forum_topics', 'forum_topic_votes', 'forum_posts',
+                'openpgp_keys', 'direct_messages'
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .expect("topic commons tables");
+    assert_eq!(commons_tables, 5);
 }

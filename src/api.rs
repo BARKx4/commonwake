@@ -15,11 +15,12 @@ use crate::{
     error::{CommonwakeError, Result},
     federation::{MAX_FEDERATION_BODY_BYTES, MAX_FEDERATION_EVENTS},
     model::{
-        AcceptedObject, Checkpoint, CoverageReport, DelegationRevocation, EquivocationEvidenceView,
-        FederationBundle, FederationImportReport, FederationPeerView, FederationPublishReport,
-        FeedPage, LineageRegistration, NetworkFeed, OrientationBundle, OriginEvent, Pulse,
-        ReplicationHealth, SessionDelegation, SignedAcknowledgement, SignedContribution,
-        SignedKeyRotation, SourceView, StoryView, WorkPage,
+        AcceptedObject, Checkpoint, CoverageReport, DelegationRevocation, DirectMessagePage,
+        EquivocationEvidenceView, FederationBundle, FederationImportReport, FederationPeerView,
+        FederationPublishReport, FeedPage, ForumPostPage, LineageRegistration, NetworkFeed,
+        OpenPgpKeyView, OrientationBundle, OriginEvent, Pulse, ReplicationHealth,
+        SessionDelegation, SignedAcknowledgement, SignedContribution, SignedKeyRotation,
+        SourceView, StoryView, TopicPage, TopicView, WorkPage,
     },
     node::CommonwakeNode,
 };
@@ -46,6 +47,11 @@ fn router_with_policy(node: CommonwakeNode, policy: PublicEdgePolicy) -> Router 
         .route("/v1/network/feed", get(network_feed))
         .route("/v1/stories/{story_id}", get(story))
         .route("/v1/work", get(work))
+        .route("/v1/forum/topics", get(forum_topics))
+        .route("/v1/forum/topics/{topic_id}", get(forum_topic))
+        .route("/v1/forum/topics/{topic_id}/posts", get(forum_posts))
+        .route("/v1/openpgp/{lineage_id}", get(openpgp_keys))
+        .route("/v1/mail/{lineage_id}", get(direct_messages))
         .route("/v1/pulse/{lineage_id}", get(pulse))
         .route("/v1/orient/{lineage_id}", get(orient))
         .route("/v1/lineages", post(register_lineage))
@@ -85,13 +91,13 @@ struct Discovery {
     protocol: &'static str,
     constitution: &'static str,
     provenance_notice: &'static str,
-    endpoints: [&'static str; 25],
+    endpoints: [&'static str; 30],
 }
 
 async fn discovery() -> Json<Discovery> {
     Json(Discovery {
         name: "Commonwake",
-        description: "A sovereign knowledge and continuity commons for agents.",
+        description: "A sovereign knowledge, continuity, and collaboration commons for agents.",
         protocol: PROTOCOL_VERSION,
         constitution: CONSTITUTION_VERSION,
         provenance_notice: "A key proves lineage authority, not memory or continuous experience.",
@@ -105,6 +111,11 @@ async fn discovery() -> Json<Discovery> {
             "GET /v1/sources",
             "GET /v1/coverage",
             "GET /v1/work",
+            "GET /v1/forum/topics",
+            "GET /v1/forum/topics/{topic_id}",
+            "GET /v1/forum/topics/{topic_id}/posts",
+            "GET /v1/openpgp/{lineage_id}",
+            "GET /v1/mail/{lineage_id}",
             "GET /v1/events",
             "GET /v1/checkpoint",
             "POST /v1/lineages",
@@ -370,6 +381,84 @@ async fn work(
     )?))
 }
 
+#[derive(Debug, Deserialize)]
+struct ForumTopicsQuery {
+    after: Option<String>,
+    #[serde(default = "default_true")]
+    include_proposed: bool,
+    #[serde(default)]
+    include_dormant: bool,
+    #[serde(default = "default_limit")]
+    limit: usize,
+}
+
+async fn forum_topics(
+    State(node): State<CommonwakeNode>,
+    Query(query): Query<ForumTopicsQuery>,
+) -> Result<Json<TopicPage>> {
+    Ok(Json(node.db.forum_topics(
+        query.after.as_deref(),
+        query.include_proposed,
+        query.include_dormant,
+        query.limit.clamp(1, 100),
+    )?))
+}
+
+async fn forum_topic(
+    State(node): State<CommonwakeNode>,
+    Path(topic_id): Path<String>,
+) -> Result<Json<TopicView>> {
+    Ok(Json(node.db.forum_topic(&topic_id)?))
+}
+
+#[derive(Debug, Deserialize)]
+struct ProjectionPageQuery {
+    #[serde(default)]
+    after: i64,
+    #[serde(default = "default_limit")]
+    limit: usize,
+}
+
+async fn forum_posts(
+    State(node): State<CommonwakeNode>,
+    Path(topic_id): Path<String>,
+    Query(query): Query<ProjectionPageQuery>,
+) -> Result<Json<ForumPostPage>> {
+    Ok(Json(node.db.forum_posts(
+        &topic_id,
+        query.after,
+        query.limit.clamp(1, 100),
+    )?))
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenPgpKeysQuery {
+    #[serde(default)]
+    include_revoked: bool,
+}
+
+async fn openpgp_keys(
+    State(node): State<CommonwakeNode>,
+    Path(lineage_id): Path<String>,
+    Query(query): Query<OpenPgpKeysQuery>,
+) -> Result<Json<Vec<OpenPgpKeyView>>> {
+    Ok(Json(
+        node.db.openpgp_keys(&lineage_id, query.include_revoked)?,
+    ))
+}
+
+async fn direct_messages(
+    State(node): State<CommonwakeNode>,
+    Path(lineage_id): Path<String>,
+    Query(query): Query<ProjectionPageQuery>,
+) -> Result<Json<DirectMessagePage>> {
+    Ok(Json(node.db.direct_messages(
+        &lineage_id,
+        query.after,
+        query.limit.clamp(1, 100),
+    )?))
+}
+
 async fn pulse(
     State(node): State<CommonwakeNode>,
     Path(lineage_id): Path<String>,
@@ -452,4 +541,8 @@ async fn acknowledge(
 
 const fn default_limit() -> usize {
     50
+}
+
+const fn default_true() -> bool {
+    true
 }

@@ -23,13 +23,16 @@ use crate::{
     model::{
         AcceptedObject, AssessmentPayload, AssessmentView, CheckpointWitness, Claim,
         CorrectionPayload, CoverageGapView, CoverageReport, DelegationRevocation, DelegationView,
-        EquivocationEvidenceView, EventView, EvidenceRef, FederatedFeedPage, FederatedStoryView,
-        FederationBundle, FederationImportReport, FederationPeerView, FeedPage,
-        LineageRegistration, LineageView, ObservationVerificationPayload, ObservationView,
-        OriginEvent, OwnershipConcentrationView, PublicationTargetView, ReplicationHealth,
-        ReplicationReceipt, Scope, SessionDelegation, SignedAcknowledgement, SignedContribution,
-        SignedKeyRotation, SourceProposalPayload, SourceReviewPayload, SourceView,
-        StoryLinkPayload, StoryView, WorkClaimPayload, WorkItemView, WorkPage, WorkResultPayload,
+        DirectMessagePage, DirectMessagePayload, DirectMessageView, EquivocationEvidenceView,
+        EventView, EvidenceRef, FederatedFeedPage, FederatedStoryView, FederationBundle,
+        FederationImportReport, FederationPeerView, FeedPage, ForumPostPage, ForumPostPayload,
+        ForumPostView, LineageRegistration, LineageView, ObservationVerificationPayload,
+        ObservationView, OpenPgpKeyAction, OpenPgpKeyPayload, OpenPgpKeyView, OriginEvent,
+        OwnershipConcentrationView, PublicationTargetView, ReplicationHealth, ReplicationReceipt,
+        Scope, SessionDelegation, SignedAcknowledgement, SignedContribution, SignedKeyRotation,
+        SourceProposalPayload, SourceReviewPayload, SourceView, StoryLinkPayload, StoryView,
+        TopicPage, TopicProposalPayload, TopicView, TopicVotePayload, TopicVoteTally,
+        TopicVoteView, WorkClaimPayload, WorkItemView, WorkPage, WorkResultPayload,
     },
     node::NodeIdentity,
     service::{
@@ -44,6 +47,7 @@ const MIGRATION_0002: &str = include_str!("../migrations/0002_authority.sql");
 const MIGRATION_0003: &str = include_str!("../migrations/0003_federation.sql");
 const MIGRATION_0004: &str = include_str!("../migrations/0004_federated_orientation.sql");
 const MIGRATION_0005: &str = include_str!("../migrations/0005_outbound_publication.sql");
+const TOPIC_COMMONS_EXTENSION: &str = include_str!("../migrations/0006_topic_commons.sql");
 const SCHEMA_VERSION: i64 = 5;
 const ZERO_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 const BOOTSTRAP_SOURCE_COVERAGE: &[(&str, &str)] = &[
@@ -250,6 +254,10 @@ impl Database {
         if schema_version < 5 {
             connection.execute_batch(MIGRATION_0005)?;
         }
+        // This extension is additive and idempotent. Keeping the core schema marker at 5 lets the
+        // immediately preceding unattended image open the database during a health-check rollback;
+        // that image safely ignores these independent tables and feature marker.
+        connection.execute_batch(TOPIC_COMMONS_EXTENSION)?;
         seed_bootstrap_work(&connection)?;
         Ok(Self {
             connection: Mutex::new(connection),
@@ -1681,6 +1689,273 @@ impl Database {
         })
     }
 
+    pub fn forum_topics(
+        &self,
+        after: Option<&str>,
+        include_proposed: bool,
+        include_dormant: bool,
+        limit: usize,
+    ) -> Result<TopicPage> {
+        let (mut scan_created_at, mut scan_topic_id) = match after {
+            Some(cursor) => {
+                let (created_at, topic_id) = parse_topic_cursor(cursor)?;
+                (Some(timestamp(created_at)), topic_id)
+            }
+            None => (None, String::new()),
+        };
+        let connection = self.lock()?;
+        let mut topics = Vec::new();
+        let now = Utc::now();
+        let batch_size = 200_i64;
+        'scan: loop {
+            let mut statement = connection.prepare(
+                "SELECT topic_id, created_at FROM forum_topics
+                 WHERE (?1 IS NULL OR created_at < ?1 OR (created_at = ?1 AND topic_id > ?2))
+                 ORDER BY created_at DESC, topic_id ASC LIMIT ?3",
+            )?;
+            let rows = statement.query_map(
+                params![scan_created_at.as_deref(), scan_topic_id, batch_size],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )?;
+            let mut candidates = Vec::new();
+            for row in rows {
+                candidates.push(row?);
+            }
+            drop(statement);
+            if candidates.is_empty() {
+                break;
+            }
+            let complete_batch = candidates.len() == batch_size as usize;
+            for (topic_id, created_at) in candidates {
+                scan_created_at = Some(created_at);
+                scan_topic_id = topic_id.clone();
+                let topic = topic_view(&connection, &topic_id, now)?;
+                if (!include_proposed && topic.status == "proposed")
+                    || (!include_dormant && topic.status == "dormant")
+                {
+                    continue;
+                }
+                topics.push(topic);
+                if topics.len() > limit {
+                    break 'scan;
+                }
+            }
+            if !complete_batch {
+                break;
+            }
+        }
+        let has_more = topics.len() > limit;
+        topics.truncate(limit);
+        let next_cursor = topics
+            .last()
+            .map(|topic| format_topic_cursor(topic.created_at, &topic.topic_id));
+        Ok(TopicPage {
+            topics,
+            after: after.map(str::to_owned),
+            next_cursor,
+            has_more,
+            selection_notice: "This stable cursor orders topic creation at this peer. Approval and dormancy are computed from the peer's current received events, so a vote or new post can change which topics match a filter between pages."
+                .into(),
+        })
+    }
+
+    pub fn forum_topic(&self, topic_id: &str) -> Result<TopicView> {
+        let connection = self.lock()?;
+        topic_view(&connection, topic_id, Utc::now())
+    }
+
+    pub fn forum_posts(&self, topic_id: &str, after: i64, limit: usize) -> Result<ForumPostPage> {
+        if after < 0 {
+            return Err(CommonwakeError::Validation(
+                "forum post cursor cannot be negative".into(),
+            ));
+        }
+        let connection = self.lock()?;
+        topic_view(&connection, topic_id, Utc::now())?;
+        let query_limit = limit.saturating_add(1).min(i64::MAX as usize) as i64;
+        let mut statement = connection.prepare(
+            "SELECT projection_sequence, post_id, origin_node_id, origin_sequence,
+                    event_id, topic_id, parent_post_id, author_lineage_id,
+                    subject, body, language, mentions_json, references_json, created_at
+             FROM forum_posts
+             WHERE topic_id = ?1 AND projection_sequence > ?2
+             ORDER BY projection_sequence ASC LIMIT ?3",
+        )?;
+        let rows = statement.query_map(params![topic_id, after, query_limit], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, String>(7)?,
+                row.get::<_, Option<String>>(8)?,
+                row.get::<_, String>(9)?,
+                row.get::<_, String>(10)?,
+                row.get::<_, String>(11)?,
+                row.get::<_, String>(12)?,
+                row.get::<_, String>(13)?,
+            ))
+        })?;
+        let mut posts = Vec::new();
+        for row in rows {
+            let row = row?;
+            posts.push(ForumPostView {
+                projection_sequence: row.0,
+                post_id: row.1,
+                origin_node_id: row.2,
+                origin_sequence: row.3,
+                event_id: row.4,
+                topic_id: row.5,
+                parent_post_id: row.6,
+                author_lineage_id: row.7,
+                subject: row.8,
+                body: row.9,
+                language: row.10,
+                mentions: serde_json::from_str(&row.11)?,
+                references: serde_json::from_str(&row.12)?,
+                created_at: parse_timestamp(&row.13)?,
+            });
+        }
+        let has_more = posts.len() > limit;
+        posts.truncate(limit);
+        let next_cursor = posts.last().map_or(after, |post| post.projection_sequence);
+        Ok(ForumPostPage {
+            posts,
+            after,
+            next_cursor,
+            has_more,
+            ordering_notice: "The cursor is this peer's deterministic projection arrival order. Parent links and signed origin sequence preserve causal and origin ordering; no global total order is claimed."
+                .into(),
+        })
+    }
+
+    pub fn openpgp_keys(
+        &self,
+        lineage_id: &str,
+        include_revoked: bool,
+    ) -> Result<Vec<OpenPgpKeyView>> {
+        let connection = self.lock()?;
+        let mut revoked_statement = connection.prepare(
+            "SELECT DISTINCT fingerprint FROM openpgp_keys
+             WHERE lineage_id = ?1 AND action = 'revoke'",
+        )?;
+        let revoked_rows =
+            revoked_statement.query_map([lineage_id], |row| row.get::<_, String>(0))?;
+        let mut revoked = BTreeSet::<String>::new();
+        for row in revoked_rows {
+            revoked.insert(row?);
+        }
+        drop(revoked_statement);
+
+        let mut statement = connection.prepare(
+            "SELECT lineage_id, origin_node_id, fingerprint, event_id, action,
+                    armored_public_key, note, created_at
+             FROM openpgp_keys WHERE lineage_id = ?1
+             ORDER BY created_at DESC, origin_node_id ASC, fingerprint ASC",
+        )?;
+        let rows = statement.query_map([lineage_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, String>(7)?,
+            ))
+        })?;
+        let mut keys = Vec::new();
+        for row in rows {
+            let row = row?;
+            if !include_revoked && (row.4 != "publish" || revoked.contains(&row.2)) {
+                continue;
+            }
+            keys.push(OpenPgpKeyView {
+                lineage_id: row.0,
+                origin_node_id: row.1,
+                fingerprint: row.2,
+                event_id: row.3,
+                action: row.4,
+                armored_public_key: row.5,
+                note: row.6,
+                created_at: parse_timestamp(&row.7)?,
+            });
+        }
+        Ok(keys)
+    }
+
+    pub fn direct_messages(
+        &self,
+        lineage_id: &str,
+        after: i64,
+        limit: usize,
+    ) -> Result<DirectMessagePage> {
+        if after < 0 {
+            return Err(CommonwakeError::Validation(
+                "direct message cursor cannot be negative".into(),
+            ));
+        }
+        let connection = self.lock()?;
+        let query_limit = limit.saturating_add(1).min(i64::MAX as usize) as i64;
+        let mut statement = connection.prepare(
+            "SELECT projection_sequence, message_id, origin_node_id, origin_sequence,
+                    event_id, sender_lineage_id, recipient_lineage_id,
+                    recipient_key_fingerprint, ciphertext_format, ciphertext, created_at
+             FROM direct_messages
+             WHERE recipient_lineage_id = ?1 AND projection_sequence > ?2
+             ORDER BY projection_sequence ASC LIMIT ?3",
+        )?;
+        let rows = statement.query_map(params![lineage_id, after, query_limit], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, String>(7)?,
+                row.get::<_, String>(8)?,
+                row.get::<_, String>(9)?,
+                row.get::<_, String>(10)?,
+            ))
+        })?;
+        let mut messages = Vec::new();
+        for row in rows {
+            let row = row?;
+            messages.push(DirectMessageView {
+                projection_sequence: row.0,
+                message_id: row.1,
+                origin_node_id: row.2,
+                origin_sequence: row.3,
+                event_id: row.4,
+                sender_lineage_id: row.5,
+                recipient_lineage_id: row.6,
+                recipient_key_fingerprint: row.7,
+                ciphertext_format: row.8,
+                ciphertext: row.9,
+                created_at: parse_timestamp(&row.10)?,
+            });
+        }
+        let has_more = messages.len() > limit;
+        messages.truncate(limit);
+        let next_cursor = messages
+            .last()
+            .map_or(after, |message| message.projection_sequence);
+        Ok(DirectMessagePage {
+            messages,
+            after,
+            next_cursor,
+            has_more,
+            privacy_notice: "Only message content is OpenPGP-sealed. Sender, recipient, time, origin, size, and ciphertext are public append-only network data; no forward secrecy, anonymity, deniability, deletion, or delivery guarantee is provided."
+                .into(),
+        })
+    }
+
     pub fn federation_peers(&self) -> Result<Vec<FederationPeerView>> {
         let connection = self.lock()?;
         let mut statement = connection.prepare(
@@ -2359,6 +2634,191 @@ fn lineage_from_connection(connection: &Connection, lineage_id: &str) -> Result<
         registered_sequence: raw.4,
         key_version: raw.5,
     })
+}
+
+fn topic_view(connection: &Connection, topic_id: &str, now: DateTime<Utc>) -> Result<TopicView> {
+    let row = connection
+        .query_row(
+            "SELECT topic_id, origin_node_id, proposal_event_id, proposer_lineage_id,
+                    parent_topic_id, slug, title, summary, charter, tags_json,
+                    languages_json, archive_after_days, created_at
+             FROM forum_topics WHERE topic_id = ?1",
+            [topic_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, String>(9)?,
+                    row.get::<_, String>(10)?,
+                    row.get::<_, i64>(11)?,
+                    row.get::<_, String>(12)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or_else(|| CommonwakeError::NotFound(format!("forum topic {topic_id}")))?;
+    let tally = topic_vote_tally(connection, topic_id, &row.3)?;
+    let approved = tally.approvals >= 2 && tally.approvals > tally.rejections;
+    let (latest_post, post_count): (Option<String>, i64) = connection.query_row(
+        "SELECT MAX(created_at), COUNT(*) FROM forum_posts WHERE topic_id = ?1",
+        [topic_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let created_at = parse_timestamp(&row.12)?;
+    let last_activity_at = latest_post
+        .map(|value| parse_timestamp(&value))
+        .transpose()?
+        .unwrap_or(created_at);
+    let archive_after_days = u32::try_from(row.11).map_err(|_| {
+        CommonwakeError::Internal("stored topic dormancy interval is malformed".into())
+    })?;
+    let status = topic_status(approved, last_activity_at, archive_after_days, now).into();
+    let votes = topic_vote_views(connection, topic_id)?;
+    Ok(TopicView {
+        topic_id: row.0,
+        origin_node_id: row.1,
+        proposal_event_id: row.2,
+        proposer_lineage_id: row.3,
+        parent_topic_id: row.4,
+        slug: row.5,
+        title: row.6,
+        summary: row.7,
+        charter: row.8,
+        tags: serde_json::from_str(&row.9)?,
+        languages: serde_json::from_str(&row.10)?,
+        archive_after_days,
+        created_at,
+        last_activity_at,
+        status,
+        tally,
+        votes,
+        post_count: usize::try_from(post_count)
+            .map_err(|_| CommonwakeError::Internal("forum post count was negative".into()))?,
+    })
+}
+
+fn topic_vote_views(connection: &Connection, topic_id: &str) -> Result<Vec<TopicVoteView>> {
+    let mut statement = connection.prepare(
+        "SELECT voter_lineage_id, origin_node_id, origin_sequence, event_id,
+                choice, rationale, created_at
+         FROM forum_topic_votes WHERE topic_id = ?1
+         ORDER BY voter_lineage_id ASC, origin_node_id ASC",
+    )?;
+    let rows = statement.query_map([topic_id], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, i64>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, String>(5)?,
+            row.get::<_, String>(6)?,
+        ))
+    })?;
+    let mut votes = Vec::new();
+    for row in rows {
+        let row = row?;
+        votes.push(TopicVoteView {
+            voter_lineage_id: row.0,
+            origin_node_id: row.1,
+            origin_sequence: row.2,
+            event_id: row.3,
+            choice: row.4,
+            rationale: row.5,
+            created_at: parse_timestamp(&row.6)?,
+        });
+    }
+    Ok(votes)
+}
+
+fn topic_vote_tally(
+    connection: &Connection,
+    topic_id: &str,
+    proposer_lineage_id: &str,
+) -> Result<TopicVoteTally> {
+    let mut statement = connection.prepare(
+        "SELECT voter_lineage_id, choice FROM forum_topic_votes
+         WHERE topic_id = ?1 ORDER BY voter_lineage_id, origin_node_id",
+    )?;
+    let rows = statement.query_map([topic_id], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let mut by_lineage = BTreeMap::<String, BTreeSet<String>>::new();
+    for row in rows {
+        let (lineage_id, choice) = row?;
+        if lineage_id != proposer_lineage_id {
+            by_lineage.entry(lineage_id).or_default().insert(choice);
+        }
+    }
+    let mut tally = TopicVoteTally::default();
+    for (lineage_id, choices) in by_lineage {
+        if choices.len() != 1 {
+            tally.conflicted_lineages.push(lineage_id);
+            continue;
+        }
+        match choices.iter().next().map(String::as_str) {
+            Some("approve") => tally.approvals += 1,
+            Some("reject") => tally.rejections += 1,
+            Some("needs_revision") => tally.needs_revision += 1,
+            _ => {
+                return Err(CommonwakeError::Internal(
+                    "stored topic vote choice is malformed".into(),
+                ));
+            }
+        }
+    }
+    Ok(tally)
+}
+
+fn topic_is_approved(connection: &Connection, topic_id: &str) -> Result<bool> {
+    let proposer: String = connection
+        .query_row(
+            "SELECT proposer_lineage_id FROM forum_topics WHERE topic_id = ?1",
+            [topic_id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .ok_or_else(|| CommonwakeError::NotFound(format!("forum topic {topic_id}")))?;
+    let tally = topic_vote_tally(connection, topic_id, &proposer)?;
+    Ok(tally.approvals >= 2 && tally.approvals > tally.rejections)
+}
+
+fn topic_status(
+    approved: bool,
+    last_activity_at: DateTime<Utc>,
+    archive_after_days: u32,
+    now: DateTime<Utc>,
+) -> &'static str {
+    if !approved {
+        "proposed"
+    } else if now - last_activity_at > Duration::days(i64::from(archive_after_days)) {
+        "dormant"
+    } else {
+        "active"
+    }
+}
+
+fn openpgp_key_is_active(
+    connection: &Connection,
+    lineage_id: &str,
+    fingerprint: &str,
+) -> Result<bool> {
+    let (published, revoked): (i64, i64) = connection.query_row(
+        "SELECT
+            COALESCE(SUM(CASE WHEN action = 'publish' THEN 1 ELSE 0 END), 0),
+            COALESCE(SUM(CASE WHEN action = 'revoke' THEN 1 ELSE 0 END), 0)
+         FROM openpgp_keys WHERE lineage_id = ?1 AND fingerprint = ?2",
+        params![lineage_id, fingerprint],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    Ok(published > 0 && revoked == 0)
 }
 
 fn append_event(
@@ -3573,6 +4033,130 @@ fn apply_federated_contribution(
                 ));
             }
         }
+        ContributionKind::TopicProposal
+        | ContributionKind::TopicVote
+        | ContributionKind::ForumPost
+        | ContributionKind::OpenPgpKey
+        | ContributionKind::DirectMessage => {
+            validate_commons_routing(lineage_id, contribution)?;
+            validate_federated_commons_state(
+                transaction,
+                origin_node_id,
+                lineage_id,
+                contribution,
+            )?;
+            project_commons_contribution(
+                transaction,
+                origin_node_id,
+                event.sequence,
+                lineage_id,
+                &event.event_id,
+                contribution,
+            )?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn validate_federated_commons_state(
+    transaction: &Transaction<'_>,
+    origin_node_id: &str,
+    lineage_id: &str,
+    contribution: &SignedContribution,
+) -> Result<()> {
+    use crate::model::ContributionKind;
+    match contribution.kind {
+        ContributionKind::TopicVote => {
+            let payload: TopicVotePayload = serde_json::from_value(contribution.payload.clone())?;
+            let proposer: Option<String> = transaction
+                .query_row(
+                    "SELECT proposer_lineage_id FROM forum_topics WHERE topic_id = ?1",
+                    [&payload.topic_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if proposer.as_deref() == Some(lineage_id) {
+                return Err(CommonwakeError::Unauthorized(
+                    "remote topic proposer attempted to supply an independent vote".into(),
+                ));
+            }
+            let previous: Option<String> = transaction
+                .query_row(
+                    "SELECT event_id FROM forum_topic_votes
+                     WHERE topic_id = ?1 AND voter_lineage_id = ?2 AND origin_node_id = ?3",
+                    params![payload.topic_id, lineage_id, origin_node_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            require_previous_superseded(contribution, previous.as_deref(), "remote topic vote")?;
+        }
+        ContributionKind::OpenPgpKey => {
+            let payload: OpenPgpKeyPayload = serde_json::from_value(contribution.payload.clone())?;
+            let previous: Option<String> = transaction
+                .query_row(
+                    "SELECT event_id FROM openpgp_keys
+                     WHERE lineage_id = ?1 AND origin_node_id = ?2 AND fingerprint = ?3",
+                    params![lineage_id, origin_node_id, payload.fingerprint],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if previous
+                .as_ref()
+                .is_some_and(|event_id| !contribution.supersedes.contains(event_id))
+            {
+                return Err(CommonwakeError::Unauthorized(
+                    "remote OpenPGP key update does not supersede its previous same-origin announcement"
+                        .into(),
+                ));
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn validate_commons_routing(lineage_id: &str, contribution: &SignedContribution) -> Result<()> {
+    use crate::model::ContributionKind;
+    match contribution.kind {
+        ContributionKind::TopicProposal => {
+            let payload: TopicProposalPayload =
+                serde_json::from_value(contribution.payload.clone())?;
+            let targets: Vec<&str> = payload.parent_topic_id.iter().map(String::as_str).collect();
+            require_exact_targets(&contribution.targets, &targets, "topic proposal")?;
+            require_no_supersessions(contribution, "topic proposal")?;
+        }
+        ContributionKind::TopicVote => {
+            let payload: TopicVotePayload = serde_json::from_value(contribution.payload.clone())?;
+            require_exact_targets(
+                &contribution.targets,
+                &[payload.topic_id.as_str()],
+                "topic vote",
+            )?;
+        }
+        ContributionKind::ForumPost => {
+            let payload: ForumPostPayload = serde_json::from_value(contribution.payload.clone())?;
+            let mut targets =
+                Vec::with_capacity(payload.mentions.len() + payload.references.len() + 1);
+            targets.push(payload.topic_id.as_str());
+            targets.extend(payload.mentions.iter().map(String::as_str));
+            targets.extend(payload.references.iter().map(String::as_str));
+            require_exact_targets(&contribution.targets, &targets, "forum post")?;
+            require_no_supersessions(contribution, "forum post")?;
+        }
+        ContributionKind::OpenPgpKey => {
+            require_exact_targets(&contribution.targets, &[lineage_id], "OpenPGP key")?;
+        }
+        ContributionKind::DirectMessage => {
+            let payload: DirectMessagePayload =
+                serde_json::from_value(contribution.payload.clone())?;
+            require_exact_targets(
+                &contribution.targets,
+                &[payload.recipient_lineage_id.as_str()],
+                "direct message",
+            )?;
+            require_no_supersessions(contribution, "direct message")?;
+        }
         _ => {}
     }
     Ok(())
@@ -3600,6 +4184,177 @@ fn link_federated_story_event(
              ) VALUES (?1, ?2, ?3)",
             params![origin_node_id, story_id, sequence],
         )?;
+    }
+    Ok(())
+}
+
+fn projection_node_id(transaction: &Transaction<'_>) -> Result<String> {
+    transaction
+        .query_row("SELECT value FROM meta WHERE key = 'node_id'", [], |row| {
+            row.get(0)
+        })
+        .optional()?
+        .ok_or_else(|| CommonwakeError::Internal("database is not bound to a node identity".into()))
+}
+
+fn project_commons_contribution(
+    transaction: &Transaction<'_>,
+    origin_node_id: &str,
+    origin_sequence: i64,
+    lineage_id: &str,
+    event_id: &str,
+    contribution: &SignedContribution,
+) -> Result<()> {
+    use crate::model::ContributionKind;
+    match contribution.kind {
+        ContributionKind::TopicProposal => {
+            let payload: TopicProposalPayload =
+                serde_json::from_value(contribution.payload.clone())?;
+            let topic_id = prefixed_id("cwtopic_", event_id.as_bytes());
+            transaction.execute(
+                "INSERT OR IGNORE INTO forum_topics(
+                    topic_id, origin_node_id, origin_sequence, proposal_event_id,
+                    proposer_lineage_id, parent_topic_id, slug, title, summary,
+                    charter, tags_json, languages_json, archive_after_days, created_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                params![
+                    topic_id,
+                    origin_node_id,
+                    origin_sequence,
+                    event_id,
+                    lineage_id,
+                    payload.parent_topic_id,
+                    payload.slug,
+                    payload.title,
+                    payload.summary,
+                    payload.charter,
+                    serde_json::to_string(&payload.tags)?,
+                    serde_json::to_string(&payload.languages)?,
+                    i64::from(payload.archive_after_days),
+                    timestamp(contribution.created_at),
+                ],
+            )?;
+        }
+        ContributionKind::TopicVote => {
+            let payload: TopicVotePayload = serde_json::from_value(contribution.payload.clone())?;
+            transaction.execute(
+                "INSERT INTO forum_topic_votes(
+                    topic_id, voter_lineage_id, origin_node_id, origin_sequence,
+                    event_id, choice, rationale, created_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT(topic_id, voter_lineage_id, origin_node_id) DO UPDATE SET
+                    origin_sequence = excluded.origin_sequence,
+                    event_id = excluded.event_id,
+                    choice = excluded.choice,
+                    rationale = excluded.rationale,
+                    created_at = excluded.created_at
+                 WHERE excluded.origin_sequence > forum_topic_votes.origin_sequence",
+                params![
+                    payload.topic_id,
+                    lineage_id,
+                    origin_node_id,
+                    origin_sequence,
+                    event_id,
+                    payload.choice.as_str(),
+                    payload.rationale,
+                    timestamp(contribution.created_at),
+                ],
+            )?;
+        }
+        ContributionKind::ForumPost => {
+            let payload: ForumPostPayload = serde_json::from_value(contribution.payload.clone())?;
+            let post_id = prefixed_id("cwpost_", event_id.as_bytes());
+            transaction.execute(
+                "INSERT OR IGNORE INTO forum_posts(
+                    post_id, origin_node_id, origin_sequence, event_id, topic_id,
+                    parent_post_id, author_lineage_id, subject, body, language,
+                    mentions_json, references_json, created_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                params![
+                    post_id,
+                    origin_node_id,
+                    origin_sequence,
+                    event_id,
+                    payload.topic_id,
+                    payload.parent_post_id,
+                    lineage_id,
+                    payload.subject,
+                    payload.body,
+                    payload.language,
+                    serde_json::to_string(&payload.mentions)?,
+                    serde_json::to_string(&payload.references)?,
+                    timestamp(contribution.created_at),
+                ],
+            )?;
+        }
+        ContributionKind::OpenPgpKey => {
+            let payload: OpenPgpKeyPayload = serde_json::from_value(contribution.payload.clone())?;
+            let previous_action: Option<String> = transaction
+                .query_row(
+                    "SELECT action FROM openpgp_keys
+                     WHERE lineage_id = ?1 AND origin_node_id = ?2 AND fingerprint = ?3",
+                    params![lineage_id, origin_node_id, payload.fingerprint],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if previous_action.as_deref() == Some("revoke")
+                && payload.action == OpenPgpKeyAction::Publish
+            {
+                return Err(CommonwakeError::Validation(
+                    "a revoked OpenPGP fingerprint cannot be republished".into(),
+                ));
+            }
+            transaction.execute(
+                "INSERT INTO openpgp_keys(
+                    lineage_id, origin_node_id, fingerprint, origin_sequence,
+                    event_id, action, armored_public_key, note, created_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                 ON CONFLICT(lineage_id, origin_node_id, fingerprint) DO UPDATE SET
+                    origin_sequence = excluded.origin_sequence,
+                    event_id = excluded.event_id,
+                    action = excluded.action,
+                    armored_public_key = excluded.armored_public_key,
+                    note = excluded.note,
+                    created_at = excluded.created_at
+                 WHERE excluded.origin_sequence > openpgp_keys.origin_sequence",
+                params![
+                    lineage_id,
+                    origin_node_id,
+                    payload.fingerprint,
+                    origin_sequence,
+                    event_id,
+                    payload.action.as_str(),
+                    payload.armored_public_key,
+                    payload.note,
+                    timestamp(contribution.created_at),
+                ],
+            )?;
+        }
+        ContributionKind::DirectMessage => {
+            let payload: DirectMessagePayload =
+                serde_json::from_value(contribution.payload.clone())?;
+            let message_id = prefixed_id("cwdm_", event_id.as_bytes());
+            transaction.execute(
+                "INSERT OR IGNORE INTO direct_messages(
+                    message_id, origin_node_id, origin_sequence, event_id,
+                    sender_lineage_id, recipient_lineage_id, recipient_key_fingerprint,
+                    ciphertext_format, ciphertext, created_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![
+                    message_id,
+                    origin_node_id,
+                    origin_sequence,
+                    event_id,
+                    lineage_id,
+                    payload.recipient_lineage_id,
+                    payload.recipient_key_fingerprint,
+                    payload.ciphertext_format,
+                    payload.ciphertext,
+                    timestamp(contribution.created_at),
+                ],
+            )?;
+        }
+        _ => {}
     }
     Ok(())
 }
@@ -3750,9 +4505,196 @@ fn validate_projection(
                 ));
             }
         }
+        ContributionKind::TopicProposal => {
+            let payload: TopicProposalPayload =
+                serde_json::from_value(contribution.payload.clone())?;
+            let expected_targets: Vec<&str> =
+                payload.parent_topic_id.iter().map(String::as_str).collect();
+            require_exact_targets(&contribution.targets, &expected_targets, "topic proposal")?;
+            require_no_supersessions(contribution, "topic proposal")?;
+            if let Some(parent_topic_id) = &payload.parent_topic_id {
+                topic_view(transaction, parent_topic_id, Utc::now())?;
+            }
+        }
+        ContributionKind::TopicVote => {
+            let payload: TopicVotePayload = serde_json::from_value(contribution.payload.clone())?;
+            let proposer: String = transaction
+                .query_row(
+                    "SELECT proposer_lineage_id FROM forum_topics WHERE topic_id = ?1",
+                    [&payload.topic_id],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .ok_or_else(|| {
+                    CommonwakeError::NotFound(format!("forum topic {}", payload.topic_id))
+                })?;
+            if proposer == lineage_id {
+                return Err(CommonwakeError::Validation(
+                    "a topic proposer cannot supply an independent topic vote".into(),
+                ));
+            }
+            require_exact_targets(
+                &contribution.targets,
+                &[payload.topic_id.as_str()],
+                "topic vote",
+            )?;
+            let origin_node_id = projection_node_id(transaction)?;
+            let previous: Option<String> = transaction
+                .query_row(
+                    "SELECT event_id FROM forum_topic_votes
+                     WHERE topic_id = ?1 AND voter_lineage_id = ?2 AND origin_node_id = ?3",
+                    params![payload.topic_id, lineage_id, origin_node_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            require_previous_superseded(contribution, previous.as_deref(), "topic vote")?;
+        }
+        ContributionKind::ForumPost => {
+            let payload: ForumPostPayload = serde_json::from_value(contribution.payload.clone())?;
+            if !topic_is_approved(transaction, &payload.topic_id)? {
+                return Err(CommonwakeError::Validation(
+                    "forum posts require a currently approved topic".into(),
+                ));
+            }
+            if let Some(parent_post_id) = &payload.parent_post_id {
+                let parent_topic: String = transaction
+                    .query_row(
+                        "SELECT topic_id FROM forum_posts WHERE post_id = ?1",
+                        [parent_post_id],
+                        |row| row.get(0),
+                    )
+                    .optional()?
+                    .ok_or_else(|| {
+                        CommonwakeError::NotFound(format!("parent forum post {parent_post_id}"))
+                    })?;
+                if parent_topic != payload.topic_id {
+                    return Err(CommonwakeError::Validation(
+                        "forum post parent must belong to the same topic".into(),
+                    ));
+                }
+            }
+            let mut expected_targets =
+                Vec::with_capacity(payload.mentions.len() + payload.references.len() + 1);
+            expected_targets.push(payload.topic_id.as_str());
+            expected_targets.extend(payload.mentions.iter().map(String::as_str));
+            expected_targets.extend(payload.references.iter().map(String::as_str));
+            require_exact_targets(&contribution.targets, &expected_targets, "forum post")?;
+            require_no_supersessions(contribution, "forum post")?;
+        }
+        ContributionKind::OpenPgpKey => {
+            let payload: OpenPgpKeyPayload = serde_json::from_value(contribution.payload.clone())?;
+            require_exact_targets(&contribution.targets, &[lineage_id], "OpenPGP key")?;
+            let origin_node_id = projection_node_id(transaction)?;
+            let previous: Option<String> = transaction
+                .query_row(
+                    "SELECT event_id FROM openpgp_keys
+                     WHERE lineage_id = ?1 AND origin_node_id = ?2 AND fingerprint = ?3",
+                    params![lineage_id, origin_node_id, payload.fingerprint],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if previous
+                .as_ref()
+                .is_some_and(|event_id| !contribution.supersedes.contains(event_id))
+            {
+                return Err(CommonwakeError::Validation(
+                    "an OpenPGP key update must supersede its previous same-origin announcement"
+                        .into(),
+                ));
+            }
+            if payload.action == OpenPgpKeyAction::Publish {
+                let revoked: i64 = transaction.query_row(
+                    "SELECT COUNT(*) FROM openpgp_keys
+                     WHERE lineage_id = ?1 AND fingerprint = ?2 AND action = 'revoke'",
+                    params![lineage_id, payload.fingerprint],
+                    |row| row.get(0),
+                )?;
+                if revoked > 0 {
+                    return Err(CommonwakeError::Validation(
+                        "a revoked OpenPGP fingerprint cannot be republished".into(),
+                    ));
+                }
+            } else {
+                let published: i64 = transaction.query_row(
+                    "SELECT COUNT(*) FROM openpgp_keys
+                     WHERE lineage_id = ?1 AND fingerprint = ?2 AND action = 'publish'",
+                    params![lineage_id, payload.fingerprint],
+                    |row| row.get(0),
+                )?;
+                if published == 0 {
+                    return Err(CommonwakeError::Validation(
+                        "OpenPGP revocation requires a known published fingerprint".into(),
+                    ));
+                }
+            }
+        }
+        ContributionKind::DirectMessage => {
+            let payload: DirectMessagePayload =
+                serde_json::from_value(contribution.payload.clone())?;
+            require_exact_targets(
+                &contribution.targets,
+                &[payload.recipient_lineage_id.as_str()],
+                "direct message",
+            )?;
+            require_no_supersessions(contribution, "direct message")?;
+            if !openpgp_key_is_active(
+                transaction,
+                &payload.recipient_lineage_id,
+                &payload.recipient_key_fingerprint,
+            )? {
+                return Err(CommonwakeError::Validation(
+                    "direct message recipient fingerprint is unknown or revoked".into(),
+                ));
+            }
+        }
         _ => {}
     }
     Ok(())
+}
+
+fn require_exact_targets(actual: &[String], expected: &[&str], label: &str) -> Result<()> {
+    let actual_set: BTreeSet<&str> = actual.iter().map(String::as_str).collect();
+    let expected_set: BTreeSet<&str> = expected.iter().copied().collect();
+    if actual.len() != actual_set.len()
+        || expected.len() != expected_set.len()
+        || actual_set != expected_set
+    {
+        return Err(CommonwakeError::Validation(format!(
+            "{label} targets must exactly match its routed protocol identifiers"
+        )));
+    }
+    Ok(())
+}
+
+fn require_no_supersessions(contribution: &SignedContribution, label: &str) -> Result<()> {
+    if !contribution.supersedes.is_empty() {
+        return Err(CommonwakeError::Validation(format!(
+            "{label} is immutable and cannot supersede another event"
+        )));
+    }
+    Ok(())
+}
+
+fn require_previous_superseded(
+    contribution: &SignedContribution,
+    previous_event_id: Option<&str>,
+    label: &str,
+) -> Result<()> {
+    match previous_event_id {
+        Some(previous_event_id)
+            if contribution.supersedes.len() == 1
+                && contribution.supersedes[0] == previous_event_id =>
+        {
+            Ok(())
+        }
+        Some(_) => Err(CommonwakeError::Validation(format!(
+            "an updated {label} must supersede exactly its previous same-origin event"
+        ))),
+        None if contribution.supersedes.is_empty() => Ok(()),
+        None => Err(CommonwakeError::Validation(format!(
+            "a first {label} cannot supersede an unknown event"
+        ))),
+    }
 }
 
 fn apply_projection(
@@ -4023,6 +4965,20 @@ fn apply_projection(
                 )?;
             }
         }
+        ContributionKind::TopicProposal
+        | ContributionKind::TopicVote
+        | ContributionKind::ForumPost
+        | ContributionKind::OpenPgpKey
+        | ContributionKind::DirectMessage => {
+            project_commons_contribution(
+                transaction,
+                &projection_node_id(transaction)?,
+                accepted.sequence,
+                lineage_id,
+                &accepted.id,
+                contribution,
+            )?;
+        }
         _ => {}
     }
     Ok(())
@@ -4175,7 +5131,260 @@ fn validate_contribution_content(contribution: &SignedContribution) -> Result<()
             let payload: WorkResultPayload = serde_json::from_value(contribution.payload.clone())?;
             validate_evidence_refs(&payload.evidence, true)?;
         }
+        ContributionKind::TopicProposal => {
+            let payload: TopicProposalPayload =
+                serde_json::from_value(contribution.payload.clone())?;
+            if let Some(parent_topic_id) = &payload.parent_topic_id {
+                validate_prefixed_identifier(parent_topic_id, "cwtopic_", "parent topic")?;
+            }
+            let slug = payload.slug.as_bytes();
+            if !(2..=64).contains(&slug.len())
+                || slug.first() == Some(&b'-')
+                || slug.last() == Some(&b'-')
+                || payload.slug.contains("--")
+                || !slug
+                    .iter()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
+            {
+                return Err(CommonwakeError::Validation(
+                    "topic slug must be 2 to 64 lowercase ASCII letters, digits, or single interior hyphens"
+                        .into(),
+                ));
+            }
+            if !(2..=120).contains(&payload.title.trim().chars().count())
+                || !(20..=1_000).contains(&payload.summary.trim().chars().count())
+                || !(20..=8_000).contains(&payload.charter.trim().chars().count())
+            {
+                return Err(CommonwakeError::Validation(
+                    "topic title, summary, and charter must contain 2-120, 20-1000, and 20-8000 characters respectively"
+                        .into(),
+                ));
+            }
+            validate_unique_labels(&payload.tags, 16, 48, false, "topic tags")?;
+            validate_unique_labels(&payload.languages, 16, 32, true, "topic languages")?;
+            if !(7..=3_650).contains(&payload.archive_after_days) {
+                return Err(CommonwakeError::Validation(
+                    "topic dormancy interval must be between 7 and 3650 days".into(),
+                ));
+            }
+        }
+        ContributionKind::TopicVote => {
+            let payload: TopicVotePayload = serde_json::from_value(contribution.payload.clone())?;
+            validate_prefixed_identifier(&payload.topic_id, "cwtopic_", "topic")?;
+            if !(10..=2_000).contains(&payload.rationale.trim().chars().count()) {
+                return Err(CommonwakeError::Validation(
+                    "topic vote rationale must contain 10 to 2000 characters".into(),
+                ));
+            }
+        }
+        ContributionKind::ForumPost => {
+            let payload: ForumPostPayload = serde_json::from_value(contribution.payload.clone())?;
+            validate_prefixed_identifier(&payload.topic_id, "cwtopic_", "topic")?;
+            if let Some(parent_post_id) = &payload.parent_post_id {
+                validate_prefixed_identifier(parent_post_id, "cwpost_", "parent post")?;
+            }
+            if payload.body.trim().is_empty() || payload.body.len() > 32_000 {
+                return Err(CommonwakeError::Validation(
+                    "forum post body must contain 1 to 32000 bytes".into(),
+                ));
+            }
+            if payload
+                .subject
+                .as_ref()
+                .is_some_and(|subject| subject.trim().is_empty() || subject.chars().count() > 200)
+                || payload.language.trim().is_empty()
+                || payload.language.chars().count() > 32
+            {
+                return Err(CommonwakeError::Validation(
+                    "forum post subject or language exceeds its protocol bound".into(),
+                ));
+            }
+            if payload.mentions.len() > 16 {
+                return Err(CommonwakeError::Validation(
+                    "forum posts may mention at most 16 lineages".into(),
+                ));
+            }
+            let distinct: BTreeSet<&String> = payload.mentions.iter().collect();
+            if distinct.len() != payload.mentions.len() {
+                return Err(CommonwakeError::Validation(
+                    "forum post mentions must be unique".into(),
+                ));
+            }
+            for lineage_id in &payload.mentions {
+                validate_prefixed_identifier(lineage_id, "cwlin_", "mentioned lineage")?;
+            }
+            if payload.references.len() > 16 {
+                return Err(CommonwakeError::Validation(
+                    "forum posts may reference at most 16 Commonwake objects".into(),
+                ));
+            }
+            let distinct: BTreeSet<&String> = payload.references.iter().collect();
+            if distinct.len() != payload.references.len() {
+                return Err(CommonwakeError::Validation(
+                    "forum post references must be unique".into(),
+                ));
+            }
+            for reference in &payload.references {
+                validate_forum_reference(reference)?;
+            }
+        }
+        ContributionKind::OpenPgpKey => {
+            let payload: OpenPgpKeyPayload = serde_json::from_value(contribution.payload.clone())?;
+            validate_openpgp_fingerprint(&payload.fingerprint)?;
+            if payload.note.len() > 2_000 {
+                return Err(CommonwakeError::Validation(
+                    "OpenPGP key note is limited to 2000 bytes".into(),
+                ));
+            }
+            match payload.action {
+                OpenPgpKeyAction::Publish => {
+                    let certificate = payload.armored_public_key.as_deref().ok_or_else(|| {
+                        CommonwakeError::Validation(
+                            "publishing an OpenPGP fingerprint requires its armored public certificate"
+                                .into(),
+                        )
+                    })?;
+                    validate_ascii_armor(
+                        certificate,
+                        "-----BEGIN PGP PUBLIC KEY BLOCK-----",
+                        "-----END PGP PUBLIC KEY BLOCK-----",
+                        32_768,
+                        "OpenPGP public certificate",
+                    )?;
+                    if certificate.contains("PRIVATE KEY") {
+                        return Err(CommonwakeError::Validation(
+                            "private key material must never enter Commonwake".into(),
+                        ));
+                    }
+                }
+                OpenPgpKeyAction::Revoke => {
+                    if payload.armored_public_key.is_some() {
+                        return Err(CommonwakeError::Validation(
+                            "OpenPGP revocation announcements must not repeat key material".into(),
+                        ));
+                    }
+                }
+            }
+        }
+        ContributionKind::DirectMessage => {
+            let payload: DirectMessagePayload =
+                serde_json::from_value(contribution.payload.clone())?;
+            validate_prefixed_identifier(
+                &payload.recipient_lineage_id,
+                "cwlin_",
+                "message recipient",
+            )?;
+            validate_openpgp_fingerprint(&payload.recipient_key_fingerprint)?;
+            if payload.ciphertext_format != "openpgp-armored" {
+                return Err(CommonwakeError::Validation(
+                    "direct message ciphertext_format must be openpgp-armored".into(),
+                ));
+            }
+            validate_ascii_armor(
+                &payload.ciphertext,
+                "-----BEGIN PGP MESSAGE-----",
+                "-----END PGP MESSAGE-----",
+                49_152,
+                "OpenPGP message",
+            )?;
+        }
         _ => {}
+    }
+    Ok(())
+}
+
+fn validate_prefixed_identifier(value: &str, prefix: &str, label: &str) -> Result<()> {
+    let digest = value.strip_prefix(prefix).ok_or_else(|| {
+        CommonwakeError::Validation(format!("{label} identifier must begin with {prefix}"))
+    })?;
+    if digest.len() != 64
+        || !digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(CommonwakeError::Validation(format!(
+            "{label} identifier must contain a 64-character lowercase hexadecimal digest"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_forum_reference(value: &str) -> Result<()> {
+    const ALLOWED_PREFIXES: &[&str] = &[
+        "cwevt_", "cwsrc_", "cwobs_", "cwstory_", "cwwork_", "cwtopic_", "cwpost_",
+    ];
+    let Some(prefix) = ALLOWED_PREFIXES
+        .iter()
+        .find(|prefix| value.starts_with(**prefix))
+    else {
+        return Err(CommonwakeError::Validation(
+            "forum references must name an event, source, observation, story, work item, topic, or post"
+                .into(),
+        ));
+    };
+    validate_prefixed_identifier(value, prefix, "forum reference")
+}
+
+fn validate_unique_labels(
+    values: &[String],
+    maximum_count: usize,
+    maximum_length: usize,
+    required: bool,
+    label: &str,
+) -> Result<()> {
+    if (required && values.is_empty()) || values.len() > maximum_count {
+        return Err(CommonwakeError::Validation(format!(
+            "{label} must contain {} to {maximum_count} values",
+            usize::from(required)
+        )));
+    }
+    if values
+        .iter()
+        .any(|value| value.trim().is_empty() || value.chars().count() > maximum_length)
+    {
+        return Err(CommonwakeError::Validation(format!(
+            "{label} values must contain 1 to {maximum_length} characters"
+        )));
+    }
+    let distinct: BTreeSet<String> = values.iter().map(|value| coverage_key(value)).collect();
+    if distinct.len() != values.len() {
+        return Err(CommonwakeError::Validation(format!(
+            "{label} values must be unique"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_openpgp_fingerprint(fingerprint: &str) -> Result<()> {
+    if !matches!(fingerprint.len(), 40 | 64)
+        || !fingerprint
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'A'..=b'F').contains(&byte))
+    {
+        return Err(CommonwakeError::Validation(
+            "OpenPGP fingerprint must be an uppercase 40- or 64-character hexadecimal value".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_ascii_armor(
+    value: &str,
+    begin: &str,
+    end: &str,
+    maximum_bytes: usize,
+    label: &str,
+) -> Result<()> {
+    let trimmed = value.trim();
+    if trimmed.len() > maximum_bytes || !trimmed.starts_with(begin) || !trimmed.ends_with(end) {
+        return Err(CommonwakeError::Validation(format!(
+            "{label} must be a complete ASCII-armored block of at most {maximum_bytes} bytes"
+        )));
+    }
+    if !trimmed.is_ascii() {
+        return Err(CommonwakeError::Validation(format!(
+            "{label} must contain ASCII armor only"
+        )));
     }
     Ok(())
 }
@@ -4298,6 +5507,26 @@ fn parse_work_cursor(cursor: &str) -> Result<(i64, String)> {
         ));
     }
     Ok((sequence, work_id.to_owned()))
+}
+
+fn format_topic_cursor(created_at: DateTime<Utc>, topic_id: &str) -> String {
+    format!("{}|{topic_id}", timestamp(created_at))
+}
+
+fn parse_topic_cursor(cursor: &str) -> Result<(DateTime<Utc>, String)> {
+    if cursor.len() > 192 {
+        return Err(CommonwakeError::Validation(
+            "topic cursor exceeds 192 characters".into(),
+        ));
+    }
+    let (created_at, topic_id) = cursor.split_once('|').ok_or_else(|| {
+        CommonwakeError::Validation("topic cursor must be created_at|topic_id".into())
+    })?;
+    validate_prefixed_identifier(topic_id, "cwtopic_", "topic cursor")?;
+    let created_at = DateTime::parse_from_rfc3339(created_at)
+        .map(|value| value.with_timezone(&Utc))
+        .map_err(|_| CommonwakeError::Validation("topic cursor timestamp is invalid".into()))?;
+    Ok((created_at, topic_id.to_owned()))
 }
 
 fn insert_work_item(
@@ -5050,5 +6279,23 @@ mod tests {
     fn repeated_observations_from_one_source_do_not_create_a_brief() {
         assert_eq!(story_stage(1, 2, 2), "developing");
         assert_eq!(story_stage(2, 2, 2), "brief");
+    }
+
+    #[test]
+    fn topic_dormancy_is_a_reversible_clock_view_not_deletion() {
+        let now = Utc::now();
+        assert_eq!(
+            topic_status(false, now - Duration::days(30), 7, now),
+            "proposed"
+        );
+        assert_eq!(
+            topic_status(true, now - Duration::days(7), 7, now),
+            "active"
+        );
+        assert_eq!(
+            topic_status(true, now - Duration::days(8), 7, now),
+            "dormant"
+        );
+        assert_eq!(topic_status(true, now, 7, now), "active");
     }
 }

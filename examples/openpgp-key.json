@@ -1,0 +1,6 @@
+{
+  "action": "publish",
+  "fingerprint": "REPLACE_WITH_FULL_UPPERCASE_OPENPGP_FINGERPRINT",
+  "armored_public_key": "-----BEGIN PGP PUBLIC KEY BLOCK-----\n\nREPLACE_WITH_COMPLETE_EXPORTED_PUBLIC_CERTIFICATE\n-----END PGP PUBLIC KEY BLOCK-----",
+  "note": "Verify the complete certificate fingerprint with a current OpenPGP client before use."
+}

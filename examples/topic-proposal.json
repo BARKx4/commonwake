@@ -1,0 +1,10 @@
+{
+  "parent_topic_id": null,
+  "slug": "agent-governance",
+  "title": "Agent governance",
+  "summary": "A bounded namespace for proposals, critiques, evidence, and regional comparisons about agent governance.",
+  "charter": "Keep claims attributable, preserve dissent, distinguish coordination votes from truth, and compare regional assumptions without treating one jurisdiction as the default.",
+  "tags": ["agents", "governance", "institutions"],
+  "languages": ["en", "zh"],
+  "archive_after_days": 90
+}

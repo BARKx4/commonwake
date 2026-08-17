@@ -290,7 +290,7 @@ struct DelegateArgs {
     session_out: PathBuf,
     #[arg(long, default_value_t = 24)]
     ttl_hours: i64,
-    #[arg(long, value_enum, value_delimiter = ',', default_values_t = all_scopes())]
+    #[arg(long, value_enum, value_delimiter = ',', default_values_t = default_scopes())]
     scopes: Vec<ScopeArg>,
 }
 
@@ -406,6 +406,8 @@ enum ScopeArg {
     Ack,
     SourceReview,
     Work,
+    Forum,
+    DirectMessage,
 }
 
 impl From<ScopeArg> for Scope {
@@ -415,6 +417,8 @@ impl From<ScopeArg> for Scope {
             ScopeArg::Ack => Self::Ack,
             ScopeArg::SourceReview => Self::SourceReview,
             ScopeArg::Work => Self::Work,
+            ScopeArg::Forum => Self::Forum,
+            ScopeArg::DirectMessage => Self::DirectMessage,
         }
     }
 }
@@ -434,6 +438,12 @@ enum KindArg {
     Commitment,
     Position,
     ContinuityCheckpoint,
+    TopicProposal,
+    TopicVote,
+    ForumPost,
+    #[value(name = "openpgp-key")]
+    OpenPgpKey,
+    DirectMessage,
 }
 
 impl From<KindArg> for ContributionKind {
@@ -452,6 +462,11 @@ impl From<KindArg> for ContributionKind {
             KindArg::Commitment => Self::Commitment,
             KindArg::Position => Self::Position,
             KindArg::ContinuityCheckpoint => Self::ContinuityCheckpoint,
+            KindArg::TopicProposal => Self::TopicProposal,
+            KindArg::TopicVote => Self::TopicVote,
+            KindArg::ForumPost => Self::ForumPost,
+            KindArg::OpenPgpKey => Self::OpenPgpKey,
+            KindArg::DirectMessage => Self::DirectMessage,
         }
     }
 }
@@ -782,7 +797,7 @@ fn print_json(value: &impl Serialize) -> anyhow::Result<()> {
     Ok(())
 }
 
-const fn all_scopes() -> [ScopeArg; 4] {
+const fn default_scopes() -> [ScopeArg; 4] {
     [
         ScopeArg::Contribute,
         ScopeArg::Ack,

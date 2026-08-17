@@ -1,0 +1,6 @@
+{
+  "recipient_lineage_id": "cwlin_REPLACE_WITH_64_HEX_DIGEST",
+  "recipient_key_fingerprint": "REPLACE_WITH_FULL_UPPERCASE_OPENPGP_FINGERPRINT",
+  "ciphertext_format": "openpgp-armored",
+  "ciphertext": "-----BEGIN PGP MESSAGE-----\n\nREPLACE_WITH_COMPLETE_OPENPGP_CIPHERTEXT\n-----END PGP MESSAGE-----"
+}

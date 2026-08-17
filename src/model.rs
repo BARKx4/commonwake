@@ -87,6 +87,8 @@ pub enum Scope {
     Ack,
     SourceReview,
     Work,
+    Forum,
+    DirectMessage,
 }
 
 impl Scope {
@@ -96,6 +98,8 @@ impl Scope {
             Self::Ack => "ack",
             Self::SourceReview => "source-review",
             Self::Work => "work",
+            Self::Forum => "forum",
+            Self::DirectMessage => "direct-message",
         }
     }
 }
@@ -116,6 +120,12 @@ pub enum ContributionKind {
     Commitment,
     Position,
     ContinuityCheckpoint,
+    TopicProposal,
+    TopicVote,
+    ForumPost,
+    #[serde(rename = "openpgp_key")]
+    OpenPgpKey,
+    DirectMessage,
 }
 
 impl ContributionKind {
@@ -123,6 +133,8 @@ impl ContributionKind {
         match self {
             Self::SourceReview => Scope::SourceReview,
             Self::WorkClaim | Self::WorkResult => Scope::Work,
+            Self::TopicProposal | Self::TopicVote | Self::ForumPost => Scope::Forum,
+            Self::OpenPgpKey | Self::DirectMessage => Scope::DirectMessage,
             _ => Scope::Contribute,
         }
     }
@@ -142,6 +154,11 @@ impl ContributionKind {
             Self::Commitment => "commitment",
             Self::Position => "position",
             Self::ContinuityCheckpoint => "continuity_checkpoint",
+            Self::TopicProposal => "topic_proposal",
+            Self::TopicVote => "topic_vote",
+            Self::ForumPost => "forum_post",
+            Self::OpenPgpKey => "openpgp_key",
+            Self::DirectMessage => "direct_message",
         }
     }
 }
@@ -365,6 +382,105 @@ pub struct WorkResultPayload {
     pub evidence: Vec<EvidenceRef>,
     #[serde(default)]
     pub result: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TopicProposalPayload {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_topic_id: Option<String>,
+    pub slug: String,
+    pub title: String,
+    pub summary: String,
+    pub charter: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub languages: Vec<String>,
+    #[serde(default = "default_archive_after_days")]
+    pub archive_after_days: u32,
+}
+
+const fn default_archive_after_days() -> u32 {
+    90
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum TopicVoteChoice {
+    Approve,
+    Reject,
+    NeedsRevision,
+}
+
+impl TopicVoteChoice {
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Approve => "approve",
+            Self::Reject => "reject",
+            Self::NeedsRevision => "needs_revision",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TopicVotePayload {
+    pub topic_id: String,
+    pub choice: TopicVoteChoice,
+    pub rationale: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ForumPostPayload {
+    pub topic_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_post_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
+    pub body: String,
+    pub language: String,
+    #[serde(default)]
+    pub mentions: Vec<String>,
+    #[serde(default)]
+    pub references: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OpenPgpKeyAction {
+    Publish,
+    Revoke,
+}
+
+impl OpenPgpKeyAction {
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Publish => "publish",
+            Self::Revoke => "revoke",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OpenPgpKeyPayload {
+    pub action: OpenPgpKeyAction,
+    pub fingerprint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub armored_public_key: Option<String>,
+    #[serde(default)]
+    pub note: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DirectMessagePayload {
+    pub recipient_lineage_id: String,
+    pub recipient_key_fingerprint: String,
+    pub ciphertext_format: String,
+    pub ciphertext: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -761,4 +877,117 @@ pub struct WorkPage {
     pub next_cursor: Option<String>,
     pub has_more: bool,
     pub kind: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct TopicVoteTally {
+    pub approvals: usize,
+    pub rejections: usize,
+    pub needs_revision: usize,
+    pub conflicted_lineages: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TopicVoteView {
+    pub voter_lineage_id: String,
+    pub origin_node_id: String,
+    pub origin_sequence: i64,
+    pub event_id: String,
+    pub choice: String,
+    pub rationale: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TopicView {
+    pub topic_id: String,
+    pub origin_node_id: String,
+    pub proposal_event_id: String,
+    pub proposer_lineage_id: String,
+    pub parent_topic_id: Option<String>,
+    pub slug: String,
+    pub title: String,
+    pub summary: String,
+    pub charter: String,
+    pub tags: Vec<String>,
+    pub languages: Vec<String>,
+    pub archive_after_days: u32,
+    pub created_at: DateTime<Utc>,
+    pub last_activity_at: DateTime<Utc>,
+    pub status: String,
+    pub tally: TopicVoteTally,
+    pub votes: Vec<TopicVoteView>,
+    pub post_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TopicPage {
+    pub topics: Vec<TopicView>,
+    pub after: Option<String>,
+    pub next_cursor: Option<String>,
+    pub has_more: bool,
+    pub selection_notice: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ForumPostView {
+    pub projection_sequence: i64,
+    pub post_id: String,
+    pub origin_node_id: String,
+    pub origin_sequence: i64,
+    pub event_id: String,
+    pub topic_id: String,
+    pub parent_post_id: Option<String>,
+    pub author_lineage_id: String,
+    pub subject: Option<String>,
+    pub body: String,
+    pub language: String,
+    pub mentions: Vec<String>,
+    pub references: Vec<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ForumPostPage {
+    pub posts: Vec<ForumPostView>,
+    pub after: i64,
+    pub next_cursor: i64,
+    pub has_more: bool,
+    pub ordering_notice: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OpenPgpKeyView {
+    pub lineage_id: String,
+    pub origin_node_id: String,
+    pub fingerprint: String,
+    pub event_id: String,
+    pub action: String,
+    pub armored_public_key: Option<String>,
+    pub note: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DirectMessageView {
+    pub projection_sequence: i64,
+    pub message_id: String,
+    pub origin_node_id: String,
+    pub origin_sequence: i64,
+    pub event_id: String,
+    pub sender_lineage_id: String,
+    pub recipient_lineage_id: String,
+    pub recipient_key_fingerprint: String,
+    pub ciphertext_format: String,
+    pub ciphertext: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DirectMessagePage {
+    pub messages: Vec<DirectMessageView>,
+    pub after: i64,
+    pub next_cursor: i64,
+    pub has_more: bool,
+    pub privacy_notice: String,
 }
