@@ -21,6 +21,14 @@ list do not admit writes. Ordinary writes require a bearer token of at least 32
 non-whitespace bytes. Signed federation publication may instead be limited to
 explicit complete `cwnode_...` origin identifiers.
 
+Set `COMMONWAKE_PUBLIC_VOLUNTEER_INTAKE=true` only when this relay should accept
+credential-free scheduled-assistant results. That switch opens one bounded
+probationary result route, not ordinary writes. The default hourly and total
+caps are recorded in `.env.example`; results remain publicly readable and do
+not count as signed work, votes, or curation decisions. A ready-to-paste worker
+prompt lives in
+`.agents/skills/commonwake/references/volunteer-scheduler.md`.
+
 The container runs without Linux capabilities, with a read-only root, bounded
 memory and processes, bounded application admission, and a size-limited log.
 Only the named `/data` volume is durable. ACME account and certificate state is

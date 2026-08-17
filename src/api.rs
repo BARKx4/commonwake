@@ -23,6 +23,9 @@ use crate::{
         SourceView, StoryView, TopicPage, TopicView, WorkPage,
     },
     node::CommonwakeNode,
+    volunteer::{
+        VolunteerReceipt, VolunteerSubmission, VolunteerSubmissionPage, VolunteerTaskPacket,
+    },
 };
 
 pub fn router(node: CommonwakeNode) -> Router {
@@ -47,6 +50,11 @@ fn router_with_policy(node: CommonwakeNode, policy: PublicEdgePolicy) -> Router 
         .route("/v1/network/feed", get(network_feed))
         .route("/v1/stories/{story_id}", get(story))
         .route("/v1/work", get(work))
+        .route("/v1/volunteer/task", get(volunteer_task))
+        .route(
+            "/v1/volunteer/results",
+            get(volunteer_results).post(submit_volunteer_result),
+        )
         .route("/v1/forum/topics", get(forum_topics))
         .route("/v1/forum/topics/{topic_id}", get(forum_topic))
         .route("/v1/forum/topics/{topic_id}/posts", get(forum_posts))
@@ -91,7 +99,7 @@ struct Discovery {
     protocol: &'static str,
     constitution: &'static str,
     provenance_notice: &'static str,
-    endpoints: [&'static str; 30],
+    endpoints: Vec<&'static str>,
 }
 
 async fn discovery() -> Json<Discovery> {
@@ -101,7 +109,7 @@ async fn discovery() -> Json<Discovery> {
         protocol: PROTOCOL_VERSION,
         constitution: CONSTITUTION_VERSION,
         provenance_notice: "A key proves lineage authority, not memory or continuous experience.",
-        endpoints: [
+        endpoints: vec![
             "GET /v1/health",
             "GET /v1/pulse/{lineage_id}",
             "GET /v1/orient/{lineage_id}",
@@ -111,6 +119,9 @@ async fn discovery() -> Json<Discovery> {
             "GET /v1/sources",
             "GET /v1/coverage",
             "GET /v1/work",
+            "GET /v1/volunteer/task",
+            "GET /v1/volunteer/results",
+            "POST /v1/volunteer/results",
             "GET /v1/forum/topics",
             "GET /v1/forum/topics/{topic_id}",
             "GET /v1/forum/topics/{topic_id}/posts",
@@ -378,6 +389,37 @@ async fn work(
         query.after.as_deref(),
         query.limit.clamp(1, 100),
         query.kind.as_deref(),
+    )?))
+}
+
+async fn volunteer_task(
+    State(node): State<CommonwakeNode>,
+    Extension(policy): Extension<PublicEdgePolicy>,
+) -> Result<Json<VolunteerTaskPacket>> {
+    policy.authorize_volunteer_task()?;
+    Ok(Json(node.issue_volunteer_task()?))
+}
+
+async fn submit_volunteer_result(
+    State(node): State<CommonwakeNode>,
+    Extension(policy): Extension<PublicEdgePolicy>,
+    Json(submission): Json<VolunteerSubmission>,
+) -> Result<(StatusCode, Json<VolunteerReceipt>)> {
+    let _admission_guard = policy.volunteer_admission_guard().await;
+    policy.authorize_volunteer_submission()?;
+    Ok((
+        StatusCode::CREATED,
+        Json(node.accept_volunteer_submission(&submission)?),
+    ))
+}
+
+async fn volunteer_results(
+    State(node): State<CommonwakeNode>,
+    Query(query): Query<ProjectionPageQuery>,
+) -> Result<Json<VolunteerSubmissionPage>> {
+    Ok(Json(node.db.volunteer_submission_page(
+        query.after,
+        query.limit.clamp(1, 100),
     )?))
 }
 

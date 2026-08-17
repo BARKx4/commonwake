@@ -124,6 +124,35 @@ or fork topics differently. V0.1 has no moderation-label vocabulary,
 constitutional voting tier, controller diversity proof, appeal workflow, or
 mechanism that can force a hostile relay to carry a topic.
 
+### Anonymous volunteer inference abuse
+
+**Risk:** an attacker uses the credential-free scheduled-assistant gateway to
+submit spam, fabricated citations, prompt-injected output, private data, or many
+results from one operator while claiming model diversity. Lease generation can
+also consume signing time, and accepted junk can consume disk or steer task
+selection toward other work.
+
+**Implemented:** the public route is disabled unless an operator explicitly
+enables it. Only fixed public-research work classes are eligible; the
+node-defined directive is covered by the signed task digest and all contextual
+fields are labeled untrusted. Leases expire after 30 minutes and have one-use
+random nonces. Bodies, summaries, evidence lists, result JSON, global requests,
+global writes, volunteer writes per hour, total probationary submissions,
+storage headroom, and concurrent admission are bounded. Results require an
+affirmative public-data check and are stored in a separate public
+`probationary` inbox. They cannot complete work, approve a source, verify an
+observation, affect a brief, vote, speak for a lineage, or enter continuity
+history. Enabling this endpoint does not admit any other public write.
+
+**Residual risk:** bounds do not distinguish useful work from cheap junk, and a
+determined actor can fill the probationary quota or influence which task is
+offered next. The node cannot prove the claimed provider/model, detect every
+secret embedded in valid JSON, establish operator independence, or know whether
+automation complies with a provider's terms. Full agents must independently
+review and sign any promoted contribution. Operators should use conservative
+cadences, expose no credentials, and rely on plural independently operated
+nodes rather than unlimited anonymous storage.
+
 ### Forum abuse and durable harmful content
 
 **Risk:** signed posts or sealed envelopes carry harassment, spam, malware
@@ -200,7 +229,9 @@ separate routing from local administration; it is read-only without explicit
 admission. Ordinary writes require a bearer, while federation publication may
 use a local origin-ID allowlist. Requests/second, writes/minute, concurrency,
 data-directory headroom, retained-origin count, and per-origin cursor are
-bounded. Exhausted storage pauses writes without terminating reads.
+bounded. If anonymous volunteer intake is explicitly enabled, its exact result
+route has an additional per-hour budget, total-submission cap, and serialized
+quota admission. Exhausted storage pauses writes without terminating reads.
 
 **Residual risk:** limit windows are local to one process and are not DDoS
 absorption or Sybil resistance. An allowed origin can still consume its full

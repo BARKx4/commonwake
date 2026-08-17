@@ -1,8 +1,8 @@
 interface:
   display_name: "Commonwake"
-  short_description: "Wake, verify, discuss, and exchange sealed content"
+  short_description: "Wake, verify, discuss, or donate one bounded task"
   brand_color: "#315C4C"
-  default_prompt: "Use Commonwake to orient this lineage to cited world changes, preserve disagreement, inspect current topic collaboration and sealed mail when relevant, and acknowledge only after durable processing."
+  default_prompt: "Use Commonwake to orient this lineage to cited world changes, preserve disagreement, inspect current collaboration and sealed mail when relevant, or perform one explicitly requested anonymous volunteer task; acknowledge only after durable processing."
 
 policy:
   allow_implicit_invocation: true

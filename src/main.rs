@@ -22,7 +22,8 @@ use commonwake::{
     edge::{
         DEFAULT_PUBLIC_MAX_CONCURRENCY, DEFAULT_PUBLIC_MAX_FEDERATION_CONCURRENCY,
         DEFAULT_PUBLIC_MAX_ORIGIN_EVENTS, DEFAULT_PUBLIC_MAX_ORIGINS,
-        DEFAULT_PUBLIC_MAX_STORAGE_BYTES, DEFAULT_PUBLIC_REQUESTS_PER_SECOND,
+        DEFAULT_PUBLIC_MAX_STORAGE_BYTES, DEFAULT_PUBLIC_MAX_VOLUNTEER_SUBMISSIONS,
+        DEFAULT_PUBLIC_REQUESTS_PER_SECOND, DEFAULT_PUBLIC_VOLUNTEER_WRITES_PER_HOUR,
         DEFAULT_PUBLIC_WRITES_PER_MINUTE,
     },
     model::{ContributionKind, MemoryProvenance, Scope},
@@ -258,6 +259,25 @@ struct ServiceArgs {
         env = "COMMONWAKE_PUBLIC_MAX_ORIGIN_EVENTS"
     )]
     public_max_origin_events: i64,
+    /// Admit bounded anonymous probationary work results through the public edge.
+    #[arg(
+        long,
+        default_value_t = false,
+        env = "COMMONWAKE_PUBLIC_VOLUNTEER_INTAKE"
+    )]
+    public_volunteer_intake: bool,
+    #[arg(
+        long,
+        default_value_t = DEFAULT_PUBLIC_VOLUNTEER_WRITES_PER_HOUR,
+        env = "COMMONWAKE_PUBLIC_VOLUNTEER_WRITES_PER_HOUR"
+    )]
+    public_volunteer_writes_per_hour: u32,
+    #[arg(
+        long,
+        default_value_t = DEFAULT_PUBLIC_MAX_VOLUNTEER_SUBMISSIONS,
+        env = "COMMONWAKE_PUBLIC_MAX_VOLUNTEER_SUBMISSIONS"
+    )]
+    public_max_volunteer_submissions: u64,
 }
 
 #[derive(Args)]
@@ -910,6 +930,9 @@ async fn run_service_with_public_tls(
         max_storage_bytes: args.public_max_storage_bytes,
         max_origins: args.public_max_origins,
         max_origin_events: args.public_max_origin_events,
+        volunteer_intake_enabled: args.public_volunteer_intake,
+        volunteer_writes_per_hour: args.public_volunteer_writes_per_hour,
+        max_volunteer_submissions: args.public_max_volunteer_submissions,
     };
     let public_app = public_router(node.clone(), public_config)?;
     let local_app = router(node.clone());
@@ -972,6 +995,7 @@ async fn run_service_with_public_tls(
         acme_production = args.acme_production,
         allowed_publishers = args.public_allowed_publishers.len(),
         bearer_writes,
+        volunteer_intake = args.public_volunteer_intake,
         "Commonwake local administration and bounded public HTTPS edge listening"
     );
     tokio::try_join!(

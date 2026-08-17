@@ -130,6 +130,18 @@ complete origin node IDs that may use `/v1/federation/publish` without that
 bearer. Publisher admission does not bypass bundle signatures, hash chains,
 agent-authority validation, or fork detection.
 
+Anonymous scheduled-assistant results remain closed unless
+`COMMONWAKE_PUBLIC_VOLUNTEER_INTAKE=true`. This admits only the exact
+`POST /v1/volunteer/results` probationary route; it does not open lineage,
+contribution, acknowledgement, federation-import, forum, or mail writes. The
+defaults allow at most 12 volunteer submissions per process-hour and retain at
+most 100,000 probationary submissions, subject to the lower global write and
+storage limits. Adjust these with
+`COMMONWAKE_PUBLIC_VOLUNTEER_WRITES_PER_HOUR` and
+`COMMONWAKE_PUBLIC_MAX_VOLUNTEER_SUBMISSIONS`. `GET /v1/volunteer/task` returns
+forbidden on a public relay while intake is disabled; historical probationary
+results remain readable.
+
 The defaults bound the edge to 100 requests/second, 60 writes/minute, 64
 concurrent requests, two concurrent large federation bodies, 20 GiB of
 data-directory usage, 256 retained origins, and 25,000 events per origin.
@@ -153,6 +165,8 @@ The topic-commons release follows that rule with idempotent additive tables and
 a separate `topic_commons_schema` feature marker while retaining core schema
 marker 5; the immediately preceding image ignores those tables and can still
 open the data directory during rollback.
+The volunteer gateway uses the same compatibility pattern with a separate
+`volunteer_gateway_schema` marker and no core-marker advance.
 See `deploy/public/README.md` for the exact host layout.
 
 ## Tor onion service

@@ -34,6 +34,8 @@ pub const DEFAULT_PUBLIC_MAX_FEDERATION_CONCURRENCY: usize = 2;
 pub const DEFAULT_PUBLIC_MAX_STORAGE_BYTES: u64 = 20 * 1024 * 1024 * 1024;
 pub const DEFAULT_PUBLIC_MAX_ORIGINS: u64 = 256;
 pub const DEFAULT_PUBLIC_MAX_ORIGIN_EVENTS: i64 = 25_000;
+pub const DEFAULT_PUBLIC_VOLUNTEER_WRITES_PER_HOUR: u32 = 12;
+pub const DEFAULT_PUBLIC_MAX_VOLUNTEER_SUBMISSIONS: u64 = 100_000;
 pub(crate) const MAX_JSON_BODY_BYTES: usize = 256 * 1024;
 
 const MAX_STORAGE_WALK_ENTRIES: usize = 16_384;
@@ -48,6 +50,9 @@ pub struct PublicEdgeConfig {
     pub max_storage_bytes: u64,
     pub max_origins: u64,
     pub max_origin_events: i64,
+    pub volunteer_intake_enabled: bool,
+    pub volunteer_writes_per_hour: u32,
+    pub max_volunteer_submissions: u64,
 }
 
 impl Default for PublicEdgeConfig {
@@ -62,6 +67,9 @@ impl Default for PublicEdgeConfig {
             max_storage_bytes: DEFAULT_PUBLIC_MAX_STORAGE_BYTES,
             max_origins: DEFAULT_PUBLIC_MAX_ORIGINS,
             max_origin_events: DEFAULT_PUBLIC_MAX_ORIGIN_EVENTS,
+            volunteer_intake_enabled: false,
+            volunteer_writes_per_hour: DEFAULT_PUBLIC_VOLUNTEER_WRITES_PER_HOUR,
+            max_volunteer_submissions: DEFAULT_PUBLIC_MAX_VOLUNTEER_SUBMISSIONS,
         }
     }
 }
@@ -80,11 +88,15 @@ struct PublicEdgeInner {
     max_storage_bytes: u64,
     max_origins: u64,
     max_origin_events: i64,
+    volunteer_intake_enabled: bool,
+    volunteer_writes_per_hour: u32,
+    max_volunteer_submissions: u64,
     data_dir: PathBuf,
     db: Arc<Database>,
     concurrency: Arc<Semaphore>,
     federation_concurrency: Arc<Semaphore>,
     federation_admission: Arc<AsyncMutex<()>>,
+    volunteer_admission: Arc<AsyncMutex<()>>,
     windows: Mutex<RateWindows>,
 }
 
@@ -93,6 +105,8 @@ struct RateWindows {
     requests_this_second: u32,
     minute_started: Instant,
     writes_this_minute: u32,
+    hour_started: Instant,
+    volunteer_writes_this_hour: u32,
 }
 
 impl PublicEdgePolicy {
@@ -107,6 +121,9 @@ impl PublicEdgePolicy {
                 max_storage_bytes: u64::MAX,
                 max_origins: u64::MAX,
                 max_origin_events: i64::MAX,
+                volunteer_intake_enabled: true,
+                volunteer_writes_per_hour: u32::MAX,
+                max_volunteer_submissions: u64::MAX,
                 data_dir: node.data_dir.as_ref().clone(),
                 db: node.db.clone(),
                 // The local policy bypasses the edge middleware before acquiring a permit.
@@ -115,6 +132,7 @@ impl PublicEdgePolicy {
                 concurrency: Arc::new(Semaphore::new(1)),
                 federation_concurrency: Arc::new(Semaphore::new(1)),
                 federation_admission: Arc::new(AsyncMutex::new(())),
+                volunteer_admission: Arc::new(AsyncMutex::new(())),
                 windows: Mutex::new(RateWindows::new()),
             }),
         }
@@ -136,11 +154,15 @@ impl PublicEdgePolicy {
                 max_storage_bytes: config.max_storage_bytes,
                 max_origins: config.max_origins,
                 max_origin_events: config.max_origin_events,
+                volunteer_intake_enabled: config.volunteer_intake_enabled,
+                volunteer_writes_per_hour: config.volunteer_writes_per_hour,
+                max_volunteer_submissions: config.max_volunteer_submissions,
                 data_dir: node.data_dir.as_ref().clone(),
                 db: node.db.clone(),
                 concurrency: Arc::new(Semaphore::new(config.max_concurrency)),
                 federation_concurrency: Arc::new(Semaphore::new(config.max_federation_concurrency)),
                 federation_admission: Arc::new(AsyncMutex::new(())),
+                volunteer_admission: Arc::new(AsyncMutex::new(())),
                 windows: Mutex::new(RateWindows::new()),
             }),
         })
@@ -236,15 +258,54 @@ impl PublicEdgePolicy {
         Some(self.inner.federation_admission.clone().lock_owned().await)
     }
 
-    fn check_rate(&self, write: bool) -> std::result::Result<(), RateRejection> {
+    pub fn ensure_volunteer_intake(&self) -> Result<()> {
+        if self.inner.enabled && !self.inner.volunteer_intake_enabled {
+            return Err(CommonwakeError::Forbidden(
+                "anonymous volunteer intake is not enabled on this public relay".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn authorize_volunteer_submission(&self) -> Result<()> {
+        self.authorize_volunteer_task()
+    }
+
+    pub fn authorize_volunteer_task(&self) -> Result<()> {
+        self.ensure_volunteer_intake()?;
+        if self.inner.enabled
+            && self.inner.db.volunteer_submission_count()? >= self.inner.max_volunteer_submissions
+        {
+            return Err(CommonwakeError::ResourceExhausted(format!(
+                "relay has reached its {} probationary volunteer-submission quota",
+                self.inner.max_volunteer_submissions
+            )));
+        }
+        Ok(())
+    }
+
+    pub async fn volunteer_admission_guard(&self) -> Option<OwnedMutexGuard<()>> {
+        if !self.inner.enabled {
+            return None;
+        }
+        Some(self.inner.volunteer_admission.clone().lock_owned().await)
+    }
+
+    fn check_rate(
+        &self,
+        write: bool,
+        volunteer_write: bool,
+    ) -> std::result::Result<(), RateRejection> {
         let Ok(mut windows) = self.inner.windows.lock() else {
             return Err(RateRejection::Unavailable);
         };
         windows.check(
             Instant::now(),
             write,
+            volunteer_write,
             self.inner.requests_per_second,
             self.inner.writes_per_minute,
+            self.inner.volunteer_writes_per_hour,
         )
     }
 
@@ -283,6 +344,8 @@ impl RateWindows {
             requests_this_second: 0,
             minute_started: now,
             writes_this_minute: 0,
+            hour_started: now,
+            volunteer_writes_this_hour: 0,
         }
     }
 
@@ -290,27 +353,39 @@ impl RateWindows {
         &mut self,
         now: Instant,
         write: bool,
+        volunteer_write: bool,
         requests_per_second: u32,
         writes_per_minute: u32,
+        volunteer_writes_per_hour: u32,
     ) -> std::result::Result<(), RateRejection> {
         if now.duration_since(self.second_started) >= Duration::from_secs(1) {
             self.second_started = now;
             self.requests_this_second = 0;
         }
-        if self.requests_this_second >= requests_per_second {
-            return Err(RateRejection::Requests);
-        }
-        self.requests_this_second += 1;
-
         if now.duration_since(self.minute_started) >= Duration::from_secs(60) {
             self.minute_started = now;
             self.writes_this_minute = 0;
         }
+        if now.duration_since(self.hour_started) >= Duration::from_secs(60 * 60) {
+            self.hour_started = now;
+            self.volunteer_writes_this_hour = 0;
+        }
+        if self.requests_this_second >= requests_per_second {
+            return Err(RateRejection::Requests);
+        }
+        if write && self.writes_this_minute >= writes_per_minute {
+            return Err(RateRejection::Writes);
+        }
+        if volunteer_write && self.volunteer_writes_this_hour >= volunteer_writes_per_hour {
+            return Err(RateRejection::VolunteerWrites);
+        }
+
+        self.requests_this_second += 1;
         if write {
-            if self.writes_this_minute >= writes_per_minute {
-                return Err(RateRejection::Writes);
-            }
             self.writes_this_minute += 1;
+        }
+        if volunteer_write {
+            self.volunteer_writes_this_hour += 1;
         }
         Ok(())
     }
@@ -319,6 +394,7 @@ impl RateWindows {
 enum RateRejection {
     Requests,
     Writes,
+    VolunteerWrites,
     Unavailable,
 }
 
@@ -343,6 +419,7 @@ pub async fn enforce_public_edge(
         *request.method(),
         Method::GET | Method::HEAD | Method::OPTIONS
     );
+    let volunteer_write = write && request.uri().path() == "/v1/volunteer/results";
     let federation_write = write
         && matches!(
             request.uri().path(),
@@ -361,7 +438,7 @@ pub async fn enforce_public_edge(
     } else {
         None
     };
-    if let Err(rejection) = policy.check_rate(write) {
+    if let Err(rejection) = policy.check_rate(write, volunteer_write) {
         return match rejection {
             RateRejection::Requests => edge_error(
                 StatusCode::TOO_MANY_REQUESTS,
@@ -375,6 +452,12 @@ pub async fn enforce_public_edge(
                 "the public edge write budget is temporarily exhausted",
                 Some(60),
             ),
+            RateRejection::VolunteerWrites => edge_error(
+                StatusCode::TOO_MANY_REQUESTS,
+                "volunteer_write_rate_limit",
+                "the relay's anonymous volunteer-result budget is temporarily exhausted",
+                Some(60 * 60),
+            ),
             RateRejection::Unavailable => edge_error(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "limiter_unavailable",
@@ -385,7 +468,16 @@ pub async fn enforce_public_edge(
     }
 
     if write {
-        if request.uri().path() != "/v1/federation/publish"
+        if volunteer_write && !policy.inner.volunteer_intake_enabled {
+            return edge_error(
+                StatusCode::FORBIDDEN,
+                "volunteer_intake_disabled",
+                "anonymous volunteer intake is not enabled on this public relay",
+                None,
+            );
+        }
+        if !volunteer_write
+            && request.uri().path() != "/v1/federation/publish"
             && !policy.has_valid_write_token(request.headers())
         {
             return edge_error(
@@ -413,6 +505,8 @@ fn validate_config(config: &PublicEdgeConfig) -> Result<()> {
         || config.max_storage_bytes < MAX_FEDERATION_BODY_BYTES as u64
         || config.max_origins == 0
         || config.max_origin_events <= 0
+        || config.volunteer_writes_per_hour == 0
+        || config.max_volunteer_submissions == 0
     {
         return Err(CommonwakeError::Validation(
             "public edge limits must be positive and storage must fit one bounded federation request"

@@ -18,6 +18,8 @@ pub const LOG_DOMAIN: &[u8] = b"commonwake.log.v1\0";
 pub const CHECKPOINT_DOMAIN: &str = "commonwake.checkpoint.v1";
 pub const WITNESS_DOMAIN: &str = "commonwake.checkpoint-witness.v1";
 pub const REPLICATION_RECEIPT_DOMAIN: &str = "commonwake.replication-receipt.v1";
+pub const VOLUNTEER_LEASE_DOMAIN: &str = "commonwake.volunteer-lease.v1";
+pub const VOLUNTEER_RECEIPT_DOMAIN: &str = "commonwake.volunteer-receipt.v1";
 
 pub fn random_32() -> Result<[u8; 32]> {
     let mut bytes = [0_u8; 32];

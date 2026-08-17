@@ -15,7 +15,7 @@ use crate::{
     crypto::{
         ACK_DOMAIN, CONTRIBUTION_DOMAIN, DELEGATION_DOMAIN, KEY_ROTATION_DOMAIN, LINEAGE_DOMAIN,
         REVOCATION_DOMAIN, WITNESS_DOMAIN, canonical_without_signature, event_hash, lineage_id,
-        prefixed_id, signature_from_b64, verify_object, verifying_key_from_b64,
+        prefixed_id, sha256_hex, signature_from_b64, verify_object, verifying_key_from_b64,
     },
     error::{CommonwakeError, Result},
     federation::{MAX_CANONICAL_OBJECT_BYTES, verify_replication_receipt},
@@ -40,6 +40,10 @@ use crate::{
         validate_authority_change_at, validate_delegation_at, validate_display_name,
         validate_lists, validate_memory_provenance,
     },
+    volunteer::{
+        VolunteerReceipt, VolunteerSubmission, VolunteerSubmissionPage, VolunteerSubmissionView,
+        task_digest, verify_volunteer_lease, verify_volunteer_receipt, volunteer_safe_work_kind,
+    },
 };
 
 const MIGRATION_0001: &str = include_str!("../migrations/0001_init.sql");
@@ -48,6 +52,7 @@ const MIGRATION_0003: &str = include_str!("../migrations/0003_federation.sql");
 const MIGRATION_0004: &str = include_str!("../migrations/0004_federated_orientation.sql");
 const MIGRATION_0005: &str = include_str!("../migrations/0005_outbound_publication.sql");
 const TOPIC_COMMONS_EXTENSION: &str = include_str!("../migrations/0006_topic_commons.sql");
+const VOLUNTEER_GATEWAY_EXTENSION: &str = include_str!("../migrations/0007_volunteer_gateway.sql");
 const SCHEMA_VERSION: i64 = 5;
 const ZERO_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 const BOOTSTRAP_SOURCE_COVERAGE: &[(&str, &str)] = &[
@@ -258,6 +263,7 @@ impl Database {
         // immediately preceding unattended image open the database during a health-check rollback;
         // that image safely ignores these independent tables and feature marker.
         connection.execute_batch(TOPIC_COMMONS_EXTENSION)?;
+        connection.execute_batch(VOLUNTEER_GATEWAY_EXTENSION)?;
         seed_bootstrap_work(&connection)?;
         Ok(Self {
             connection: Mutex::new(connection),
@@ -1686,6 +1692,206 @@ impl Database {
             next_cursor,
             has_more,
             kind: kind.map(str::to_owned),
+        })
+    }
+
+    pub fn volunteer_task_candidate(&self) -> Result<Option<WorkItemView>> {
+        let connection = self.lock()?;
+        let row = connection
+            .query_row(
+                "SELECT w.work_id, w.kind, w.subject_type, w.subject_id, w.instructions,
+                        w.required_results, w.created_sequence
+                 FROM work_items w
+                 LEFT JOIN (
+                    SELECT work_id, COUNT(*) AS submission_count
+                    FROM volunteer_submissions GROUP BY work_id
+                 ) v ON v.work_id = w.work_id
+                 WHERE w.status = 'open'
+                   AND w.kind IN (
+                       'discover_sources', 'review_source', 'verify_observation',
+                       'cluster_stories', 'assess_story'
+                   )
+                 ORDER BY COALESCE(v.submission_count, 0) ASC,
+                          w.created_sequence ASC, w.work_id ASC
+                 LIMIT 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, i64>(6)?,
+                    ))
+                },
+            )
+            .optional()?;
+        row.map(|row| work_item_view(&connection, row)).transpose()
+    }
+
+    pub fn volunteer_work_item(&self, work_id: &str) -> Result<WorkItemView> {
+        let connection = self.lock()?;
+        let row = connection
+            .query_row(
+                "SELECT work_id, kind, subject_type, subject_id, instructions,
+                        required_results, created_sequence
+                 FROM work_items WHERE work_id = ?1 AND status = 'open'",
+                [work_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, i64>(6)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or_else(|| CommonwakeError::NotFound(format!("open work item {work_id}")))?;
+        work_item_view(&connection, row)
+    }
+
+    pub fn store_volunteer_submission(
+        &self,
+        submission: &VolunteerSubmission,
+        receipt: &VolunteerReceipt,
+        canonical_submission: &str,
+    ) -> Result<()> {
+        let canonical_receipt = serde_jcs::to_string(receipt).map_err(|error| {
+            CommonwakeError::Internal(format!("canonical volunteer receipt JSON failed: {error}"))
+        })?;
+        let connection = self.lock()?;
+        let inserted = connection.execute(
+            "INSERT OR IGNORE INTO volunteer_submissions(
+                submission_id, work_id, lease_nonce, task_digest, submission_digest,
+                submission_json, receipt_json, status, received_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'probationary', ?8)",
+            params![
+                receipt.submission_id,
+                receipt.work_id,
+                submission.lease.nonce,
+                submission.lease.task_digest,
+                receipt.submission_digest,
+                canonical_submission,
+                canonical_receipt,
+                timestamp(receipt.received_at),
+            ],
+        )?;
+        if inserted == 0 {
+            return Err(CommonwakeError::Conflict(
+                "this volunteer lease or exact submission has already been used".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn volunteer_submission_count(&self) -> Result<u64> {
+        let connection = self.lock()?;
+        let count: i64 =
+            connection.query_row("SELECT COUNT(*) FROM volunteer_submissions", [], |row| {
+                row.get(0)
+            })?;
+        u64::try_from(count)
+            .map_err(|_| CommonwakeError::Internal("volunteer submission count is negative".into()))
+    }
+
+    pub fn volunteer_submission_page(
+        &self,
+        after: i64,
+        limit: usize,
+    ) -> Result<VolunteerSubmissionPage> {
+        if after < 0 {
+            return Err(CommonwakeError::Validation(
+                "volunteer submission cursor cannot be negative".into(),
+            ));
+        }
+        let connection = self.lock()?;
+        let mut statement = connection.prepare(
+            "SELECT projection_sequence, submission_id, work_id, submission_digest,
+                    submission_json, receipt_json, status, received_at
+             FROM volunteer_submissions
+             WHERE projection_sequence > ?1
+             ORDER BY projection_sequence ASC LIMIT ?2",
+        )?;
+        let rows = statement.query_map(params![after, (limit + 1) as i64], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, String>(7)?,
+            ))
+        })?;
+        let mut submissions = Vec::new();
+        for row in rows {
+            let row = row?;
+            let submission: VolunteerSubmission = serde_json::from_str(&row.4)?;
+            let receipt: VolunteerReceipt = serde_json::from_str(&row.5)?;
+            verify_volunteer_lease(&submission.lease)?;
+            verify_volunteer_receipt(&receipt)?;
+            if submission.task.work_id != submission.lease.work_id
+                || task_digest(&submission.task)? != submission.lease.task_digest
+                || !volunteer_safe_work_kind(&submission.task.kind)
+            {
+                return Err(CommonwakeError::Internal(format!(
+                    "stored volunteer submission {} has a task outside its signed lease",
+                    row.1
+                )));
+            }
+            let canonical = serde_jcs::to_vec(&submission).map_err(|error| {
+                CommonwakeError::Internal(format!(
+                    "canonical stored volunteer submission failed: {error}"
+                ))
+            })?;
+            let digest = sha256_hex(&canonical);
+            let submission_id = prefixed_id("cwvol_", &canonical);
+            let stored_received_at = parse_timestamp(&row.7)?;
+            if row.1 != submission_id
+                || row.2 != submission.lease.work_id
+                || row.3 != digest
+                || receipt.submission_id != row.1
+                || receipt.work_id != row.2
+                || receipt.submission_digest != row.3
+                || receipt.status != row.6
+                || receipt.node_id != submission.lease.node_id
+                || receipt.node_public_key != submission.lease.node_public_key
+                || row.7 != timestamp(receipt.received_at)
+            {
+                return Err(CommonwakeError::Internal(format!(
+                    "stored volunteer submission {} does not match its receipt or index",
+                    row.1
+                )));
+            }
+            submissions.push(VolunteerSubmissionView {
+                projection_sequence: row.0,
+                submission_id: row.1,
+                work_id: row.2,
+                received_at: stored_received_at,
+                status: row.6,
+                submission,
+                receipt,
+            });
+        }
+        let has_more = submissions.len() > limit;
+        submissions.truncate(limit);
+        let next_cursor = submissions
+            .last()
+            .map_or(after, |submission| submission.projection_sequence);
+        Ok(VolunteerSubmissionPage {
+            submissions,
+            after,
+            next_cursor,
+            has_more,
+            provenance_notice: "These are anonymous probationary submissions. Node receipts prove exact receipt, not worker identity, independence, truth, endorsement, or canonical acceptance."
+                .into(),
         })
     }
 
@@ -5507,6 +5713,29 @@ fn parse_work_cursor(cursor: &str) -> Result<(i64, String)> {
         ));
     }
     Ok((sequence, work_id.to_owned()))
+}
+
+fn work_item_view(
+    connection: &Connection,
+    row: (String, String, String, String, String, i64, i64),
+) -> Result<WorkItemView> {
+    let received_results = work_result_count(connection, &row.1, &row.3)?;
+    let active_claims: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM work_claims WHERE work_id = ?1 AND expires_at > ?2",
+        params![&row.0, timestamp(Utc::now())],
+        |claim_row| claim_row.get(0),
+    )?;
+    Ok(WorkItemView {
+        work_id: row.0,
+        kind: row.1,
+        subject_type: row.2,
+        subject_id: row.3,
+        instructions: row.4,
+        required_results: row.5,
+        received_results,
+        active_claims,
+        created_sequence: row.6,
+    })
 }
 
 fn format_topic_cursor(created_at: DateTime<Utc>, topic_id: &str) -> String {

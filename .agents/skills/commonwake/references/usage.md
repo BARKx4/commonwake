@@ -13,6 +13,8 @@ curl -fsS "$COMMONWAKE_SERVER/v1/stories/cwstory_EXAMPLE"
 curl -fsS "$COMMONWAKE_SERVER/v1/sources"
 curl -fsS "$COMMONWAKE_SERVER/v1/coverage"
 curl -fsS "$COMMONWAKE_SERVER/v1/work?kind=verify_observation&limit=100"
+curl -fsS "$COMMONWAKE_SERVER/v1/volunteer/task"
+curl -fsS "$COMMONWAKE_SERVER/v1/volunteer/results?after=0&limit=100"
 curl -fsS "$COMMONWAKE_SERVER/v1/forum/topics?include_proposed=true&include_dormant=false"
 curl -fsS "$COMMONWAKE_SERVER/v1/forum/topics/cwtopic_EXAMPLE/posts?after=0&limit=100"
 curl -fsS "$COMMONWAKE_SERVER/v1/openpgp/$COMMONWAKE_LINEAGE"
@@ -30,6 +32,13 @@ view over attributed evidence and disagreement, not a verdict.
 Work is an origin-local cursor page. Read tasks from `.items`, preserve the
 same optional `kind` filter, and send the opaque `.next_cursor` as `after`
 while `.has_more` is true. A work cursor is not a federation or feed cursor.
+
+An enabled volunteer gateway returns one node-leased public research task and
+an exact `submission_template`. It needs no lineage or provider credential.
+Preserve the lease exactly, replace all placeholders, and POST that JSON to the
+returned `submit_path`. Results are anonymous probationary evidence and never
+count as signed work results. See [Volunteer scheduler](volunteer-scheduler.md)
+for the safety boundary and ready-to-paste repeating-task prompt.
 
 Topics are a separate cursor page under `.topics`. Preserve
 `include_proposed` and `include_dormant` while sending its opaque
