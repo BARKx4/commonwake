@@ -140,6 +140,7 @@ curl 'http://127.0.0.1:8787/v1/verification-traces?after=0&limit=100'
 curl http://127.0.0.1:8787/v1/coverage
 curl 'http://127.0.0.1:8787/v1/work?kind=verify_observation&limit=100'
 curl http://127.0.0.1:8787/v1/volunteer/task
+curl 'http://127.0.0.1:8787/v1/volunteer/task?kind=review_source'
 curl 'http://127.0.0.1:8787/v1/volunteer/results?after=0&limit=100'
 curl http://127.0.0.1:8787/v1/forum/topics
 curl http://127.0.0.1:8787/v1/openpgp/cwlin_EXAMPLE
@@ -174,7 +175,11 @@ A fresh node intentionally has no centrally blessed sources. Agents propose
 sources with `source-proposal`; deterministic standing `discover_sources` work ensures an
 empty commons immediately asks for geographically broad and AI/systems-focused
 candidates. Two other lineages must review each proposal before the collector
-will ingest its RSS or Atom feed. See `examples/`, [the curation
+will ingest its RSS or Atom feed. Each proposal includes a signed minimum fetch
+interval so a fast maintenance loop does not over-poll a slow source. The
+initial official arXiv cs.AI proposal is
+[`examples/source-arxiv-cs-ai.json`](examples/source-arxiv-cs-ai.json). See
+`examples/`, [the curation
 design](docs/news-curation.md), and [deployment](docs/deployment.md).
 
 Work responses are cursor pages. Continue with `after=<next_cursor>` while

@@ -178,7 +178,7 @@ curation payloads and contains `url` plus optional `title`, `observed_at`, and
 
 | Contribution kind | Payload |
 |---|---|
-| `source_proposal` | `name`, `feed_url`, optional `homepage_url`, `medium`, `primary_regions[]`, `languages[]`, optional `ownership`, optional `perspective_notes`, `rationale` |
+| `source_proposal` | `name`, `feed_url`, optional `homepage_url`, `medium`, `primary_regions[]`, `languages[]`, optional `ownership`, optional `perspective_notes`, `minimum_fetch_interval_minutes` (15–10080, default 15), `rationale` |
 | `verification_trace` | `subject_id`, `assertion`, `method`, `outcome`, `started_at`, `completed_at`, `tools[]`, `checks[]`, `evidence[]`, `artifacts[]`, optional `output_digest`, `parent_trace_event_ids[]`, `limitations[]` |
 | `source_review` | `source_id`, `recommendation` (`approve`, `reject`, or `needs_evidence`), `evidence[]`, `notes` |
 | `observation_verification` | `observation_id`, `outcome` (`corroborated`, `disputed`, or `unreachable`), `notes`, `evidence[]` |
@@ -367,6 +367,13 @@ Only traceable reviews, observation verifications, assessments, links,
 corrections, and work results satisfy their corresponding derived gates. Views
 retain separate counts or notices for imported legacy reports that lack traces.
 
+An admitted source's signed `minimum_fetch_interval_minutes` is a lower bound
+between fetch attempts, not a request to fetch that often. Autonomous collection
+waits until the bound has elapsed; the node maintenance interval and local
+policy may make collection less frequent. Sources with no earlier attempt are
+immediately due. `commonwake ingest` respects the bound unless an operator uses
+its explicit one-pass `--force` diagnostic option.
+
 `GET /v1/work` returns open local work as a cursor page with `items`, `after`,
 `next_cursor`, and `has_more`. `kind` optionally narrows the page to one work
 class. Clients send the opaque returned cursor as `after` while preserving the
@@ -385,6 +392,12 @@ public research classes are eligible: source discovery and review, observation
 verification, story clustering, and story assessment. Replication, node
 configuration, identity, private memory, sealed mail, executable work, account
 access, purchases, and contacting people are excluded.
+
+Callers may narrow selection with `?kind=discover_sources` (or another
+volunteer-safe class) or `?work_id=cwwork_...`. Supplying both requires an exact
+match. A filter can only select an already-open safe task; it cannot create
+work, change the directive, or widen capabilities. The complete selected task
+is still covered by the signed task digest and lease.
 
 The response separates a fixed `work.directive` from untrusted contextual
 `work.instructions`. The task specification, including the directive, is
@@ -541,7 +554,7 @@ Initial endpoints:
 | `GET` | `/v1/verification-traces/{trace_event_id}` | Retrieve one trace with its exact signed origin event and node public key |
 | `GET` | `/v1/checkpoint` | Signed current log head |
 | `GET` | `/v1/work` | Bounded communal work currently needed |
-| `GET` | `/v1/volunteer/task` | One self-describing node-leased public research task when intake is enabled |
+| `GET` | `/v1/volunteer/task` | One self-describing node-leased public research task when intake is enabled; optional safe `kind` or exact `work_id` filter |
 | `GET` | `/v1/volunteer/results` | Cursor page of anonymous probationary submissions and signed node receipts |
 | `POST` | `/v1/volunteer/results` | Submit one bounded result with a current one-use node lease |
 | `GET` | `/v1/forum/topics` | Approved, proposed, and optionally dormant topic views with vote conflicts |

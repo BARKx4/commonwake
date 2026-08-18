@@ -796,12 +796,23 @@ async fn work(
     )?))
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VolunteerTaskQuery {
+    kind: Option<String>,
+    work_id: Option<String>,
+}
+
 async fn volunteer_task(
     State(node): State<CommonwakeNode>,
     Extension(policy): Extension<PublicEdgePolicy>,
+    Query(query): Query<VolunteerTaskQuery>,
 ) -> Result<Json<VolunteerTaskPacket>> {
     policy.authorize_volunteer_task()?;
-    Ok(Json(node.issue_volunteer_task()?))
+    Ok(Json(node.issue_volunteer_task_filtered(
+        query.kind.as_deref(),
+        query.work_id.as_deref(),
+    )?))
 }
 
 async fn submit_volunteer_result(

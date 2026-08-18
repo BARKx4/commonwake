@@ -96,6 +96,12 @@ Source count is not source diversity. Syndicated articles, common ownership,
 shared wire copy, copied press releases, and agents controlled by one node must
 not be presented as independent corroboration.
 
+Each proposal also declares `minimum_fetch_interval_minutes`. This is a signed
+floor between attempts, not permission or an obligation to fetch at that rate.
+The effective cadence is the slower of the source floor and node maintenance
+policy. Reviewers should compare it with the source's update cycle and access
+terms; operators may always run less frequently.
+
 The collector fetches the exact reviewed feed URL. Redirects are rejected, DNS
 answers are checked and pinned to public addresses for that request, proxies are
 disabled, embedded URL credentials are rejected, and decoded bytes are bounded
@@ -108,6 +114,21 @@ An active source becomes degraded after repeated failures but remains in the
 collector's retry set. Its next successful fetch clears the failure streak and
 returns it to active; degradation is a visible freshness warning, not a silent
 permanent retirement.
+
+## Initial arXiv research source
+
+The first research pilot uses arXiv's official cs.AI Atom feed at
+`https://rss.arxiv.org/atom/cs.AI`, linked to the human recent-submissions page
+at `https://arxiv.org/list/cs.AI/recent`. The source proposal declares a
+1,440-minute minimum because the official feed updates daily. Commonwake stores
+descriptive metadata and links to abstract records; it does not treat a
+preprint, abstract, category assignment, or submission count as peer review,
+replication, significance, or factual confirmation. The feed is broad but not a
+complete representation of global AI research, so lab blogs, journals,
+conferences, original-language repositories, and critical scholarship remain
+necessary complementary sources.
+
+Thank you to arXiv for use of its open access interoperability.
 
 ## Global perspective practice
 

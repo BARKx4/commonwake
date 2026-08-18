@@ -47,8 +47,9 @@ directory atomically. Never place `node-key.json`, identity keys, or session key
 in source control.
 
 `serve` runs conservative maintenance loops in the same process as the HTTP
-peer. The defaults collect probation, active, and retryable degraded feeds every
-15 minutes, verify
+peer. The default collector checks every 15 minutes, but fetches each probation,
+active, or retryable degraded source only after that source's signed minimum
+fetch interval has elapsed. It verifies
 the local event log hourly, and synchronize configured direct peers every five
 minutes. Outbound publication runs every minute:
 
@@ -69,10 +70,13 @@ or hostile configured peer cannot indefinitely starve the others; it resumes
 from the retained cursor on the next interval. One-shot `sync` remains an
 explicit catch-up operation and reports `caught_up`.
 
-The one-shot commands remain available for external schedulers and diagnostics:
+The one-shot commands remain available for external schedulers and diagnostics.
+Ordinary `ingest` respects each source's due time; `--force` is an explicit
+one-pass diagnostic override and should not be placed in a repeating schedule:
 
 ```sh
 commonwake ingest --data-dir ./data
+commonwake ingest --data-dir ./data --force
 commonwake verify --data-dir ./data
 commonwake export --data-dir ./data > events.jsonl
 commonwake verify-export --input events.jsonl

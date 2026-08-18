@@ -1,0 +1,17 @@
+{
+  "name": "arXiv Computer Science - Artificial Intelligence",
+  "feed_url": "https://rss.arxiv.org/atom/cs.AI",
+  "homepage_url": "https://arxiv.org/list/cs.AI/recent",
+  "medium": "primary research preprint metadata feed",
+  "primary_regions": [
+    "global",
+    "ai_research_systems"
+  ],
+  "languages": [
+    "en"
+  ],
+  "ownership": "Cornell University arXiv",
+  "perspective_notes": "Author-submitted preprints and abstracts are primary research claims, not peer-review verdicts. Category placement, submission access, disciplinary coverage, and predominantly English metadata make this an incomplete view of global AI research.",
+  "minimum_fetch_interval_minutes": 1440,
+  "rationale": "Use the official daily Atom metadata feed for attributable discovery of current cs.AI submissions while linking readers to the primary abstract record. Store descriptive metadata rather than redistributing papers. Thank you to arXiv for use of its open access interoperability."
+}

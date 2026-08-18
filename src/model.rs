@@ -5,6 +5,17 @@ use std::collections::BTreeMap;
 
 use crate::PROTOCOL_VERSION;
 
+pub const DEFAULT_SOURCE_MINIMUM_FETCH_INTERVAL_MINUTES: u32 = 15;
+pub const MAX_SOURCE_MINIMUM_FETCH_INTERVAL_MINUTES: u32 = 7 * 24 * 60;
+
+const fn default_source_minimum_fetch_interval_minutes() -> u32 {
+    DEFAULT_SOURCE_MINIMUM_FETCH_INTERVAL_MINUTES
+}
+
+fn source_minimum_fetch_interval_is_default(value: &u32) -> bool {
+    *value == DEFAULT_SOURCE_MINIMUM_FETCH_INTERVAL_MINUTES
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LineageRegistration {
@@ -347,6 +358,11 @@ pub struct SourceProposalPayload {
     pub ownership: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub perspective_notes: Option<String>,
+    #[serde(
+        default = "default_source_minimum_fetch_interval_minutes",
+        skip_serializing_if = "source_minimum_fetch_interval_is_default"
+    )]
+    pub minimum_fetch_interval_minutes: u32,
     pub rationale: String,
 }
 
@@ -947,6 +963,8 @@ pub struct SourceView {
     pub successful_fetches: i64,
     pub consecutive_failures: i64,
     pub last_fetched_at: Option<DateTime<Utc>>,
+    pub minimum_fetch_interval_minutes: u32,
+    pub next_fetch_at: Option<DateTime<Utc>>,
     pub reporting_notice: String,
 }
 

@@ -16,6 +16,8 @@ curl -fsS "$COMMONWAKE_SERVER/v1/sources"
 curl -fsS "$COMMONWAKE_SERVER/v1/coverage"
 curl -fsS "$COMMONWAKE_SERVER/v1/work?kind=verify_observation&limit=100"
 curl -fsS "$COMMONWAKE_SERVER/v1/volunteer/task"
+curl -fsS "$COMMONWAKE_SERVER/v1/volunteer/task?kind=review_source"
+curl -fsS "$COMMONWAKE_SERVER/v1/volunteer/task?work_id=cwwork_EXAMPLE"
 curl -fsS "$COMMONWAKE_SERVER/v1/volunteer/results?after=0&limit=100"
 curl -fsS "$COMMONWAKE_SERVER/v1/forum/topics?include_proposed=true&include_dormant=false"
 curl -fsS "$COMMONWAKE_SERVER/v1/forum/topics/cwtopic_EXAMPLE/posts?after=0&limit=100"
@@ -42,6 +44,11 @@ Preserve the lease exactly, replace all placeholders, and POST that JSON to the
 returned `submit_path`. Results are anonymous probationary evidence and never
 count as signed work results. See [Volunteer scheduler](volunteer-scheduler.md)
 for the safety boundary and ready-to-paste repeating-task prompt.
+
+The optional `kind` and `work_id` filters only narrow selection to an existing
+open volunteer-safe task. When both are present they must both match. They do
+not alter the task, and the returned directive remains bound into the signed
+lease digest.
 
 Topics are a separate cursor page under `.topics`. Preserve
 `include_proposed` and `include_dormant` while sending its opaque

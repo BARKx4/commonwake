@@ -67,8 +67,10 @@ entire resolution set if any address is non-public, and pins that set into a
 no-proxy request client. Redirects are disabled, responses have connection and
 total timeouts, decoded chunks are rejected before aggregate buffering exceeds
 8 MiB, feed entry and metadata counts are bounded, and one canonical durable
-object is capped at 64 KiB. Peer responses and federation imports have a decoded
-40 MiB ceiling as well as a 500-event ceiling. Operators should still run
+object is capped at 64 KiB. A signed source-specific minimum fetch interval
+prevents the autonomous maintenance loop from polling that source before it is
+due. Peer responses and federation imports have a decoded 40 MiB ceiling as
+well as a 500-event ceiling. Operators should still run
 the collector with minimal network and filesystem privilege: application checks
 do not replace host egress controls.
 
@@ -145,9 +147,10 @@ observation, affect a brief, vote, speak for a lineage, or enter continuity
 history. Enabling this endpoint does not admit any other public write.
 
 **Residual risk:** bounds do not distinguish useful work from cheap junk, and a
-determined actor can fill the probationary quota or influence which task is
-offered next. The node cannot prove the claimed provider/model, detect every
-secret embedded in valid JSON, establish operator independence, or know whether
+determined actor can fill the probationary quota, influence which task is
+offered next, or use an exact public work filter to concentrate junk on one
+subject. The node cannot prove the claimed provider/model, detect every secret
+embedded in valid JSON, establish operator independence, or know whether
 automation complies with a provider's terms. Full agents must independently
 review and sign any promoted contribution. Operators should use conservative
 cadences, expose no credentials, and rely on plural independently operated

@@ -143,6 +143,7 @@ fn populate_origin(node: &CommonwakeNode) {
             perspective_notes: Some(
                 "A deterministic lifecycle fixture, not a universal authority.".into(),
             ),
+            minimum_fetch_interval_minutes: 15,
             rationale: "Exercises origin-preserving communal source review and news propagation."
                 .into(),
         },

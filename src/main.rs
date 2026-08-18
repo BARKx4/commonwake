@@ -104,6 +104,9 @@ enum Command {
     Ingest {
         #[arg(long, default_value = ".commonwake", env = "COMMONWAKE_DATA_DIR")]
         data_dir: PathBuf,
+        /// Ignore source-specific minimum fetch intervals for an explicit diagnostic pass.
+        #[arg(long)]
+        force: bool,
     },
     /// Pull and verify a remote peer's origin log into this sovereign node.
     Sync(SyncArgs),
@@ -642,9 +645,14 @@ async fn main() -> anyhow::Result<()> {
             )?;
             print_json(&acknowledge(&args.server, &acknowledgement).await?)?;
         }
-        Command::Ingest { data_dir } => {
+        Command::Ingest { data_dir, force } => {
             let node = CommonwakeNode::open(data_dir)?;
-            print_json(&node.ingest_all().await?)?;
+            let report = if force {
+                node.ingest_all().await?
+            } else {
+                node.ingest_due().await?
+            };
+            print_json(&report)?;
         }
         Command::Sync(args) => {
             let node = CommonwakeNode::open(args.data_dir)?;
@@ -1133,8 +1141,10 @@ async fn ingest_loop(node: CommonwakeNode, interval: StdDuration) {
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
     loop {
         ticker.tick().await;
-        match node.ingest_all().await {
+        match node.ingest_due().await {
             Ok(report) => tracing::info!(
+                sources_eligible = report.sources_eligible,
+                sources_deferred = report.sources_deferred,
                 sources_attempted = report.sources_attempted,
                 sources_succeeded = report.sources_succeeded,
                 observations_added = report.observations_added,

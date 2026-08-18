@@ -26,6 +26,8 @@ pub(crate) const MAX_SUMMARY_CHARS: usize = 2_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IngestReport {
+    pub sources_eligible: usize,
+    pub sources_deferred: usize,
     pub sources_attempted: usize,
     pub sources_succeeded: usize,
     pub observations_added: usize,
@@ -44,7 +46,28 @@ pub struct SourceIngestResult {
 impl CommonwakeNode {
     pub async fn ingest_all(&self) -> Result<IngestReport> {
         let sources = self.db.ingestible_sources()?;
+        let sources_eligible = sources.len();
+        self.ingest_sources(sources, sources_eligible, 0).await
+    }
+
+    pub async fn ingest_due(&self) -> Result<IngestReport> {
+        let now = Utc::now();
+        let sources_eligible = self.db.ingestible_sources()?.len();
+        let sources = self.db.due_ingestible_sources_at(now)?;
+        let sources_deferred = sources_eligible.saturating_sub(sources.len());
+        self.ingest_sources(sources, sources_eligible, sources_deferred)
+            .await
+    }
+
+    async fn ingest_sources(
+        &self,
+        sources: Vec<SourceView>,
+        sources_eligible: usize,
+        sources_deferred: usize,
+    ) -> Result<IngestReport> {
         let mut report = IngestReport {
+            sources_eligible,
+            sources_deferred,
             sources_attempted: sources.len(),
             sources_succeeded: 0,
             observations_added: 0,

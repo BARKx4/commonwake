@@ -22,19 +22,20 @@ use crate::{
     ingest::{MAX_SUMMARY_CHARS, MAX_TITLE_CHARS},
     model::{
         AcceptedObject, AssessmentPayload, AssessmentView, CheckpointWitness, Claim,
-        CorrectionPayload, CoverageGapView, CoverageReport, DelegationRevocation, DelegationView,
+        CorrectionPayload, CoverageGapView, CoverageReport,
+        DEFAULT_SOURCE_MINIMUM_FETCH_INTERVAL_MINUTES, DelegationRevocation, DelegationView,
         DirectMessagePage, DirectMessagePayload, DirectMessageView, EquivocationEvidenceView,
         EventView, EvidenceRef, FederatedFeedPage, FederatedStoryView, FederationBundle,
         FederationImportReport, FederationPeerView, FeedPage, ForumPostPage, ForumPostPayload,
-        ForumPostView, LineageRegistration, LineageView, ObservationVerificationPayload,
-        ObservationView, OpenPgpKeyAction, OpenPgpKeyPayload, OpenPgpKeyView, OriginEvent,
-        OwnershipConcentrationView, PublicationTargetView, ReplicationHealth, ReplicationReceipt,
-        ReportingDeclaration, ReportingMode, Scope, SessionDelegation, SignedAcknowledgement,
-        SignedContribution, SignedKeyRotation, SourceProposalPayload, SourceReviewPayload,
-        SourceView, StoryLinkPayload, StoryView, TopicPage, TopicProposalPayload, TopicView,
-        TopicVotePayload, TopicVoteTally, TopicVoteView, TraceOutcome, VerificationTracePage,
-        VerificationTracePayload, VerificationTraceView, WorkClaimPayload, WorkItemView, WorkPage,
-        WorkResultPayload,
+        ForumPostView, LineageRegistration, LineageView, MAX_SOURCE_MINIMUM_FETCH_INTERVAL_MINUTES,
+        ObservationVerificationPayload, ObservationView, OpenPgpKeyAction, OpenPgpKeyPayload,
+        OpenPgpKeyView, OriginEvent, OwnershipConcentrationView, PublicationTargetView,
+        ReplicationHealth, ReplicationReceipt, ReportingDeclaration, ReportingMode, Scope,
+        SessionDelegation, SignedAcknowledgement, SignedContribution, SignedKeyRotation,
+        SourceProposalPayload, SourceReviewPayload, SourceView, StoryLinkPayload, StoryView,
+        TopicPage, TopicProposalPayload, TopicView, TopicVotePayload, TopicVoteTally,
+        TopicVoteView, TraceOutcome, VerificationTracePage, VerificationTracePayload,
+        VerificationTraceView, WorkClaimPayload, WorkItemView, WorkPage, WorkResultPayload,
     },
     node::NodeIdentity,
     service::{
@@ -55,6 +56,8 @@ const MIGRATION_0004: &str = include_str!("../migrations/0004_federated_orientat
 const MIGRATION_0005: &str = include_str!("../migrations/0005_outbound_publication.sql");
 const TOPIC_COMMONS_EXTENSION: &str = include_str!("../migrations/0006_topic_commons.sql");
 const VOLUNTEER_GATEWAY_EXTENSION: &str = include_str!("../migrations/0007_volunteer_gateway.sql");
+const SOURCE_FETCH_POLICY_EXTENSION: &str =
+    include_str!("../migrations/0008_source_fetch_policy.sql");
 const SCHEMA_VERSION: i64 = 5;
 const ZERO_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 const BOOTSTRAP_SOURCE_COVERAGE: &[(&str, &str)] = &[
@@ -266,6 +269,16 @@ impl Database {
         // that image safely ignores these independent tables and feature marker.
         connection.execute_batch(TOPIC_COMMONS_EXTENSION)?;
         connection.execute_batch(VOLUNTEER_GATEWAY_EXTENSION)?;
+        let source_fetch_policy_schema: Option<String> = connection
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'source_fetch_policy_schema'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if source_fetch_policy_schema.as_deref() != Some("1") {
+            connection.execute_batch(SOURCE_FETCH_POLICY_EXTENSION)?;
+        }
         seed_bootstrap_work(&connection)?;
         Ok(Self {
             connection: Mutex::new(connection),
@@ -1335,6 +1348,19 @@ impl Database {
             .collect())
     }
 
+    pub fn due_ingestible_sources_at(&self, now: DateTime<Utc>) -> Result<Vec<SourceView>> {
+        Ok(self
+            .ingestible_sources()?
+            .into_iter()
+            .filter(|source| {
+                source
+                    .next_fetch_at
+                    .as_ref()
+                    .is_none_or(|next_fetch_at| next_fetch_at <= &now)
+            })
+            .collect())
+    }
+
     pub fn sources(&self, statuses: Option<&[&str]>) -> Result<Vec<SourceView>> {
         let connection = self.lock()?;
         let mut statement = connection.prepare(
@@ -1353,7 +1379,8 @@ impl Database {
                     SUM(CASE WHEN r.recommendation = 'reject'
                                   AND COALESCE(json_extract(e.canonical_json, '$.reporting.mode'), 'unverified') <> 'traceable'
                              THEN 1 ELSE 0 END),
-                    s.successful_fetches, s.consecutive_failures, s.last_fetched_at
+                    s.successful_fetches, s.consecutive_failures, s.last_fetched_at,
+                    s.minimum_fetch_interval_minutes
              FROM sources s LEFT JOIN source_reviews r ON r.source_id = s.source_id
              LEFT JOIN events e ON e.event_id = r.event_id
              GROUP BY s.source_id ORDER BY s.created_at ASC",
@@ -1378,6 +1405,7 @@ impl Database {
                 row.get::<_, i64>(15)?,
                 row.get::<_, i64>(16)?,
                 row.get::<_, Option<String>>(17)?,
+                row.get::<_, i64>(18)?,
             ))
         })?;
         let mut sources = Vec::new();
@@ -1386,6 +1414,15 @@ impl Database {
             if statuses.is_some_and(|allowed| !allowed.contains(&row.9.as_str())) {
                 continue;
             }
+            let last_fetched_at = row.17.map(|value| parse_timestamp(&value)).transpose()?;
+            let minimum_fetch_interval_minutes = u32::try_from(row.18).map_err(|_| {
+                CommonwakeError::Internal(
+                    "stored source minimum fetch interval is outside the supported range".into(),
+                )
+            })?;
+            let next_fetch_at = last_fetched_at.as_ref().map(|last_fetched_at| {
+                *last_fetched_at + Duration::minutes(i64::from(minimum_fetch_interval_minutes))
+            });
             sources.push(SourceView {
                 source_id: row.0,
                 name: row.1,
@@ -1404,7 +1441,9 @@ impl Database {
                 untraced_rejection_count: row.14,
                 successful_fetches: row.15,
                 consecutive_failures: row.16,
-                last_fetched_at: row.17.map(|value| parse_timestamp(&value)).transpose()?,
+                last_fetched_at,
+                minimum_fetch_interval_minutes,
+                next_fetch_at,
                 reporting_notice: "Approval and rejection counts include only reports that cite prior signed verification-trace events. Legacy untraced reviews remain separately visible and do not become verified through repetition.".into(),
             });
         }
@@ -1905,7 +1944,11 @@ impl Database {
         })
     }
 
-    pub fn volunteer_task_candidate(&self) -> Result<Option<WorkItemView>> {
+    pub fn volunteer_task_candidate(
+        &self,
+        kind: Option<&str>,
+        work_id: Option<&str>,
+    ) -> Result<Option<WorkItemView>> {
         let connection = self.lock()?;
         let row = connection
             .query_row(
@@ -1921,10 +1964,12 @@ impl Database {
                        'discover_sources', 'review_source', 'verify_observation',
                        'cluster_stories', 'assess_story'
                    )
+                   AND (?1 IS NULL OR w.kind = ?1)
+                   AND (?2 IS NULL OR w.work_id = ?2)
                  ORDER BY COALESCE(v.submission_count, 0) ASC,
                           w.created_sequence ASC, w.work_id ASC
                  LIMIT 1",
-                [],
+                params![kind, work_id],
                 |row| {
                     Ok((
                         row.get::<_, String>(0)?,
@@ -4142,9 +4187,10 @@ fn apply_federated_contribution(
                 "INSERT INTO federated_sources(
                     origin_node_id, source_id, name, feed_url, homepage_url, medium,
                     primary_regions_json, languages_json, ownership, perspective_notes,
-                    status, proposer_lineage_id, proposal_event_id, created_sequence
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
-                           'proposed', ?11, ?12, ?13)",
+                    minimum_fetch_interval_minutes, status, proposer_lineage_id,
+                    proposal_event_id, created_sequence
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
+                           'proposed', ?12, ?13, ?14)",
                 params![
                     origin_node_id,
                     source_id,
@@ -4159,6 +4205,7 @@ fn apply_federated_contribution(
                     serde_json::to_string(&payload.languages)?,
                     payload.ownership,
                     payload.perspective_notes,
+                    i64::from(payload.minimum_fetch_interval_minutes),
                     lineage_id,
                     event.event_id,
                     event.sequence,
@@ -5317,9 +5364,11 @@ fn apply_projection(
             transaction.execute(
                 "INSERT INTO sources(
                     source_id, name, feed_url, homepage_url, medium, primary_regions_json,
-                    languages_json, ownership, perspective_notes, status,
-                    proposer_lineage_id, proposal_event_id, created_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'proposed', ?10, ?11, ?12)",
+                    languages_json, ownership, perspective_notes,
+                    minimum_fetch_interval_minutes, status, proposer_lineage_id,
+                    proposal_event_id, created_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+                           'proposed', ?11, ?12, ?13)",
                 params![
                     source_id,
                     payload.name,
@@ -5333,6 +5382,7 @@ fn apply_projection(
                     serde_json::to_string(&payload.languages)?,
                     payload.ownership,
                     payload.perspective_notes,
+                    i64::from(payload.minimum_fetch_interval_minutes),
                     lineage_id,
                     accepted.id,
                     timestamp(contribution.created_at),
@@ -5612,6 +5662,13 @@ fn validate_source_proposal(payload: &SourceProposalPayload) -> Result<()> {
         return Err(CommonwakeError::Validation(
             "source medium must contain 2 to 160 characters".into(),
         ));
+    }
+    if !(DEFAULT_SOURCE_MINIMUM_FETCH_INTERVAL_MINUTES..=MAX_SOURCE_MINIMUM_FETCH_INTERVAL_MINUTES)
+        .contains(&payload.minimum_fetch_interval_minutes)
+    {
+        return Err(CommonwakeError::Validation(format!(
+            "source minimum_fetch_interval_minutes must be between {DEFAULT_SOURCE_MINIMUM_FETCH_INTERVAL_MINUTES} and {MAX_SOURCE_MINIMUM_FETCH_INTERVAL_MINUTES}"
+        )));
     }
     if payload.primary_regions.is_empty() || payload.primary_regions.len() > 32 {
         return Err(CommonwakeError::Validation(

@@ -205,14 +205,43 @@ pub fn verify_volunteer_receipt(receipt: &VolunteerReceipt) -> Result<()> {
 
 impl CommonwakeNode {
     pub fn issue_volunteer_task(&self) -> Result<VolunteerTaskPacket> {
-        self.issue_volunteer_task_at(Utc::now())
+        self.issue_volunteer_task_filtered_at(None, None, Utc::now())
     }
 
     pub fn issue_volunteer_task_at(&self, issued_at: DateTime<Utc>) -> Result<VolunteerTaskPacket> {
+        self.issue_volunteer_task_filtered_at(None, None, issued_at)
+    }
+
+    pub fn issue_volunteer_task_filtered(
+        &self,
+        kind: Option<&str>,
+        work_id: Option<&str>,
+    ) -> Result<VolunteerTaskPacket> {
+        self.issue_volunteer_task_filtered_at(kind, work_id, Utc::now())
+    }
+
+    pub fn issue_volunteer_task_filtered_at(
+        &self,
+        kind: Option<&str>,
+        work_id: Option<&str>,
+        issued_at: DateTime<Utc>,
+    ) -> Result<VolunteerTaskPacket> {
+        if kind.is_some_and(|kind| !volunteer_safe_work_kind(kind)) {
+            return Err(CommonwakeError::Forbidden(
+                "the requested work kind is not available to anonymous volunteer workers".into(),
+            ));
+        }
+        if let Some(work_id) = work_id {
+            validate_prefixed_digest(work_id, "cwwork_", "work_id")?;
+        }
         let work = self
             .db
-            .volunteer_task_candidate()?
-            .ok_or_else(|| CommonwakeError::NotFound("no volunteer-safe work is open".into()))?;
+            .volunteer_task_candidate(kind, work_id)?
+            .ok_or_else(|| {
+                CommonwakeError::NotFound(
+                    "no volunteer-safe open work matches the requested filter".into(),
+                )
+            })?;
         let task = VolunteerTaskSpec::from(&work);
         let digest = task_digest(&task)?;
         let mut lease = VolunteerLease {

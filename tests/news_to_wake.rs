@@ -149,6 +149,7 @@ fn propose_source(node: &CommonwakeNode, proposer: &Actor, name: &str, feed_url:
             languages: vec!["en".into()],
             ownership: Some("fixture cooperative".into()),
             perspective_notes: Some("Deterministic test fixture, not an endorsement.".into()),
+            minimum_fetch_interval_minutes: 15,
             rationale: "Adds an independently retrievable view needed for the lifecycle proof."
                 .into(),
         },
@@ -190,6 +191,123 @@ fn rss(channel: &str, item_url: &str, title: &str, description: &str) -> String 
   </channel>
 </rss>"#
     )
+}
+
+#[tokio::test]
+async fn arxiv_atom_metadata_can_enter_probation_without_overpolling() {
+    let directory = TempDir::new().expect("temp dir");
+    let node = CommonwakeNode::initialize(directory.path()).expect("node");
+    let proposer = actor(&node, "research-source-proposer");
+    let reviewer_a = actor(&node, "research-source-reviewer-a");
+    let reviewer_b = actor(&node, "research-source-reviewer-b");
+    let feed_url = "https://rss.arxiv.org/atom/cs.AI";
+
+    submit(
+        &node,
+        &proposer,
+        ContributionKind::SourceProposal,
+        SourceProposalPayload {
+            name: "arXiv Computer Science - Artificial Intelligence".into(),
+            feed_url: feed_url.into(),
+            homepage_url: Some("https://arxiv.org/list/cs.AI/recent".into()),
+            medium: "primary research preprint metadata feed".into(),
+            primary_regions: vec!["global".into(), "ai_research_systems".into()],
+            languages: vec!["en".into()],
+            ownership: Some("Cornell University arXiv".into()),
+            perspective_notes: Some(
+                "Author-submitted preprints are primary research claims, not peer-review verdicts; category and English-language coverage are incomplete views of global AI research."
+                    .into(),
+            ),
+            minimum_fetch_interval_minutes: 24 * 60,
+            rationale: "The official daily Atom feed supplies attributable metadata for current cs.AI submissions while preserving links to the primary abstract records."
+                .into(),
+        },
+        vec![],
+    );
+    let proposed = node.db.sources(None).expect("proposed source").remove(0);
+    review_source(&node, &reviewer_a, &proposed.source_id, feed_url);
+    review_source(&node, &reviewer_b, &proposed.source_id, feed_url);
+
+    let source = node
+        .db
+        .ingestible_sources()
+        .expect("reviewed source")
+        .remove(0);
+    assert_eq!(source.minimum_fetch_interval_minutes, 24 * 60);
+    assert_eq!(source.next_fetch_at, None);
+
+    let atom = r#"<?xml version='1.0' encoding='UTF-8'?>
+<feed xmlns:arxiv="http://arxiv.org/schemas/atom" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns="http://www.w3.org/2005/Atom" xml:lang="en-us">
+  <id>http://rss.arxiv.org/atom/cs.AI</id>
+  <title>cs.AI updates on arXiv.org</title>
+  <updated>2026-08-18T04:00:14Z</updated>
+  <entry>
+    <id>oai:arXiv.org:2608.14550v1</id>
+    <title>FLOPs vs Real Work: The Importance of Replication in AI Efficiency Assessment</title>
+    <updated>2026-08-18T04:00:15Z</updated>
+    <link href="https://arxiv.org/abs/2608.14550" rel="alternate" type="text/html"/>
+    <summary>arXiv:2608.14550v1 Announce Type: new. Abstract: A replication study examines whether raw FLOPs adequately represent execution costs.</summary>
+    <category term="cs.AI"/>
+    <category term="cs.PF"/>
+    <published>2026-08-18T04:00:00Z</published>
+    <arxiv:announce_type>new</arxiv:announce_type>
+    <dc:creator>Fixture Authors</dc:creator>
+  </entry>
+</feed>"#;
+    assert_eq!(
+        node.ingest_feed_bytes(&source, atom.as_bytes())
+            .expect("official Atom shape is ingestible"),
+        (1, 1)
+    );
+    node.db
+        .mark_source_fetch(&source.source_id, true)
+        .expect("record fetch");
+
+    let current = node.db.sources(None).expect("source view").remove(0);
+    let last_fetched_at = current.last_fetched_at.expect("last fetch");
+    assert_eq!(
+        current.next_fetch_at,
+        Some(last_fetched_at + Duration::minutes(24 * 60))
+    );
+    assert!(
+        node.db
+            .due_ingestible_sources_at(last_fetched_at + Duration::minutes(24 * 60 - 1))
+            .expect("deferred sources")
+            .is_empty()
+    );
+    assert_eq!(
+        node.db
+            .due_ingestible_sources_at(last_fetched_at + Duration::minutes(24 * 60))
+            .expect("due sources")
+            .len(),
+        1
+    );
+    let scheduled_pass = node.ingest_due().await.expect("scheduled collection pass");
+    assert_eq!(scheduled_pass.sources_eligible, 1);
+    assert_eq!(scheduled_pass.sources_deferred, 1);
+    assert_eq!(scheduled_pass.sources_attempted, 0);
+
+    let feed = node.db.feed(0, 10, None).expect("raw research feed");
+    assert_eq!(feed.stories.len(), 1);
+    assert_eq!(
+        feed.stories[0].observations[0].canonical_url,
+        "https://arxiv.org/abs/2608.14550"
+    );
+    assert_eq!(
+        feed.stories[0].observations[0].language.as_deref(),
+        Some("en-us")
+    );
+
+    let connection = rusqlite::Connection::open(directory.path().join("commonwake.db"))
+        .expect("inspect schema marker");
+    let extension: String = connection
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'source_fetch_policy_schema'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("source fetch policy marker");
+    assert_eq!(extension, "1");
 }
 
 #[tokio::test]

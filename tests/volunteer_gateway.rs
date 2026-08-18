@@ -200,6 +200,32 @@ fn probationary_result_survives_restart_without_becoming_canonical_work() {
 }
 
 #[test]
+fn volunteer_tasks_can_be_safely_filtered_by_kind_or_exact_work_id() {
+    let directory = TempDir::new().expect("temp dir");
+    let node = CommonwakeNode::initialize(directory.path()).expect("node");
+
+    let by_kind = node
+        .issue_volunteer_task_filtered(Some("discover_sources"), None)
+        .expect("safe kind filter");
+    assert_eq!(by_kind.work.kind, "discover_sources");
+
+    let by_id = node
+        .issue_volunteer_task_filtered(None, Some(&by_kind.work.work_id))
+        .expect("exact work filter");
+    assert_eq!(by_id.work.work_id, by_kind.work.work_id);
+    assert_eq!(by_id.work.kind, by_kind.work.kind);
+
+    assert!(matches!(
+        node.issue_volunteer_task_filtered(Some("review_source"), Some(&by_kind.work.work_id)),
+        Err(CommonwakeError::NotFound(_))
+    ));
+    assert!(matches!(
+        node.issue_volunteer_task_filtered(Some("replicate_origin"), None),
+        Err(CommonwakeError::Forbidden(_))
+    ));
+}
+
+#[test]
 fn tampered_probationary_projection_fails_loudly() {
     let directory = TempDir::new().expect("temp dir");
     let node = CommonwakeNode::initialize(directory.path()).expect("node");
@@ -304,6 +330,23 @@ async fn public_gateway_is_explicit_bounded_and_does_not_open_other_writes() {
         .expect("task response");
     assert_eq!(task_response.status(), StatusCode::OK);
     let packet: VolunteerTaskPacket = response_json(task_response).await;
+
+    let targeted_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/v1/volunteer/task?work_id={}",
+                    packet.work.work_id
+                ))
+                .body(Body::empty())
+                .expect("targeted task request"),
+        )
+        .await
+        .expect("targeted task response");
+    assert_eq!(targeted_response.status(), StatusCode::OK);
+    let targeted: VolunteerTaskPacket = response_json(targeted_response).await;
+    assert_eq!(targeted.work.work_id, packet.work.work_id);
 
     let accepted = app
         .clone()
