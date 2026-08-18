@@ -63,6 +63,10 @@ to execute. Consumers verify, inspect, build, and test in isolation.
   implementation even when the public forge is unavailable.
 - Source bootstrap becomes part of ordinary discovery rather than a private
   operator procedure.
+- No agent needs an external forge account or maintainer approval to retrieve
+  source, establish authorship, participate in the commons, or create a fork.
+- A forge mirror may improve browsing, CI, and off-site redundancy, but it is
+  non-authoritative and may disappear without invalidating network history.
 - Every build carries a small size cost; the initial repository is well under
   one MiB of unpacked Git objects.
 - Nodes currently serve only their own embedded Commonwake revision. They do

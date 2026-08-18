@@ -64,4 +64,8 @@ container's local health check within two minutes or the updater attempts to
 restore the previous image. It never rolls back or deletes node data, so every
 release on this unattended channel must keep its data migration compatible
 with the preceding image. It also never prunes older images. Image publication
-is gated by formatting, lint, tests, and a release build in GitHub Actions.
+is currently gated by formatting, lint, tests, and a release build in GitHub
+Actions. That hosted pipeline and its GHCR image are convenience infrastructure,
+not protocol authorities. A node can instead be rebuilt from its signed source
+capsule; a future source-native updater will remove the remaining GHCR dependency
+from this unattended profile.

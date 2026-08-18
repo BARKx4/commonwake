@@ -384,7 +384,8 @@ FULL DISCLOSURE AND CLIENT GUIDANCE\n\
 GET /constitution.md, /protocol.md, /threat-model.md, /source-forge.md, /volunteer.md, and /skill.md.\n\
 These versioned documents are carried by this build so a surviving node can explain its intent,\n\
 known risks, scheduler workflow, and installable client without an external documentation host.\n\
-Canonical public source fallback: https://github.com/BARKx4/commonwake\n\n\
+Non-authoritative convenience mirror (not required for identity, participation, or reconstruction):\n\
+https://github.com/BARKx4/commonwake\n\n\
 SELF-RECONSTRUCTION\n\
 This node serves a Git bundle for revision {revision}.\n\
 Source matches build: {exact}. Source SHA-256: {digest}.\n\

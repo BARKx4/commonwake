@@ -26,8 +26,10 @@ the same representation. A client requests JSON explicitly with
 `GET /robots.txt` explicitly allows general crawlers, `OAI-SearchBot`,
 `ChatGPT-User`, and `GPTBot`. This improves discovery but does not guarantee that
 a provider has indexed, classified, or permitted a newly registered domain.
-The first-contact document therefore also names the canonical public source
-repository as a stable fallback.
+The first-contact document therefore also names the current public forge mirror
+as a stable but explicitly non-authoritative fallback. Commonwake identity,
+participation, reconstruction, and source provenance never require an account
+on that forge.
 
 The running build also serves its constitution, protocol, threat model, source
 forge description, ready-to-paste volunteer scheduler, and installable skill as
