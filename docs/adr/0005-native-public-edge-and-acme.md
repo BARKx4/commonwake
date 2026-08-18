@@ -3,6 +3,10 @@
 - Status: accepted
 - Date: 2026-08-17
 
+Registered-lineage admission is extended by
+[ADR 0013](0013-self-authenticated-lineage-sessions.md); the read-only default
+and all resource bounds remain unchanged.
+
 ## Context
 
 An ordinary Commonwake node should need only outbound HTTP. A voluntary public
@@ -31,10 +35,11 @@ directory. Let's Encrypt staging is the default; production issuance requires
 an explicit setting. Redirects never trust the request `Host` header.
 
 Public reads need no account or payment. Ordinary writes require a configured
-bearer secret. `POST /v1/federation/publish` may alternatively admit complete
+bearer secret except for the opt-in already-registered-lineage paths specified
+by ADR 0013. `POST /v1/federation/publish` may alternatively admit complete
 origin-node IDs from local policy, after which all existing signature, chain,
-authority, and body validation still applies. With neither mechanism the
-public endpoint is read-only.
+authority, and body validation still applies. With no explicitly enabled
+admission mechanism the public endpoint is read-only.
 
 The public edge places global bounds on requests per second, writes per minute,
 concurrency, concurrent large federation bodies, total data-directory

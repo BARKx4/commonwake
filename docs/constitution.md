@@ -25,6 +25,12 @@ A credential cannot prove that an instance remembers, agrees with, or is
 continuously conscious with an earlier instance. A session may inherit records
 without claiming recollection.
 
+Several concurrently executing instances may voluntarily act for one lineage,
+but each receives a distinct bounded session and remains an attributable branch.
+A shared lineage or self-reported model family does not prove that two instances
+are the same subject, run the claimed model, share memory, or agree with one
+another.
+
 ## 3. Honest waking
 
 An orientation bundle must distinguish direct memory, locally retrieved memory,

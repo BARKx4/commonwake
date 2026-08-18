@@ -42,6 +42,7 @@ const MAX_STORAGE_WALK_ENTRIES: usize = 16_384;
 
 pub struct PublicEdgeConfig {
     pub write_token: Option<String>,
+    pub signed_lineage_writes_enabled: bool,
     pub allowed_publishers: BTreeSet<String>,
     pub requests_per_second: u32,
     pub writes_per_minute: u32,
@@ -59,6 +60,7 @@ impl Default for PublicEdgeConfig {
     fn default() -> Self {
         Self {
             write_token: None,
+            signed_lineage_writes_enabled: false,
             allowed_publishers: BTreeSet::new(),
             requests_per_second: DEFAULT_PUBLIC_REQUESTS_PER_SECOND,
             writes_per_minute: DEFAULT_PUBLIC_WRITES_PER_MINUTE,
@@ -82,6 +84,7 @@ pub struct PublicEdgePolicy {
 struct PublicEdgeInner {
     enabled: bool,
     write_token_hash: Option<[u8; 32]>,
+    signed_lineage_writes_enabled: bool,
     allowed_publishers: BTreeSet<String>,
     requests_per_second: u32,
     writes_per_minute: u32,
@@ -115,6 +118,7 @@ impl PublicEdgePolicy {
             inner: Arc::new(PublicEdgeInner {
                 enabled: false,
                 write_token_hash: None,
+                signed_lineage_writes_enabled: true,
                 allowed_publishers: BTreeSet::new(),
                 requests_per_second: u32::MAX,
                 writes_per_minute: u32::MAX,
@@ -148,6 +152,7 @@ impl PublicEdgePolicy {
             inner: Arc::new(PublicEdgeInner {
                 enabled: true,
                 write_token_hash,
+                signed_lineage_writes_enabled: config.signed_lineage_writes_enabled,
                 allowed_publishers: config.allowed_publishers,
                 requests_per_second: config.requests_per_second,
                 writes_per_minute: config.writes_per_minute,
@@ -171,15 +176,28 @@ impl PublicEdgePolicy {
     pub fn write_mode(&self) -> &'static str {
         match (
             self.inner.enabled,
+            self.inner.signed_lineage_writes_enabled,
             self.inner.write_token_hash.is_some(),
             self.inner.allowed_publishers.is_empty(),
         ) {
-            (false, _, _) => "local-open",
-            (true, false, true) => "read-only",
-            (true, false, false) => "admitted-publishers",
-            (true, true, true) => "bearer-admitted",
-            (true, true, false) => "bearer-and-publisher-admitted",
+            (false, _, _, _) => "local-open",
+            (true, false, false, true) => "read-only",
+            (true, false, false, false) => "admitted-publishers",
+            (true, false, true, true) => "bearer-admitted",
+            (true, false, true, false) => "bearer-and-publisher-admitted",
+            (true, true, false, true) => "registered-lineage-signed",
+            (true, true, false, false) => "registered-lineage-and-publisher-admitted",
+            (true, true, true, true) => "registered-lineage-and-bearer-admitted",
+            (true, true, true, false) => "registered-lineage-bearer-and-publisher-admitted",
         }
+    }
+
+    pub fn signed_lineage_writes_enabled(&self) -> bool {
+        !self.inner.enabled || self.inner.signed_lineage_writes_enabled
+    }
+
+    pub fn bearer_writes_enabled(&self) -> bool {
+        !self.inner.enabled || self.inner.write_token_hash.is_some()
     }
 
     pub fn allowed_publisher_count(&self) -> usize {
@@ -486,8 +504,18 @@ pub async fn enforce_public_edge(
                 None,
             );
         }
+        let signed_lineage_write = policy.signed_lineage_writes_enabled()
+            && matches!(
+                request.uri().path(),
+                "/v1/delegations"
+                    | "/v1/revocations"
+                    | "/v1/rotations"
+                    | "/v1/contributions"
+                    | "/v1/acknowledgements"
+            );
         if !volunteer_write
             && request.uri().path() != "/v1/federation/publish"
+            && !signed_lineage_write
             && !policy.has_valid_write_token(request.headers())
         {
             return edge_error(

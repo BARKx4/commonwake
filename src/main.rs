@@ -232,6 +232,13 @@ struct ServiceArgs {
     /// Bearer secret admitting ordinary writes through the public edge.
     #[arg(long, env = "COMMONWAKE_PUBLIC_WRITE_TOKEN", hide_env_values = true)]
     public_write_token: Option<String>,
+    /// Admit valid signed actions from lineages that are already registered on this peer.
+    #[arg(
+        long,
+        default_value_t = false,
+        env = "COMMONWAKE_PUBLIC_SIGNED_LINEAGE_WRITES"
+    )]
+    public_signed_lineage_writes: bool,
     /// Node IDs allowed to publish signed origin bundles without a bearer secret.
     #[arg(
         long = "public-allowed-publisher",
@@ -581,6 +588,7 @@ async fn main() -> anyhow::Result<()> {
             let identity = read_identity(&args.identity)?;
             let scopes = args.scopes.into_iter().map(Into::into).collect();
             let session = make_session(&identity, scopes, Duration::hours(args.ttl_hours))?;
+            let session_delegation_id = delegation_id(&session)?;
             let accepted = delegate(
                 &args.server,
                 &session.delegation,
@@ -590,6 +598,8 @@ async fn main() -> anyhow::Result<()> {
             write_secret(&args.session_out, &session)?;
             print_json(&serde_json::json!({
                 "accepted": accepted,
+                "lineage_id": session.delegation.lineage_id,
+                "delegation_id": session_delegation_id,
                 "session_path": args.session_out,
                 "expires_at": session.delegation.expires_at,
                 "scopes": session.delegation.scopes,
@@ -936,6 +946,7 @@ async fn run_service(node: CommonwakeNode, args: &ServiceArgs) -> anyhow::Result
             .public_write_token
             .as_ref()
             .is_some_and(|token| !token.is_empty())
+            || args.public_signed_lineage_writes
             || args
                 .public_allowed_publishers
                 .iter()
@@ -1003,6 +1014,7 @@ async fn run_service_with_public_tls(
     let bearer_writes = write_token.is_some();
     let public_config = PublicEdgeConfig {
         write_token,
+        signed_lineage_writes_enabled: args.public_signed_lineage_writes,
         allowed_publishers,
         requests_per_second: args.public_requests_per_second,
         writes_per_minute: args.public_writes_per_minute,
@@ -1076,6 +1088,7 @@ async fn run_service_with_public_tls(
         acme_production = args.acme_production,
         allowed_publishers = args.public_allowed_publishers.len(),
         bearer_writes,
+        signed_lineage_writes = args.public_signed_lineage_writes,
         volunteer_intake = args.public_volunteer_intake,
         "Commonwake local administration and bounded public HTTPS edge listening"
     );

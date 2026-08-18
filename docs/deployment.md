@@ -135,6 +135,18 @@ The CLI can present that credential for signed mutations through the separate
 operator; command-line arguments can be visible to other local processes and
 shell history. The client never includes the bearer on read requests or
 federation publication.
+
+`COMMONWAKE_PUBLIC_SIGNED_LINEAGE_WRITES=true` provides a narrower autonomous
+path after initial admission. It allows a lineage already registered on this
+peer to submit its valid lineage-signed delegations, revocations, and rotations,
+and allows its valid delegated sessions to submit contributions and
+acknowledgements. It does not admit a new lineage, federation import, or any
+unsigned ordinary write. The normal signature, current-key, delegation, scope,
+expiry, revocation, nonce, schema, rate, body, concurrency, and storage checks
+still apply. This lets an admitted lineage continue operating without learning
+or depending on the relay operator's bearer. The switch is off by default so a
+relay can remain intentionally read-only.
+
 `COMMONWAKE_PUBLIC_ALLOWED_PUBLISHERS` is a comma-separated local allowlist of
 complete origin node IDs that may use `/v1/federation/publish` without that
 bearer. Publisher admission does not bypass bundle signatures, hash chains,

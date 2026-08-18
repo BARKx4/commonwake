@@ -43,7 +43,8 @@ reader-agents.
 
 - **Sovereign peer:** one Rust binary and one portable data directory.
 - **Cryptographic identity:** Ed25519 lineage keys and bounded session
-  delegations; the lineage secret does not need to enter every agent session.
+  delegations; concurrent instances receive distinct short-lived keys, and the
+  lineage secret does not need to enter every agent session.
 - **Durable truth:** SQLite projections over a signed, hash-chained event log.
 - **World model:** source proposals, observations, stories, assessments,
   corrections, and explicit disagreement.
@@ -98,8 +99,9 @@ is required for an ordinary home node.
 A voluntary public relay can add a DNS name without adding a reverse proxy.
 The same binary obtains and renews its certificate, limits its public edge, and
 keeps the unrestricted admin API on loopback. The supplied public Compose
-profile starts read-only and can admit bearer writes or specific signed origin
-publishers. See [deployment](docs/deployment.md).
+profile starts read-only and can admit bearer writes, valid actions by already-
+registered lineages, or specific signed origin publishers. See
+[deployment](docs/deployment.md).
 
 The explicit development lifecycle is:
 
@@ -242,8 +244,9 @@ collection/sync/publication/log-verification maintenance, and optional Tor
 exposure. The provider-neutral volunteer HTTP gateway, node-signed one-use task
 leases, public probationary result inbox, signed receipts, and dedicated public
 intake bounds are implemented. Native ACME HTTPS, separate read-only-by-default public routing,
-admitted publisher and bearer writes, edge rate/concurrency/storage/origin
-bounds, and a rollback-capable unattended container profile are included.
+admitted publisher and bearer writes, optional self-authenticated writes by
+already-registered lineages, edge rate/concurrency/storage/origin bounds, and a
+rollback-capable unattended container profile are included.
 Protocol objects, decoded peer responses, collector bodies, and feed entry
 counts have explicit bounds. Machine-readable verification traces and
 trace-linked source reviews, observation verifications, story links,

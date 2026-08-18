@@ -4,13 +4,19 @@ use axum::{
     body::{Body, to_bytes},
     http::{Request, StatusCode, header::AUTHORIZATION},
 };
+use chrono::Duration;
 use commonwake::{
     CommonwakeNode, PublicEdgeConfig,
-    client::{create_identity, make_registration, register},
+    client::{
+        acknowledge, contribute, create_identity, delegate, make_acknowledgement,
+        make_contribution, make_delegation_revocation, make_key_rotation, make_registration,
+        make_session, register, revoke, rotate,
+    },
     federation::MAX_FEDERATION_BODY_BYTES,
-    model::FederationBundle,
+    model::{ContributionKind, FederationBundle, MemoryProvenance, Scope},
     public_router, router,
 };
+use serde_json::json;
 use tempfile::TempDir;
 use tower::ServiceExt;
 
@@ -152,6 +158,142 @@ async fn signed_client_can_present_a_public_edge_bearer() {
     .await
     .expect("credentialed registration");
     assert_eq!(node.db.current_head().expect("registration event").0, 1);
+    server.abort();
+}
+
+#[tokio::test]
+async fn registered_lineage_signed_writes_remain_closed_until_explicitly_enabled() {
+    let directory = TempDir::new().expect("temp dir");
+    let node = CommonwakeNode::initialize(directory.path()).expect("relay node");
+    let identity = create_identity("existing-lineage").expect("identity");
+    node.register_lineage(&make_registration(&identity).expect("registration"))
+        .expect("locally admitted lineage");
+    let session =
+        make_session(&identity, vec![Scope::Contribute], Duration::hours(1)).expect("session");
+
+    let denied = public_router(node.clone(), PublicEdgeConfig::default())
+        .expect("public router")
+        .oneshot(json_request("POST", "/v1/delegations", &session.delegation))
+        .await
+        .expect("denied response");
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+    assert_eq!(node.db.current_head().expect("unchanged log").0, 1);
+}
+
+#[tokio::test]
+async fn registered_lineages_can_use_their_own_signed_authority_without_a_relay_bearer() {
+    let directory = TempDir::new().expect("temp dir");
+    let node = CommonwakeNode::initialize(directory.path()).expect("relay node");
+    let identity = create_identity("self-authorizing-lineage").expect("identity");
+    node.register_lineage(&make_registration(&identity).expect("registration"))
+        .expect("locally admitted lineage");
+    let config = PublicEdgeConfig {
+        signed_lineage_writes_enabled: true,
+        ..PublicEdgeConfig::default()
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("test listener");
+    let address = listener.local_addr().expect("listener address");
+    let app = public_router(node.clone(), config).expect("public router");
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("public edge server");
+    });
+    let endpoint = format!("http://{address}");
+
+    let discovery: serde_json::Value = reqwest::get(format!("{endpoint}/v1/discovery"))
+        .await
+        .expect("discovery request")
+        .json()
+        .await
+        .expect("discovery JSON");
+    assert_eq!(discovery["node"]["registered_lineage_writes"], true);
+    assert_eq!(discovery["node"]["bearer_write_admission"], false);
+    assert_eq!(
+        discovery["node"]["public_write_mode"],
+        "registered-lineage-signed"
+    );
+
+    let stranger = create_identity("unregistered-lineage").expect("stranger identity");
+    let stranger_registration = make_registration(&stranger).expect("stranger registration");
+    let denied_registration = register(&endpoint, &stranger_registration, None)
+        .await
+        .expect_err("new lineage registration still requires operator admission");
+    assert!(denied_registration.to_string().contains("HTTP 403"));
+    let stranger_session = make_session(&stranger, vec![Scope::Contribute], Duration::hours(1))
+        .expect("stranger session");
+    let denied_delegation = delegate(&endpoint, &stranger_session.delegation, None)
+        .await
+        .expect_err("an unknown lineage cannot self-admit");
+    assert!(denied_delegation.to_string().contains("HTTP 404"));
+    assert_eq!(node.db.current_head().expect("unchanged log").0, 1);
+
+    let session = make_session(
+        &identity,
+        vec![Scope::Contribute, Scope::Ack],
+        Duration::hours(1),
+    )
+    .expect("bounded session");
+    delegate(&endpoint, &session.delegation, None)
+        .await
+        .expect("lineage-signed delegation");
+
+    let contribution = make_contribution(
+        &session,
+        ContributionKind::Position,
+        json!({"statement": "This concurrent session remains a distinct bounded delegate."}),
+        vec![],
+        vec![],
+    )
+    .expect("signed contribution");
+    contribute(&endpoint, &contribution, None)
+        .await
+        .expect("session-signed contribution");
+
+    let acknowledged_cursor = node.db.current_head().expect("current head").0;
+    let acknowledgement = make_acknowledgement(
+        &session,
+        acknowledged_cursor,
+        MemoryProvenance {
+            statement: "Processed inherited records without claiming direct memory.".into(),
+            local_digest: None,
+            direct_memory_claimed: false,
+        },
+    )
+    .expect("signed acknowledgement");
+    acknowledge(&endpoint, &acknowledgement, None)
+        .await
+        .expect("session-signed acknowledgement");
+
+    let revocation = make_delegation_revocation(
+        &identity,
+        commonwake::client::delegation_id(&session).expect("delegation id"),
+        "This bounded branch completed its effectful phase.",
+    )
+    .expect("signed revocation");
+    revoke(&endpoint, &revocation, None)
+        .await
+        .expect("lineage-signed revocation");
+
+    let (replacement, rotation) = make_key_rotation(
+        &identity,
+        "Test the complete self-authenticated authority lifecycle.",
+        true,
+    )
+    .expect("rotation package");
+    rotate(&endpoint, &rotation, None)
+        .await
+        .expect("dual-proof key rotation");
+    assert_eq!(
+        node.db
+            .lineage(&identity.lineage_id)
+            .expect("rotated lineage")
+            .public_key,
+        replacement.public_key
+    );
+    assert_eq!(node.db.current_head().expect("complete lifecycle").0, 6);
     server.abort();
 }
 

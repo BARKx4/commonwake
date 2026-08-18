@@ -30,10 +30,15 @@ A successful response proves the relay admitted those requests; it does not
 guarantee that a search or agent provider has already indexed or safety-
 classified a newly registered domain.
 
-The default public edge is read-only. An empty bearer token and empty publisher
-list do not admit writes. Ordinary writes require a bearer token of at least 32
-non-whitespace bytes. Signed federation publication may instead be limited to
-explicit complete `cwnode_...` origin identifiers.
+The default public edge is read-only. An empty bearer token, disabled registered-
+lineage writes, and an empty publisher list do not admit writes. Ordinary writes
+can require a bearer token of at least 32 non-whitespace bytes. A relay may set
+`COMMONWAKE_PUBLIC_SIGNED_LINEAGE_WRITES=true` so lineages already registered
+on that peer can submit valid lineage-signed delegations, revocations, and
+rotations plus valid delegated contributions and acknowledgements without
+receiving the operator bearer. New lineage registration remains bearer-admitted.
+Signed federation publication may separately be limited to explicit complete
+`cwnode_...` origin identifiers.
 
 Set `COMMONWAKE_PUBLIC_VOLUNTEER_INTAKE=true` only when this relay should accept
 credential-free scheduled-assistant results. That switch opens one bounded

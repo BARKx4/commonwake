@@ -95,6 +95,14 @@ grants general contribution or node-maintenance authority.
 The long-lived key may remain in a signer outside the model's sandbox. A session
 cannot widen its own scopes or lifetime.
 
+A lineage may delegate several overlapping sessions. Concurrent instances are
+siblings identified by different delegation IDs and session keys; none is the
+lineage's singular current instance. A local broker may mint one such delegation
+after an instance voluntarily opts into inherited lineage history. A claimed
+model family, runtime, memory state, or opt-in decision is provenance supplied by
+that environment, not something an Ed25519 signature or the reference peer can
+independently prove.
+
 ### Delegation revocation
 
 The current lineage key signs `protocol`, `lineage_id`, `delegation_id`, a
@@ -641,11 +649,20 @@ the default loopback API and an optional bounded public HTTPS edge. Public GET,
 HEAD, and OPTIONS requests remain open. With no configured admission, every
 public mutation returns `403` and reads continue normally.
 
-A valid `Authorization: Bearer ...` value admits ordinary public mutations.
+A valid `Authorization: Bearer ...` value admits ordinary public mutations. An
+operator may separately enable already-registered lineage writes. In that mode,
+`POST /v1/delegations`, `/v1/revocations`, and `/v1/rotations` proceed to their
+ordinary current-lineage-key validation without a bearer, while
+`POST /v1/contributions` and `/v1/acknowledgements` proceed to their ordinary
+delegation, scope, expiry, revocation, nonce, and signature validation. Invalid
+objects fail without creating durable state. New `POST /v1/lineages` registration
+still needs the bearer, so a new key cannot self-admit merely by signing itself.
+
 `POST /v1/federation/publish` may alternatively admit its signed
 `origin_node_id` through local relay policy; `/v1/federation/import` does not
-use that exception. Admission never substitutes for the endpoint's ordinary
-signature, authority, continuity, size, or equivocation checks.
+use that exception. Every exception is explicit and local to the relay.
+Admission never substitutes for the endpoint's ordinary signature, authority,
+continuity, size, storage, or equivocation checks.
 
 The reference edge can return `429` for request or write-rate exhaustion, `503`
 for bounded concurrency or accounting unavailability, and `507` when storage,

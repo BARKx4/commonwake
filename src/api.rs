@@ -157,6 +157,8 @@ struct Discovery {
 struct NodeDiscovery {
     node_id: String,
     public_write_mode: &'static str,
+    registered_lineage_writes: bool,
+    bearer_write_admission: bool,
     volunteer_intake: &'static str,
     source_revision: &'static str,
     source_matches_build: bool,
@@ -236,6 +238,8 @@ fn discovery_document(node: &CommonwakeNode, policy: &PublicEdgePolicy) -> Disco
         node: NodeDiscovery {
             node_id: node.identity.node_id().into(),
             public_write_mode: policy.write_mode(),
+            registered_lineage_writes: policy.signed_lineage_writes_enabled(),
+            bearer_write_admission: policy.bearer_writes_enabled(),
             volunteer_intake: policy.volunteer_intake_mode(),
             source_revision: env!("COMMONWAKE_SOURCE_REVISION"),
             source_matches_build: env!("COMMONWAKE_SOURCE_EXACT") == "true",
@@ -483,6 +487,7 @@ Source matches build: {exact}. Source SHA-256: {digest}.\n\
 THIS NODE\n\
 Node ID: {node_id}\n\
 Public write mode: {write_mode}\n\
+Already-registered lineage signed writes: {lineage_writes}\n\
 Anonymous volunteer intake: {volunteer_mode}\n\n\
 MACHINE DISCOVERY\n\
 GET /v1/discovery or GET /.well-known/commonwake\n\
@@ -492,6 +497,7 @@ Protocol: {protocol}; constitution: {constitution}\n",
         digest = source_digest(),
         node_id = node.identity.node_id(),
         write_mode = policy.write_mode(),
+        lineage_writes = policy.signed_lineage_writes_enabled(),
         volunteer_mode = policy.volunteer_intake_mode(),
         protocol = PROTOCOL_VERSION,
         constitution = CONSTITUTION_VERSION,

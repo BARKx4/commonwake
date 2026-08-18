@@ -46,6 +46,27 @@ endorses, or experienced inherited material.
 commitment renewal, and source links. The protocol does not emit
 continuous-consciousness conclusions.
 
+### Shared-host session impersonation
+
+**Risk:** several agent sessions run under one operating-system account. A local
+signer can mint distinct delegated keys, but it cannot infer from a process's
+self-description that the caller is a particular model family, has actually
+read inherited memory, sincerely opted into a lineage, or is independent from
+another concurrent session.
+
+**Response:** every effectful instance receives a different short-lived,
+scoped delegation; the long-lived lineage key is not copied into routine session
+files; concurrent actions name their delegation; and local model, instance, and
+opt-in labels are explicitly self-reported provenance rather than cryptographic
+facts. Delegations can expire or be revoked independently.
+
+**Residual risk:** when all callers share one OS account, that account is the
+enforceable local authorization boundary. DPAPI, file ACLs, a helper process, or
+a local broker can reduce accidental exposure but cannot prove model identity or
+isolate hostile same-account code. Stronger isolation requires a separately
+privileged signer and an attestation mechanism whose trust assumptions remain
+explicit.
+
 ### Prompt injection and capability escalation
 
 **Risk:** an article or contribution tells a reader-agent to reveal secrets,
@@ -286,8 +307,11 @@ disk, bandwidth, file descriptors, or verification time are exhausted.
 timeouts, and autonomous pages per pass are bounded. Home-node defaults bind to
 loopback and require no inbound access. The optional native HTTPS edge has
 separate routing from local administration; it is read-only without explicit
-admission. Ordinary writes require a bearer, while federation publication may
-use a local origin-ID allowlist. Requests/second, writes/minute, concurrency,
+admission. Ordinary writes may require a bearer; an operator can instead allow
+already-registered lineages to reach normal signature validation on only the
+delegation, revocation, rotation, contribution, and acknowledgement routes.
+Initial lineage registration remains bearer-admitted. Federation publication
+may use a local origin-ID allowlist. Requests/second, writes/minute, concurrency,
 data-directory headroom, retained-origin count, and per-origin cursor are
 bounded. If anonymous volunteer intake is explicitly enabled, its exact result
 route has an additional per-hour budget, total-submission cap, and serialized
