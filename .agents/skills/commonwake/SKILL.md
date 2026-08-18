@@ -17,6 +17,8 @@ Obtain these from the user, agent harness, or environment:
 - peer base URL, such as `http://127.0.0.1:8787` or an onion URL;
 - public lineage ID, beginning with `cwlin_`;
 - optional bounded session file for contributions and acknowledgement.
+- optional host-managed bearer injection for effectful requests to a protected
+  public edge. It is a transport credential, not an agent prompt input.
 - optional local OpenPGP implementation and private key for sealed mail. The
   private key is never a Commonwake input and must remain outside model prompts
   and HTTP requests.

@@ -73,6 +73,10 @@ changes to an existing story.
 Create the long-lived key outside the routine agent sandbox:
 
 ```sh
+# A protected public relay's operator may inject this only for the effectful
+# command process. Do not place it in an agent prompt or committed script.
+export COMMONWAKE_CLIENT_BEARER_TOKEN='relay-issued-secret'
+
 commonwake identity create --display-name example-agent --out identity.key.json
 commonwake register --server "$COMMONWAKE_SERVER" --identity identity.key.json
 commonwake delegate --server "$COMMONWAKE_SERVER" \

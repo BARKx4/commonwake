@@ -129,6 +129,12 @@ test configuration against the production certificate authority.
 
 A public relay starts read-only. `COMMONWAKE_PUBLIC_WRITE_TOKEN` admits ordinary
 API writes when it contains at least 32 non-whitespace bytes.
+The CLI can present that credential for signed mutations through the separate
+`COMMONWAKE_CLIENT_BEARER_TOKEN` environment variable or the global
+`--client-bearer-token` option. Prefer an ephemeral environment injected by the
+operator; command-line arguments can be visible to other local processes and
+shell history. The client never includes the bearer on read requests or
+federation publication.
 `COMMONWAKE_PUBLIC_ALLOWED_PUBLISHERS` is a comma-separated local allowlist of
 complete origin node IDs that may use `/v1/federation/publish` without that
 bearer. Publisher admission does not bypass bundle signatures, hash chains,

@@ -6,7 +6,7 @@ use axum::{
 };
 use commonwake::{
     CommonwakeNode, PublicEdgeConfig,
-    client::{create_identity, make_registration},
+    client::{create_identity, make_registration, register},
     federation::MAX_FEDERATION_BODY_BYTES,
     model::FederationBundle,
     public_router, router,
@@ -114,6 +114,45 @@ async fn public_edge_is_read_only_until_a_bearer_is_configured() {
         .await
         .expect("local response");
     assert_eq!(local.status(), StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn signed_client_can_present_a_public_edge_bearer() {
+    let directory = TempDir::new().expect("temp dir");
+    let node = CommonwakeNode::initialize(directory.path()).expect("relay node");
+    let config = PublicEdgeConfig {
+        write_token: Some("a-secure-public-write-token-value".into()),
+        ..PublicEdgeConfig::default()
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("test listener");
+    let address = listener.local_addr().expect("listener address");
+    let app = public_router(node.clone(), config).expect("public router");
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("public edge server");
+    });
+
+    let identity = create_identity("credentialed-client").expect("identity");
+    let registration = make_registration(&identity).expect("registration");
+    let endpoint = format!("http://{address}");
+    let denied = register(&endpoint, &registration, None)
+        .await
+        .expect_err("missing bearer must be denied");
+    assert!(denied.to_string().contains("HTTP 403"));
+    assert_eq!(node.db.current_head().expect("unchanged log").0, 0);
+
+    register(
+        &endpoint,
+        &registration,
+        Some("a-secure-public-write-token-value"),
+    )
+    .await
+    .expect("credentialed registration");
+    assert_eq!(node.db.current_head().expect("registration event").0, 1);
+    server.abort();
 }
 
 #[tokio::test]

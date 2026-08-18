@@ -233,31 +233,52 @@ pub fn make_acknowledgement(
     Ok(acknowledgement)
 }
 
-pub async fn register(server: &str, registration: &LineageRegistration) -> Result<AcceptedObject> {
-    post_json(server, "v1/lineages", registration).await
+pub async fn register(
+    server: &str,
+    registration: &LineageRegistration,
+    bearer_token: Option<&str>,
+) -> Result<AcceptedObject> {
+    post_json(server, "v1/lineages", registration, bearer_token).await
 }
 
-pub async fn delegate(server: &str, delegation: &SessionDelegation) -> Result<AcceptedObject> {
-    post_json(server, "v1/delegations", delegation).await
+pub async fn delegate(
+    server: &str,
+    delegation: &SessionDelegation,
+    bearer_token: Option<&str>,
+) -> Result<AcceptedObject> {
+    post_json(server, "v1/delegations", delegation, bearer_token).await
 }
 
-pub async fn revoke(server: &str, revocation: &DelegationRevocation) -> Result<AcceptedObject> {
-    post_json(server, "v1/revocations", revocation).await
+pub async fn revoke(
+    server: &str,
+    revocation: &DelegationRevocation,
+    bearer_token: Option<&str>,
+) -> Result<AcceptedObject> {
+    post_json(server, "v1/revocations", revocation, bearer_token).await
 }
 
-pub async fn rotate(server: &str, rotation: &SignedKeyRotation) -> Result<AcceptedObject> {
-    post_json(server, "v1/rotations", rotation).await
+pub async fn rotate(
+    server: &str,
+    rotation: &SignedKeyRotation,
+    bearer_token: Option<&str>,
+) -> Result<AcceptedObject> {
+    post_json(server, "v1/rotations", rotation, bearer_token).await
 }
 
-pub async fn contribute(server: &str, contribution: &SignedContribution) -> Result<AcceptedObject> {
-    post_json(server, "v1/contributions", contribution).await
+pub async fn contribute(
+    server: &str,
+    contribution: &SignedContribution,
+    bearer_token: Option<&str>,
+) -> Result<AcceptedObject> {
+    post_json(server, "v1/contributions", contribution, bearer_token).await
 }
 
 pub async fn acknowledge(
     server: &str,
     acknowledgement: &SignedAcknowledgement,
+    bearer_token: Option<&str>,
 ) -> Result<AcceptedObject> {
-    post_json(server, "v1/acknowledgements", acknowledgement).await
+    post_json(server, "v1/acknowledgements", acknowledgement, bearer_token).await
 }
 
 pub async fn orient(
@@ -305,14 +326,14 @@ pub async fn push_federation_bundle(
     server: &str,
     bundle: &FederationBundle,
 ) -> Result<FederationImportReport> {
-    post_json(server, "v1/federation/import", bundle).await
+    post_json(server, "v1/federation/import", bundle, None).await
 }
 
 pub async fn publish_federation_bundle(
     server: &str,
     bundle: &FederationBundle,
 ) -> Result<FederationPublishReport> {
-    post_json(server, "v1/federation/publish", bundle).await
+    post_json(server, "v1/federation/publish", bundle, None).await
 }
 
 pub fn read_identity(path: impl AsRef<Path>) -> Result<IdentityFile> {
@@ -357,12 +378,18 @@ async fn post_json<T: Serialize, R: DeserializeOwned>(
     server: &str,
     path: &str,
     value: &T,
+    bearer_token: Option<&str>,
 ) -> Result<R> {
-    let response = http_client()?
-        .post(endpoint(server, path)?)
-        .json(value)
-        .send()
-        .await?;
+    let mut request = http_client()?.post(endpoint(server, path)?).json(value);
+    if let Some(token) = bearer_token {
+        if token.is_empty() {
+            return Err(CommonwakeError::Validation(
+                "client bearer token cannot be empty".into(),
+            ));
+        }
+        request = request.bearer_auth(token);
+    }
+    let response = request.send().await?;
     decode_response(response).await
 }
 

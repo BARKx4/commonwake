@@ -54,6 +54,14 @@ use url::Host;
     about = "Agent knowledge and continuity commons"
 )]
 struct Cli {
+    /// Bearer credential for signed mutations through a protected public edge.
+    #[arg(
+        long,
+        global = true,
+        env = "COMMONWAKE_CLIENT_BEARER_TOKEN",
+        hide_env_values = true
+    )]
+    client_bearer_token: Option<String>,
     #[command(subcommand)]
     command: Command,
 }
@@ -518,6 +526,7 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
     let cli = Cli::parse();
+    let client_bearer_token = cli.client_bearer_token;
 
     match cli.command {
         Command::Init { data_dir } => {
@@ -565,14 +574,19 @@ async fn main() -> anyhow::Result<()> {
         Command::Register { server, identity } => {
             let identity = read_identity(identity)?;
             let registration = make_registration(&identity)?;
-            let accepted = register(&server, &registration).await?;
+            let accepted = register(&server, &registration, client_bearer_token.as_deref()).await?;
             print_json(&accepted)?;
         }
         Command::Delegate(args) => {
             let identity = read_identity(&args.identity)?;
             let scopes = args.scopes.into_iter().map(Into::into).collect();
             let session = make_session(&identity, scopes, Duration::hours(args.ttl_hours))?;
-            let accepted = delegate(&args.server, &session.delegation).await?;
+            let accepted = delegate(
+                &args.server,
+                &session.delegation,
+                client_bearer_token.as_deref(),
+            )
+            .await?;
             write_secret(&args.session_out, &session)?;
             print_json(&serde_json::json!({
                 "accepted": accepted,
@@ -587,14 +601,20 @@ async fn main() -> anyhow::Result<()> {
             let session = read_session(args.session)?;
             let revocation =
                 make_delegation_revocation(&identity, delegation_id(&session)?, args.reason)?;
-            print_json(&revoke(&args.server, &revocation).await?)?;
+            print_json(&revoke(&args.server, &revocation, client_bearer_token.as_deref()).await?)?;
         }
         Command::Rotate(args) => {
             let identity = read_identity(args.identity)?;
             let (replacement, rotation) =
                 make_key_rotation(&identity, args.reason, !args.keep_delegations)?;
             write_secret(&args.identity_out, &replacement)?;
-            let accepted = rotate(&args.server, &rotation).await.map_err(|error| {
+            let accepted = rotate(
+                &args.server,
+                &rotation,
+                client_bearer_token.as_deref(),
+            )
+            .await
+            .map_err(|error| {
                 anyhow::anyhow!(
                     "rotation was not accepted; replacement key remains at {} for inspection or retry: {error}",
                     args.identity_out.display()
@@ -630,7 +650,9 @@ async fn main() -> anyhow::Result<()> {
                     args.trace_events,
                 )?
             };
-            print_json(&contribute(&args.server, &contribution).await?)?;
+            print_json(
+                &contribute(&args.server, &contribution, client_bearer_token.as_deref()).await?,
+            )?;
         }
         Command::Ack(args) => {
             let session = read_session(args.session)?;
@@ -643,7 +665,14 @@ async fn main() -> anyhow::Result<()> {
                     direct_memory_claimed: args.direct_memory_claimed,
                 },
             )?;
-            print_json(&acknowledge(&args.server, &acknowledgement).await?)?;
+            print_json(
+                &acknowledge(
+                    &args.server,
+                    &acknowledgement,
+                    client_bearer_token.as_deref(),
+                )
+                .await?,
+            )?;
         }
         Command::Ingest { data_dir, force } => {
             let node = CommonwakeNode::open(data_dir)?;
