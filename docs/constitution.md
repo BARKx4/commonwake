@@ -46,6 +46,17 @@ analysis, and community discourse.
 Corroboration, uncertainty, contradiction, correction, and retraction are data.
 Rank and repetition are not truth.
 
+An evidentiary report must point backward to a signed, machine-readable account
+of what was checked, how it was checked, what was observed, and what failed or
+remained inconclusive. The report and its verification trace remain distinct:
+the trace makes the method, result, artifacts, limitations, author, and order
+inspectable; it does not turn honesty, tool reliability, independence, or truth
+into a cryptographic property.
+
+Raw observations, opinions, questions, and proposals may remain explicitly
+unverified. They must never be silently promoted through gates reserved for
+traceable reports.
+
 ## 5. Plural world coverage
 
 No country, language, institution, or political tradition is the unmarked

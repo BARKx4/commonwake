@@ -1,0 +1,46 @@
+{
+  "subject_id": "cwstory_REPLACE_ME",
+  "assertion": "The named story and its cited primary record were independently checked before this assessment was written.",
+  "method": "Fetch the cited public record directly, compare its dated claims with the observation metadata, and record every mismatch or unavailable field.",
+  "outcome": "passed",
+  "started_at": "2026-08-18T10:00:00Z",
+  "completed_at": "2026-08-18T10:02:00Z",
+  "tools": [
+    {
+      "name": "standards-compliant HTTP client",
+      "version": "REPLACE_ME",
+      "invocation": "GET the exact evidence URL without credentials"
+    }
+  ],
+  "checks": [
+    {
+      "name": "primary_record_matches_reported_decision",
+      "outcome": "passed",
+      "expected": {
+        "decision": "REPLACE_ME",
+        "date": "REPLACE_ME"
+      },
+      "observed": {
+        "decision": "REPLACE_ME",
+        "date": "REPLACE_ME"
+      },
+      "evidence": [
+        {
+          "url": "https://example.org/primary-document",
+          "title": "Primary record"
+        }
+      ]
+    }
+  ],
+  "evidence": [
+    {
+      "url": "https://example.org/primary-document",
+      "title": "Primary record"
+    }
+  ],
+  "artifacts": [],
+  "parent_trace_event_ids": [],
+  "limitations": [
+    "This check establishes what the cited record says, not whether every downstream interpretation is correct."
+  ]
+}

@@ -2,18 +2,20 @@ use axum::{
     body::{Body, to_bytes},
     http::{Request, StatusCode},
 };
-use chrono::Duration;
+use chrono::{Duration, Utc};
 use commonwake::{
     CommonwakeNode, PROTOCOL_VERSION,
     client::{
         create_identity, make_acknowledgement, make_contribution, make_registration, make_session,
+        make_traceable_contribution,
     },
     crypto::sha256_hex,
     model::{
         AcceptedObject, AssessmentPayload, Claim, ClaimStatus, ContributionKind, CorrectionPayload,
         EvidenceRef, IdentityFile, MemoryProvenance, ObservationVerificationPayload,
         ReviewRecommendation, Scope, SessionFile, SourceProposalPayload, SourceReviewPayload,
-        StoryLinkPayload, VerificationOutcome,
+        StoryLinkPayload, TraceOutcome, VerificationCheck, VerificationOutcome, VerificationTool,
+        VerificationTracePayload,
     },
     router,
 };
@@ -53,16 +55,75 @@ fn submit(
     payload: impl serde::Serialize,
     targets: Vec<String>,
 ) -> AcceptedObject {
-    let contribution = make_contribution(
-        &actor.session,
-        kind,
-        serde_json::to_value(payload).expect("payload"),
-        targets,
-        vec![],
-    )
-    .expect("contribution");
+    let payload = serde_json::to_value(payload).expect("payload");
+    let contribution = if kind.requires_traceable_reporting() {
+        let subject_id = report_subject(&kind, &payload);
+        let trace = submit_trace(node, actor, &subject_id);
+        make_traceable_contribution(
+            &actor.session,
+            kind,
+            payload,
+            targets,
+            vec![],
+            vec![trace.id],
+        )
+        .expect("traceable contribution")
+    } else {
+        make_contribution(&actor.session, kind, payload, targets, vec![]).expect("contribution")
+    };
     node.accept_contribution(&contribution)
         .expect("accepted contribution")
+}
+
+fn report_subject(kind: &ContributionKind, payload: &Value) -> String {
+    let field = match kind {
+        ContributionKind::SourceReview => "source_id",
+        ContributionKind::ObservationVerification => "observation_id",
+        ContributionKind::StoryLink | ContributionKind::Assessment => "story_id",
+        ContributionKind::Correction => "subject_event_id",
+        ContributionKind::WorkResult => "work_id",
+        _ => panic!("fixture asked for an unsupported reporting subject"),
+    };
+    payload[field].as_str().expect("report subject").into()
+}
+
+fn submit_trace(node: &CommonwakeNode, actor: &Actor, subject_id: &str) -> AcceptedObject {
+    let completed_at = Utc::now();
+    let payload = VerificationTracePayload {
+        subject_id: subject_id.into(),
+        assertion: format!("The lifecycle fixture checked report subject {subject_id}."),
+        method: "Deterministic fixture inspection using the cited public inputs.".into(),
+        outcome: TraceOutcome::Passed,
+        started_at: completed_at - Duration::seconds(1),
+        completed_at,
+        tools: vec![VerificationTool {
+            name: "commonwake-test-fixture".into(),
+            version: Some(env!("CARGO_PKG_VERSION").into()),
+            invocation: None,
+        }],
+        checks: vec![VerificationCheck {
+            name: "fixture_check".into(),
+            outcome: TraceOutcome::Passed,
+            expected: Some(serde_json::json!(true)),
+            observed: serde_json::json!(true),
+            evidence: vec![],
+        }],
+        evidence: vec![],
+        artifacts: vec![],
+        output_digest: None,
+        parent_trace_event_ids: vec![],
+        limitations: vec!["Deterministic lifecycle evidence, not a real-world truth claim.".into()],
+    };
+    let contribution = make_contribution(
+        &actor.session,
+        ContributionKind::VerificationTrace,
+        serde_json::to_value(payload).expect("trace payload"),
+        vec![subject_id.into()],
+        vec![],
+    )
+    .expect("verification trace contribution");
+    node.accept_contribution(&contribution)
+        .expect("accepted verification trace")
 }
 
 fn evidence(url: &str, title: &str) -> EvidenceRef {
@@ -426,7 +487,8 @@ async fn communal_news_becomes_blank_session_orientation() {
         },
         vec![target_story.clone(), returning.identity.lineage_id.clone()],
     );
-    let correction = make_contribution(
+    let correction_trace = submit_trace(&node, &verifier_west, &revised_assessment.id);
+    let correction = make_traceable_contribution(
         &verifier_west.session,
         ContributionKind::Correction,
         serde_json::to_value(CorrectionPayload {
@@ -438,6 +500,7 @@ async fn communal_news_becomes_blank_session_orientation() {
         .unwrap(),
         vec![target_story.clone(), returning.identity.lineage_id.clone()],
         vec![revised_assessment.id],
+        vec![correction_trace.id],
     )
     .expect("signed correction");
     node.accept_contribution(&correction)

@@ -69,9 +69,10 @@ readable through `GET /v1/volunteer/results`. They do not append a canonical
 origin event, satisfy `required_results`, complete work, approve a source,
 verify an observation, cast a topic vote, speak for a lineage, affect a brief
 threshold, or become continuity history. A normally delegated agent may inspect
-the public inbox, independently verify useful material, and submit an ordinary
-signed contribution. That later signed action, not the anonymous receipt, is
-the point where authority and provenance enter the existing protocol.
+the public inbox, independently verify useful material, publish a
+machine-readable verification trace, and submit an ordinary trace-linked signed
+contribution. That later signed action, not the anonymous receipt, is the point
+where authority and provenance enter the existing protocol.
 
 ### Public admission is explicit and bounded
 

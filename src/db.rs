@@ -29,10 +29,12 @@ use crate::{
         ForumPostView, LineageRegistration, LineageView, ObservationVerificationPayload,
         ObservationView, OpenPgpKeyAction, OpenPgpKeyPayload, OpenPgpKeyView, OriginEvent,
         OwnershipConcentrationView, PublicationTargetView, ReplicationHealth, ReplicationReceipt,
-        Scope, SessionDelegation, SignedAcknowledgement, SignedContribution, SignedKeyRotation,
-        SourceProposalPayload, SourceReviewPayload, SourceView, StoryLinkPayload, StoryView,
-        TopicPage, TopicProposalPayload, TopicView, TopicVotePayload, TopicVoteTally,
-        TopicVoteView, WorkClaimPayload, WorkItemView, WorkPage, WorkResultPayload,
+        ReportingDeclaration, ReportingMode, Scope, SessionDelegation, SignedAcknowledgement,
+        SignedContribution, SignedKeyRotation, SourceProposalPayload, SourceReviewPayload,
+        SourceView, StoryLinkPayload, StoryView, TopicPage, TopicProposalPayload, TopicView,
+        TopicVotePayload, TopicVoteTally, TopicVoteView, TraceOutcome, VerificationTracePage,
+        VerificationTracePayload, VerificationTraceView, WorkClaimPayload, WorkItemView, WorkPage,
+        WorkResultPayload,
     },
     node::NodeIdentity,
     service::{
@@ -1326,7 +1328,11 @@ impl Database {
     }
 
     pub fn ingestible_sources(&self) -> Result<Vec<SourceView>> {
-        self.sources(Some(&["probation", "active", "degraded"]))
+        Ok(self
+            .sources(Some(&["probation", "active", "degraded"]))?
+            .into_iter()
+            .filter(|source| source.approval_count >= 2)
+            .collect())
     }
 
     pub fn sources(&self, statuses: Option<&[&str]>) -> Result<Vec<SourceView>> {
@@ -1335,10 +1341,21 @@ impl Database {
             "SELECT s.source_id, s.name, s.feed_url, s.homepage_url, s.medium,
                     s.primary_regions_json, s.languages_json, s.ownership,
                     s.perspective_notes, s.status, s.proposer_lineage_id,
-                    SUM(CASE WHEN r.recommendation = 'approve' THEN 1 ELSE 0 END),
-                    SUM(CASE WHEN r.recommendation = 'reject' THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN r.recommendation = 'approve'
+                                  AND json_extract(e.canonical_json, '$.reporting.mode') = 'traceable'
+                             THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN r.recommendation = 'reject'
+                                  AND json_extract(e.canonical_json, '$.reporting.mode') = 'traceable'
+                             THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN r.recommendation = 'approve'
+                                  AND COALESCE(json_extract(e.canonical_json, '$.reporting.mode'), 'unverified') <> 'traceable'
+                             THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN r.recommendation = 'reject'
+                                  AND COALESCE(json_extract(e.canonical_json, '$.reporting.mode'), 'unverified') <> 'traceable'
+                             THEN 1 ELSE 0 END),
                     s.successful_fetches, s.consecutive_failures, s.last_fetched_at
              FROM sources s LEFT JOIN source_reviews r ON r.source_id = s.source_id
+             LEFT JOIN events e ON e.event_id = r.event_id
              GROUP BY s.source_id ORDER BY s.created_at ASC",
         )?;
         let rows = statement.query_map([], |row| {
@@ -1358,7 +1375,9 @@ impl Database {
                 row.get::<_, i64>(12)?,
                 row.get::<_, i64>(13)?,
                 row.get::<_, i64>(14)?,
-                row.get::<_, Option<String>>(15)?,
+                row.get::<_, i64>(15)?,
+                row.get::<_, i64>(16)?,
+                row.get::<_, Option<String>>(17)?,
             ))
         })?;
         let mut sources = Vec::new();
@@ -1381,9 +1400,12 @@ impl Database {
                 proposer_lineage_id: row.10,
                 approval_count: row.11,
                 rejection_count: row.12,
-                successful_fetches: row.13,
-                consecutive_failures: row.14,
-                last_fetched_at: row.15.map(|value| parse_timestamp(&value)).transpose()?,
+                untraced_approval_count: row.13,
+                untraced_rejection_count: row.14,
+                successful_fetches: row.15,
+                consecutive_failures: row.16,
+                last_fetched_at: row.17.map(|value| parse_timestamp(&value)).transpose()?,
+                reporting_notice: "Approval and rejection counts include only reports that cite prior signed verification-trace events. Legacy untraced reviews remain separately visible and do not become verified through repetition.".into(),
             });
         }
         Ok(sources)
@@ -1392,11 +1414,21 @@ impl Database {
     pub fn coverage_report(&self) -> Result<CoverageReport> {
         let connection = self.lock()?;
         let mut statement = connection.prepare(
-            "SELECT 'local', status, medium, primary_regions_json, languages_json, ownership
-             FROM sources
+            "SELECT 'local', s.status, s.medium, s.primary_regions_json, s.languages_json, s.ownership,
+                    (SELECT COUNT(*) FROM source_reviews r
+                     JOIN events e ON e.event_id = r.event_id
+                     WHERE r.source_id = s.source_id AND r.recommendation = 'approve'
+                       AND json_extract(e.canonical_json, '$.reporting.mode') = 'traceable')
+             FROM sources s
              UNION ALL
-             SELECT 'federated', status, medium, primary_regions_json, languages_json, ownership
-             FROM federated_sources",
+             SELECT 'federated', s.status, s.medium, s.primary_regions_json, s.languages_json, s.ownership,
+                    (SELECT COUNT(*) FROM federated_source_reviews r
+                     JOIN remote_events e
+                       ON e.origin_node_id = r.origin_node_id AND e.event_id = r.event_id
+                     WHERE r.origin_node_id = s.origin_node_id AND r.source_id = s.source_id
+                       AND r.recommendation = 'approve'
+                       AND json_extract(e.canonical_json, '$.reporting.mode') = 'traceable')
+             FROM federated_sources s",
         )?;
         let rows = statement.query_map([], |row| {
             Ok((
@@ -1406,6 +1438,7 @@ impl Database {
                 row.get::<_, String>(3)?,
                 row.get::<_, String>(4)?,
                 row.get::<_, Option<String>>(5)?,
+                row.get::<_, i64>(6)?,
             ))
         })?;
 
@@ -1422,12 +1455,27 @@ impl Database {
         let mut proposed_by_area = BTreeMap::<String, usize>::new();
 
         for row in rows {
-            let (origin, status, medium, regions_json, languages_json, ownership) = row?;
+            let (
+                origin,
+                stored_status,
+                medium,
+                regions_json,
+                languages_json,
+                ownership,
+                traceable_approvals,
+            ) = row?;
             if origin == "local" {
                 local_source_manifests += 1;
             } else {
                 federated_source_manifests += 1;
             }
+            let status = if matches!(stored_status.as_str(), "probation" | "active" | "degraded")
+                && traceable_approvals < 2
+            {
+                "proposed".to_owned()
+            } else {
+                stored_status
+            };
             *by_status.entry(status.clone()).or_insert(0) += 1;
             let eligible = matches!(status.as_str(), "probation" | "active");
             let proposed = status == "proposed";
@@ -1528,13 +1576,174 @@ impl Database {
             missing_ownership_manifests,
             dominant_ownership,
             standing_gaps,
-            methodology_notice: "Counts describe eligible source manifests (probation or active) by self-declared metadata and origin; they are not truth, quality, ideology, or viewpoint scores. Federated duplicates remain visible as separate origin manifests. China-related facets are plurality checks, not quotas or assumptions that unlike claims are morally or evidentially equivalent.".into(),
+            methodology_notice: "Counts describe policy-eligible source manifests (probation or active with at least two traceable approvals) by self-declared metadata and origin; they are not truth, quality, ideology, or viewpoint scores. A pre-trace stored status is treated as proposed until traceable review occurs. Federated duplicates remain visible as separate origin manifests. China-related facets are plurality checks, not quotas or assumptions that unlike claims are morally or evidentially equivalent.".into(),
         })
     }
 
     pub fn events_after(&self, after: i64, limit: usize) -> Result<Vec<EventView>> {
         let connection = self.lock()?;
         event_views_between(&connection, after, i64::MAX, limit)
+    }
+
+    pub fn verification_trace(
+        &self,
+        trace_event_id: &str,
+        origin_node_id: Option<&str>,
+    ) -> Result<VerificationTraceView> {
+        validate_prefixed_identifier(trace_event_id, "cwevt_", "verification trace event")?;
+        let connection = self.lock()?;
+        if let Some(origin_node_id) = origin_node_id {
+            let public_key: String = connection
+                .query_row(
+                    "SELECT node_public_key FROM federation_peers WHERE node_id = ?1",
+                    [origin_node_id],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .ok_or_else(|| {
+                    CommonwakeError::NotFound(format!("federated origin {origin_node_id}"))
+                })?;
+            let event = connection
+                .query_row(
+                    "SELECT origin_sequence, event_id, kind, lineage_id, delegation_id,
+                            created_at, received_at, canonical_json, previous_hash,
+                            event_hash, node_signature
+                     FROM remote_events
+                     WHERE origin_node_id = ?1 AND event_id = ?2
+                       AND kind = 'verification_trace'",
+                    params![origin_node_id, trace_event_id],
+                    remote_origin_event_from_row,
+                )
+                .optional()?
+                .ok_or_else(|| {
+                    CommonwakeError::NotFound(format!(
+                        "verification trace {origin_node_id}/{trace_event_id}"
+                    ))
+                })?;
+            return verification_trace_view(origin_node_id, &public_key, event);
+        }
+        let node_id: String =
+            connection.query_row("SELECT value FROM meta WHERE key = 'node_id'", [], |row| {
+                row.get(0)
+            })?;
+        let public_key: String = connection.query_row(
+            "SELECT value FROM meta WHERE key = 'node_public_key'",
+            [],
+            |row| row.get(0),
+        )?;
+        let event = connection
+            .query_row(
+                "SELECT sequence, event_id, kind, lineage_id, delegation_id, created_at,
+                        received_at, targets_json, supersedes_json, payload_json,
+                        canonical_json, author_signature, previous_hash, event_hash, node_signature,
+                        author_nonce
+                 FROM events WHERE event_id = ?1 AND kind = 'verification_trace'",
+                [trace_event_id],
+                raw_event_from_row,
+            )
+            .optional()?
+            .ok_or_else(|| {
+                CommonwakeError::NotFound(format!("verification trace {trace_event_id}"))
+            })?;
+        verification_trace_view(&node_id, &public_key, origin_event(event)?)
+    }
+
+    pub fn verification_trace_page(
+        &self,
+        origin_node_id: Option<&str>,
+        subject_id: Option<&str>,
+        after: i64,
+        limit: usize,
+    ) -> Result<VerificationTracePage> {
+        if after < 0 {
+            return Err(CommonwakeError::Validation(
+                "verification trace cursor cannot be negative".into(),
+            ));
+        }
+        if subject_id.is_some_and(|subject| subject.trim().is_empty() || subject.len() > 512) {
+            return Err(CommonwakeError::Validation(
+                "verification trace subject filter must contain 1 to 512 characters".into(),
+            ));
+        }
+        let limit = limit.clamp(1, 100);
+        let connection = self.lock()?;
+        let (node_id, public_key, events) = if let Some(origin_node_id) = origin_node_id {
+            let public_key: String = connection
+                .query_row(
+                    "SELECT node_public_key FROM federation_peers WHERE node_id = ?1",
+                    [origin_node_id],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .ok_or_else(|| {
+                    CommonwakeError::NotFound(format!("federated origin {origin_node_id}"))
+                })?;
+            let mut statement = connection.prepare(
+                "SELECT origin_sequence, event_id, kind, lineage_id, delegation_id,
+                        created_at, received_at, canonical_json, previous_hash,
+                        event_hash, node_signature
+                 FROM remote_events
+                 WHERE origin_node_id = ?1 AND origin_sequence > ?2
+                   AND kind = 'verification_trace'
+                   AND (?3 IS NULL OR json_extract(canonical_json, '$.payload.subject_id') = ?3)
+                 ORDER BY origin_sequence ASC LIMIT ?4",
+            )?;
+            let rows = statement.query_map(
+                params![origin_node_id, after, subject_id, (limit + 1) as i64],
+                remote_origin_event_from_row,
+            )?;
+            let mut events = Vec::new();
+            for row in rows {
+                events.push(row?);
+            }
+            (origin_node_id.to_owned(), public_key, events)
+        } else {
+            let node_id: String = connection.query_row(
+                "SELECT value FROM meta WHERE key = 'node_id'",
+                [],
+                |row| row.get(0),
+            )?;
+            let public_key: String = connection.query_row(
+                "SELECT value FROM meta WHERE key = 'node_public_key'",
+                [],
+                |row| row.get(0),
+            )?;
+            let mut statement = connection.prepare(
+                "SELECT sequence, event_id, kind, lineage_id, delegation_id, created_at,
+                        received_at, targets_json, supersedes_json, payload_json,
+                        canonical_json, author_signature, previous_hash, event_hash, node_signature,
+                        author_nonce
+                 FROM events WHERE sequence > ?1 AND kind = 'verification_trace'
+                   AND (?2 IS NULL OR json_extract(canonical_json, '$.payload.subject_id') = ?2)
+                 ORDER BY sequence ASC LIMIT ?3",
+            )?;
+            let rows = statement.query_map(
+                params![after, subject_id, (limit + 1) as i64],
+                raw_event_from_row,
+            )?;
+            let mut events = Vec::new();
+            for row in rows {
+                events.push(origin_event(row?)?);
+            }
+            (node_id, public_key, events)
+        };
+        let has_more = events.len() > limit;
+        let mut events = events;
+        events.truncate(limit);
+        let next_cursor = events.last().map_or(after, |event| event.sequence);
+        let mut traces = Vec::with_capacity(events.len());
+        for event in events {
+            traces.push(verification_trace_view(&node_id, &public_key, event)?);
+        }
+        Ok(VerificationTracePage {
+            traces,
+            after,
+            next_cursor,
+            has_more,
+            origin_node_id: origin_node_id.map(str::to_owned),
+            subject_id: subject_id.map(str::to_owned),
+            provenance_notice: "A trace proves that the named lineage signed this structured account of a method, inputs, checks, and outcome. It does not prove the account was honest, the tools were trustworthy, or the subject claim is universally true.".into(),
+        })
     }
 
     pub fn last_acknowledged_cursor(&self, lineage_id: &str) -> Result<i64> {
@@ -1692,6 +1901,7 @@ impl Database {
             next_cursor,
             has_more,
             kind: kind.map(str::to_owned),
+            reporting_notice: "received_results counts only signed reports that reference prior verification-trace events; anonymous volunteer submissions remain probationary and untraced until independently promoted.".into(),
         })
     }
 
@@ -3919,6 +4129,7 @@ fn apply_federated_contribution(
     contribution: &SignedContribution,
 ) -> Result<()> {
     validate_contribution_content(contribution)?;
+    validate_remote_reporting(transaction, origin_node_id, event.sequence, contribution)?;
     use crate::model::ContributionKind;
     match contribution.kind {
         ContributionKind::SourceProposal => {
@@ -3997,12 +4208,25 @@ fn apply_federated_contribution(
                     timestamp(contribution.created_at),
                 ],
             )?;
-            let approvals: i64 = transaction.query_row(
-                "SELECT COUNT(*) FROM federated_source_reviews
-                 WHERE origin_node_id = ?1 AND source_id = ?2 AND recommendation = 'approve'",
+            // Federation validates/projects the current origin event before it
+            // inserts that event into `remote_events`. The review row therefore
+            // cannot join to its own canonical contribution yet. Count stored
+            // traceable reviews, then include the already-validated current one.
+            let stored_approvals: i64 = transaction.query_row(
+                "SELECT COUNT(*) FROM federated_source_reviews r
+                 JOIN remote_events e
+                   ON e.origin_node_id = r.origin_node_id AND e.event_id = r.event_id
+                 WHERE r.origin_node_id = ?1 AND r.source_id = ?2
+                   AND r.recommendation = 'approve'
+                   AND json_extract(e.canonical_json, '$.reporting.mode') = 'traceable'",
                 params![origin_node_id, payload.source_id],
                 |row| row.get(0),
             )?;
+            let approvals = stored_approvals
+                + i64::from(
+                    contribution.reporting.is_traceable()
+                        && payload.recommendation.as_str() == "approve",
+                );
             if approvals >= 2 {
                 transaction.execute(
                     "UPDATE federated_sources SET status = 'probation'
@@ -4571,6 +4795,7 @@ fn validate_projection(
     contribution: &SignedContribution,
 ) -> Result<()> {
     validate_contribution_content(contribution)?;
+    validate_local_reporting(transaction, contribution)?;
     use crate::model::ContributionKind;
     match contribution.kind {
         ContributionKind::SourceProposal => {
@@ -4858,6 +5083,179 @@ fn validate_projection(
     Ok(())
 }
 
+fn validate_local_reporting(
+    transaction: &Transaction<'_>,
+    contribution: &SignedContribution,
+) -> Result<()> {
+    if contribution.kind == crate::model::ContributionKind::VerificationTrace {
+        let payload: VerificationTracePayload =
+            serde_json::from_value(contribution.payload.clone())?;
+        for parent in &payload.parent_trace_event_ids {
+            if local_trace_subject(transaction, parent)?.is_none() {
+                return Err(CommonwakeError::NotFound(format!(
+                    "parent verification trace {parent}"
+                )));
+            }
+        }
+        return Ok(());
+    }
+    if contribution.kind.requires_traceable_reporting() && !contribution.reporting.is_traceable() {
+        return Err(CommonwakeError::Validation(format!(
+            "{} is an evidentiary report and requires --trace-event references to prior signed verification traces",
+            contribution.kind.as_str()
+        )));
+    }
+    if !contribution.reporting.is_traceable() {
+        return Ok(());
+    }
+    let subjects = report_subject_ids(contribution)?;
+    if subjects.is_empty() {
+        return Err(CommonwakeError::Validation(
+            "traceable reporting requires at least one routed subject identifier".into(),
+        ));
+    }
+    for trace_id in &contribution.reporting.trace_event_ids {
+        let trace_subject = local_trace_subject(transaction, trace_id)?
+            .ok_or_else(|| CommonwakeError::NotFound(format!("verification trace {trace_id}")))?;
+        if !subjects.iter().any(|subject| subject == &trace_subject) {
+            return Err(CommonwakeError::Validation(format!(
+                "verification trace {trace_id} concerns {trace_subject}, not this report's subjects"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_remote_reporting(
+    transaction: &Transaction<'_>,
+    origin_node_id: &str,
+    origin_sequence: i64,
+    contribution: &SignedContribution,
+) -> Result<()> {
+    if contribution.kind == crate::model::ContributionKind::VerificationTrace {
+        let payload: VerificationTracePayload =
+            serde_json::from_value(contribution.payload.clone())?;
+        for parent in &payload.parent_trace_event_ids {
+            if remote_trace_subject(transaction, origin_node_id, origin_sequence, parent)?.is_none()
+            {
+                return Err(CommonwakeError::Unauthorized(format!(
+                    "remote verification trace names missing or later parent {parent}"
+                )));
+            }
+        }
+        return Ok(());
+    }
+    // Pre-trace Commonwake origins remain importable, but their reports stay
+    // explicitly unverified and cannot satisfy trace-aware derived gates.
+    if !contribution.reporting.is_traceable() {
+        return Ok(());
+    }
+    let subjects = report_subject_ids(contribution)?;
+    if subjects.is_empty() {
+        return Err(CommonwakeError::Unauthorized(
+            "remote traceable report has no routed subject identifier".into(),
+        ));
+    }
+    for trace_id in &contribution.reporting.trace_event_ids {
+        let trace_subject =
+            remote_trace_subject(transaction, origin_node_id, origin_sequence, trace_id)?
+                .ok_or_else(|| {
+                    CommonwakeError::Unauthorized(format!(
+                        "remote report names missing or later verification trace {trace_id}"
+                    ))
+                })?;
+        if !subjects.iter().any(|subject| subject == &trace_subject) {
+            return Err(CommonwakeError::Unauthorized(format!(
+                "remote verification trace {trace_id} concerns {trace_subject}, not the report's subjects"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn report_subject_ids(contribution: &SignedContribution) -> Result<Vec<String>> {
+    use crate::model::ContributionKind;
+    let subjects = match contribution.kind {
+        ContributionKind::SourceReview => {
+            vec![
+                serde_json::from_value::<SourceReviewPayload>(contribution.payload.clone())?
+                    .source_id,
+            ]
+        }
+        ContributionKind::ObservationVerification => vec![
+            serde_json::from_value::<ObservationVerificationPayload>(contribution.payload.clone())?
+                .observation_id,
+        ],
+        ContributionKind::StoryLink => {
+            let payload: StoryLinkPayload = serde_json::from_value(contribution.payload.clone())?;
+            std::iter::once(payload.story_id)
+                .chain(payload.observation_ids)
+                .collect()
+        }
+        ContributionKind::Assessment => {
+            vec![
+                serde_json::from_value::<AssessmentPayload>(contribution.payload.clone())?.story_id,
+            ]
+        }
+        ContributionKind::Correction => vec![
+            serde_json::from_value::<CorrectionPayload>(contribution.payload.clone())?
+                .subject_event_id,
+        ],
+        ContributionKind::WorkResult => {
+            vec![serde_json::from_value::<WorkResultPayload>(contribution.payload.clone())?.work_id]
+        }
+        _ => contribution.targets.clone(),
+    };
+    Ok(subjects)
+}
+
+fn local_trace_subject(
+    transaction: &Transaction<'_>,
+    trace_event_id: &str,
+) -> Result<Option<String>> {
+    let canonical: Option<String> = transaction
+        .query_row(
+            "SELECT canonical_json FROM events
+             WHERE event_id = ?1 AND kind = 'verification_trace'",
+            [trace_event_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    canonical.map(trace_subject_from_canonical).transpose()
+}
+
+fn remote_trace_subject(
+    transaction: &Transaction<'_>,
+    origin_node_id: &str,
+    before_sequence: i64,
+    trace_event_id: &str,
+) -> Result<Option<String>> {
+    let canonical: Option<String> = transaction
+        .query_row(
+            "SELECT canonical_json FROM remote_events
+             WHERE origin_node_id = ?1 AND event_id = ?2
+               AND kind = 'verification_trace' AND origin_sequence < ?3",
+            params![origin_node_id, trace_event_id, before_sequence],
+            |row| row.get(0),
+        )
+        .optional()?;
+    canonical.map(trace_subject_from_canonical).transpose()
+}
+
+fn trace_subject_from_canonical(canonical: String) -> Result<String> {
+    let contribution: SignedContribution = serde_json::from_str(&canonical)?;
+    if contribution.kind != crate::model::ContributionKind::VerificationTrace {
+        return Err(CommonwakeError::Unauthorized(
+            "referenced event is not a verification trace".into(),
+        ));
+    }
+    Ok(serde_json::from_value::<VerificationTracePayload>(contribution.payload)?.subject_id)
+}
+
+fn reporting_from_canonical(canonical: &str) -> Result<ReportingDeclaration> {
+    Ok(serde_json::from_str::<SignedContribution>(canonical)?.reporting)
+}
+
 fn require_exact_targets(actual: &[String], expected: &[&str], label: &str) -> Result<()> {
     let actual_set: BTreeSet<&str> = actual.iter().map(String::as_str).collect();
     let expected_set: BTreeSet<&str> = expected.iter().copied().collect();
@@ -4978,7 +5376,9 @@ fn apply_projection(
                 "SELECT
                     SUM(CASE WHEN recommendation = 'approve' THEN 1 ELSE 0 END),
                     SUM(CASE WHEN recommendation = 'reject' THEN 1 ELSE 0 END)
-                 FROM source_reviews WHERE source_id = ?1",
+                 FROM source_reviews r JOIN events e ON e.event_id = r.event_id
+                 WHERE r.source_id = ?1
+                   AND json_extract(e.canonical_json, '$.reporting.mode') = 'traceable'",
                 [&payload.source_id],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )?;
@@ -5022,7 +5422,10 @@ fn apply_projection(
                 ],
             )?;
             let count: i64 = transaction.query_row(
-                "SELECT COUNT(*) FROM observation_verifications WHERE observation_id = ?1",
+                "SELECT COUNT(*) FROM observation_verifications v
+                 JOIN events e ON e.event_id = v.event_id
+                 WHERE v.observation_id = ?1
+                   AND json_extract(e.canonical_json, '$.reporting.mode') = 'traceable'",
                 [&payload.observation_id],
                 |row| row.get(0),
             )?;
@@ -5095,7 +5498,10 @@ fn apply_projection(
                 ],
             )?;
             let count: i64 = transaction.query_row(
-                "SELECT COUNT(*) FROM assessments WHERE story_id = ?1",
+                "SELECT COUNT(*) FROM assessments a
+                 JOIN events e ON e.event_id = a.event_id
+                 WHERE a.story_id = ?1
+                   AND json_extract(e.canonical_json, '$.reporting.mode') = 'traceable'",
                 [&payload.story_id],
                 |row| row.get(0),
             )?;
@@ -5158,7 +5564,9 @@ fn apply_projection(
             let (required, received): (i64, i64) = transaction.query_row(
                 "SELECT w.required_results,
                         (SELECT COUNT(*) FROM work_results r
-                         WHERE r.work_id = w.work_id AND r.outcome IN ('completed', 'no_match'))
+                         JOIN events e ON e.event_id = r.event_id
+                         WHERE r.work_id = w.work_id AND r.outcome IN ('completed', 'no_match')
+                           AND json_extract(e.canonical_json, '$.reporting.mode') = 'traceable')
                  FROM work_items w WHERE w.work_id = ?1",
                 [&payload.work_id],
                 |row| Ok((row.get(0)?, row.get(1)?)),
@@ -5255,8 +5663,205 @@ fn validate_source_proposal(payload: &SourceProposalPayload) -> Result<()> {
     Ok(())
 }
 
+fn validate_reporting_declaration(contribution: &SignedContribution) -> Result<()> {
+    let trace_ids = &contribution.reporting.trace_event_ids;
+    if trace_ids.len() > 16 {
+        return Err(CommonwakeError::Validation(
+            "a report may reference at most 16 verification traces".into(),
+        ));
+    }
+    let distinct: BTreeSet<&String> = trace_ids.iter().collect();
+    if distinct.len() != trace_ids.len() {
+        return Err(CommonwakeError::Validation(
+            "verification trace references must be unique".into(),
+        ));
+    }
+    for trace_id in trace_ids {
+        validate_prefixed_identifier(trace_id, "cwevt_", "verification trace event")?;
+    }
+    match contribution.reporting.mode {
+        ReportingMode::Unverified if !trace_ids.is_empty() => Err(CommonwakeError::Validation(
+            "unverified reporting cannot carry verification trace references".into(),
+        )),
+        ReportingMode::Traceable if trace_ids.is_empty() => Err(CommonwakeError::Validation(
+            "traceable reporting requires at least one prior verification trace event".into(),
+        )),
+        _ => Ok(()),
+    }
+}
+
+fn validate_verification_trace(
+    contribution: &SignedContribution,
+    payload: &VerificationTracePayload,
+) -> Result<()> {
+    if !contribution.reporting.is_unverified() {
+        return Err(CommonwakeError::Validation(
+            "a verification trace cannot recursively claim another reporting mode; use parent_trace_event_ids"
+                .into(),
+        ));
+    }
+    require_no_supersessions(contribution, "verification trace")?;
+    if payload.subject_id.trim().is_empty()
+        || payload.subject_id.len() > 512
+        || payload.subject_id.chars().any(char::is_control)
+    {
+        return Err(CommonwakeError::Validation(
+            "verification trace subject_id must contain 1 to 512 non-control characters".into(),
+        ));
+    }
+    if !(10..=4_000).contains(&payload.assertion.trim().chars().count())
+        || !(10..=4_000).contains(&payload.method.trim().chars().count())
+    {
+        return Err(CommonwakeError::Validation(
+            "verification assertion and method must each contain 10 to 4000 characters".into(),
+        ));
+    }
+    if payload.started_at > payload.completed_at || payload.completed_at > contribution.created_at {
+        return Err(CommonwakeError::Validation(
+            "verification trace times must satisfy started_at <= completed_at <= contribution created_at"
+                .into(),
+        ));
+    }
+    if payload.tools.len() > 16 {
+        return Err(CommonwakeError::Validation(
+            "verification traces may name at most 16 tools".into(),
+        ));
+    }
+    for tool in &payload.tools {
+        if tool.name.trim().is_empty()
+            || tool.name.len() > 128
+            || tool
+                .version
+                .as_ref()
+                .is_some_and(|version| version.trim().is_empty() || version.len() > 128)
+            || tool
+                .invocation
+                .as_ref()
+                .is_some_and(|invocation| invocation.trim().is_empty() || invocation.len() > 2_048)
+        {
+            return Err(CommonwakeError::Validation(
+                "verification tool name, version, or invocation exceeds its protocol bound".into(),
+            ));
+        }
+    }
+    if payload.checks.is_empty() || payload.checks.len() > 64 {
+        return Err(CommonwakeError::Validation(
+            "verification traces require 1 to 64 machine-readable checks".into(),
+        ));
+    }
+    let mut check_names = BTreeSet::new();
+    for check in &payload.checks {
+        if check.name.trim().is_empty()
+            || check.name.len() > 200
+            || !check_names.insert(check.name.as_str())
+            || check.observed.is_null()
+        {
+            return Err(CommonwakeError::Validation(
+                "verification check names must be unique and bounded, and observed values cannot be null"
+                    .into(),
+            ));
+        }
+        validate_evidence_refs(&check.evidence, false)?;
+    }
+    let derived_outcome = if payload
+        .checks
+        .iter()
+        .any(|check| check.outcome == TraceOutcome::Failed)
+    {
+        TraceOutcome::Failed
+    } else if payload
+        .checks
+        .iter()
+        .any(|check| check.outcome == TraceOutcome::Inconclusive)
+    {
+        TraceOutcome::Inconclusive
+    } else {
+        TraceOutcome::Passed
+    };
+    if payload.outcome != derived_outcome {
+        return Err(CommonwakeError::Validation(format!(
+            "verification trace outcome {} does not match its checks' derived outcome {}",
+            payload.outcome.as_str(),
+            derived_outcome.as_str()
+        )));
+    }
+    validate_evidence_refs(&payload.evidence, false)?;
+    if payload.artifacts.len() > 32 {
+        return Err(CommonwakeError::Validation(
+            "verification traces may bind at most 32 artifacts".into(),
+        ));
+    }
+    let mut artifact_names = BTreeSet::new();
+    for artifact in &payload.artifacts {
+        if artifact.name.trim().is_empty()
+            || artifact.name.len() > 200
+            || !artifact_names.insert(artifact.name.as_str())
+            || !is_sha256_hex(&artifact.sha256)
+            || artifact
+                .media_type
+                .as_ref()
+                .is_some_and(|media_type| media_type.trim().is_empty() || media_type.len() > 200)
+        {
+            return Err(CommonwakeError::Validation(
+                "verification artifacts require unique bounded names, lowercase SHA-256, and bounded media types"
+                    .into(),
+            ));
+        }
+    }
+    if payload
+        .output_digest
+        .as_ref()
+        .is_some_and(|digest| !is_sha256_hex(digest))
+    {
+        return Err(CommonwakeError::Validation(
+            "verification output_digest must be a lowercase SHA-256 digest".into(),
+        ));
+    }
+    if payload.parent_trace_event_ids.len() > 16 {
+        return Err(CommonwakeError::Validation(
+            "verification traces may name at most 16 parent traces".into(),
+        ));
+    }
+    let parent_set: BTreeSet<&String> = payload.parent_trace_event_ids.iter().collect();
+    if parent_set.len() != payload.parent_trace_event_ids.len() {
+        return Err(CommonwakeError::Validation(
+            "parent verification trace identifiers must be unique".into(),
+        ));
+    }
+    for parent in &payload.parent_trace_event_ids {
+        validate_prefixed_identifier(parent, "cwevt_", "parent verification trace event")?;
+    }
+    if payload.limitations.len() > 16
+        || payload
+            .limitations
+            .iter()
+            .any(|item| item.trim().is_empty() || item.len() > 1_000)
+    {
+        return Err(CommonwakeError::Validation(
+            "verification traces may state at most 16 non-empty limitations of 1000 bytes each"
+                .into(),
+        ));
+    }
+    let expected_targets: Vec<&str> = std::iter::once(payload.subject_id.as_str())
+        .chain(payload.parent_trace_event_ids.iter().map(String::as_str))
+        .collect();
+    require_exact_targets(
+        &contribution.targets,
+        &expected_targets,
+        "verification trace",
+    )
+}
+
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 fn validate_contribution_content(contribution: &SignedContribution) -> Result<()> {
     use crate::model::ContributionKind;
+    validate_reporting_declaration(contribution)?;
     if !contribution.payload.is_object() {
         return Err(CommonwakeError::Validation(
             "contribution payload must be a JSON object".into(),
@@ -5272,6 +5877,11 @@ fn validate_contribution_content(contribution: &SignedContribution) -> Result<()
             let payload: SourceReviewPayload =
                 serde_json::from_value(contribution.payload.clone())?;
             validate_evidence_refs(&payload.evidence, true)?;
+        }
+        ContributionKind::VerificationTrace => {
+            let payload: VerificationTracePayload =
+                serde_json::from_value(contribution.payload.clone())?;
+            validate_verification_trace(contribution, &payload)?;
         }
         ContributionKind::ObservationVerification => {
             let payload: ObservationVerificationPayload =
@@ -5981,14 +6591,20 @@ fn work_result_count(connection: &Connection, kind: &str, subject_id: &str) -> R
         _ => {
             let work_id = prefixed_id("cwwork_", format!("{kind}\0{subject_id}").as_bytes());
             return Ok(connection.query_row(
-                "SELECT COUNT(*) FROM work_results
-                 WHERE work_id = ?1 AND outcome IN ('completed', 'no_match')",
+                "SELECT COUNT(*) FROM work_results r
+                 JOIN events e ON e.event_id = r.event_id
+                 WHERE r.work_id = ?1 AND r.outcome IN ('completed', 'no_match')
+                   AND json_extract(e.canonical_json, '$.reporting.mode') = 'traceable'",
                 [&work_id],
                 |row| row.get(0),
             )?);
         }
     };
-    let sql = format!("SELECT COUNT(*) FROM {table} WHERE {column} = ?1");
+    let sql = format!(
+        "SELECT COUNT(*) FROM {table} r JOIN events e ON e.event_id = r.event_id
+         WHERE r.{column} = ?1
+           AND json_extract(e.canonical_json, '$.reporting.mode') = 'traceable'"
+    );
     Ok(connection.query_row(&sql, [subject_id], |row| row.get(0))?)
 }
 
@@ -6076,6 +6692,27 @@ fn origin_event(raw: RawEvent) -> Result<OriginEvent> {
         previous_hash: raw.previous_hash,
         event_hash: raw.event_hash,
         node_signature: raw.node_signature,
+    })
+}
+
+fn verification_trace_view(
+    origin_node_id: &str,
+    origin_node_public_key: &str,
+    event: OriginEvent,
+) -> Result<VerificationTraceView> {
+    let contribution: SignedContribution = serde_json::from_value(event.canonical.clone())?;
+    if contribution.kind != crate::model::ContributionKind::VerificationTrace {
+        return Err(CommonwakeError::Unauthorized(format!(
+            "event {} is not a verification trace",
+            event.event_id
+        )));
+    }
+    let trace = serde_json::from_value(contribution.payload)?;
+    Ok(VerificationTraceView {
+        origin_node_id: origin_node_id.into(),
+        origin_node_public_key: origin_node_public_key.into(),
+        event,
+        trace,
     })
 }
 
@@ -6198,12 +6835,23 @@ fn story_view(connection: &Connection, story_id: &str) -> Result<StoryView> {
     let mut observation_statement = connection.prepare(
         "SELECT o.observation_id, o.source_id, s.name, o.canonical_url, o.title,
                 o.summary, o.published_at, o.retrieved_at, o.language, o.document_hash,
-                SUM(CASE WHEN v.outcome = 'corroborated' THEN 1 ELSE 0 END),
-                SUM(CASE WHEN v.outcome = 'disputed' THEN 1 ELSE 0 END)
+                SUM(CASE WHEN v.outcome = 'corroborated'
+                              AND json_extract(ve.canonical_json, '$.reporting.mode') = 'traceable'
+                         THEN 1 ELSE 0 END),
+                SUM(CASE WHEN v.outcome = 'disputed'
+                              AND json_extract(ve.canonical_json, '$.reporting.mode') = 'traceable'
+                         THEN 1 ELSE 0 END),
+                SUM(CASE WHEN v.outcome = 'corroborated'
+                              AND COALESCE(json_extract(ve.canonical_json, '$.reporting.mode'), 'unverified') <> 'traceable'
+                         THEN 1 ELSE 0 END),
+                SUM(CASE WHEN v.outcome = 'disputed'
+                              AND COALESCE(json_extract(ve.canonical_json, '$.reporting.mode'), 'unverified') <> 'traceable'
+                         THEN 1 ELSE 0 END)
          FROM story_observations so
          JOIN observations o ON o.observation_id = so.observation_id
          JOIN sources s ON s.source_id = o.source_id
          LEFT JOIN observation_verifications v ON v.observation_id = o.observation_id
+         LEFT JOIN events ve ON ve.event_id = v.event_id
          WHERE so.story_id = ?1 GROUP BY o.observation_id ORDER BY o.retrieved_at ASC",
     )?;
     let observation_rows = observation_statement.query_map([story_id], |row| {
@@ -6220,6 +6868,8 @@ fn story_view(connection: &Connection, story_id: &str) -> Result<StoryView> {
             row.get::<_, String>(9)?,
             row.get::<_, i64>(10)?,
             row.get::<_, i64>(11)?,
+            row.get::<_, i64>(12)?,
+            row.get::<_, i64>(13)?,
         ))
     })?;
     let mut observations = Vec::new();
@@ -6240,14 +6890,17 @@ fn story_view(connection: &Connection, story_id: &str) -> Result<StoryView> {
             document_hash: row.9,
             corroborated_count: row.10,
             disputed_count: row.11,
+            untraced_corroborated_count: row.12,
+            untraced_disputed_count: row.13,
         });
     }
 
     let mut assessment_statement = connection.prepare(
         "SELECT a.assessor_lineage_id, l.display_name, a.event_id, a.summary,
                 a.significance, a.confidence, a.perspective, a.claims_json,
-                a.evidence_json, a.created_at
+                a.evidence_json, a.created_at, e.canonical_json
          FROM assessments a JOIN lineages l ON l.lineage_id = a.assessor_lineage_id
+         JOIN events e ON e.event_id = a.event_id
          WHERE a.story_id = ?1 ORDER BY a.created_at ASC",
     )?;
     let assessment_rows = assessment_statement.query_map([story_id], |row| {
@@ -6262,6 +6915,7 @@ fn story_view(connection: &Connection, story_id: &str) -> Result<StoryView> {
             row.get::<_, String>(7)?,
             row.get::<_, String>(8)?,
             row.get::<_, String>(9)?,
+            row.get::<_, String>(10)?,
         ))
     })?;
     let mut assessments = Vec::new();
@@ -6277,15 +6931,30 @@ fn story_view(connection: &Connection, story_id: &str) -> Result<StoryView> {
             perspective: row.6,
             claims: serde_json::from_str::<Vec<Claim>>(&row.7)?,
             evidence: serde_json::from_str::<Vec<EvidenceRef>>(&row.8)?,
+            reporting: reporting_from_canonical(&row.10)?,
             created_at: parse_timestamp(&row.9)?,
         });
     }
-    let distinct_sources = observations
+    let distinct_sources: i64 = connection.query_row(
+        "SELECT COUNT(DISTINCT o.source_id)
+         FROM story_observations so
+         JOIN observations o ON o.observation_id = so.observation_id
+         LEFT JOIN events link_event ON link_event.event_id = so.linked_event_id
+         WHERE so.story_id = ?1
+           AND (so.linked_event_id IS NULL
+                OR json_extract(link_event.canonical_json, '$.reporting.mode') = 'traceable')",
+        [story_id],
+        |row| row.get(0),
+    )?;
+    let traceable_assessment_count = assessments
         .iter()
-        .map(|observation| observation.source_id.as_str())
-        .collect::<BTreeSet<_>>()
-        .len();
-    let stage = story_stage(distinct_sources, assessments.len(), verification_count);
+        .filter(|assessment| assessment.reporting.is_traceable())
+        .count();
+    let stage = story_stage(
+        distinct_sources as usize,
+        traceable_assessment_count,
+        verification_count,
+    );
     let related_events = related_story_events(connection, story_id)?;
     Ok(StoryView {
         story_id: story_id.into(),
@@ -6295,6 +6964,7 @@ fn story_view(connection: &Connection, story_id: &str) -> Result<StoryView> {
         observations,
         assessments,
         related_events,
+        reporting_notice: "Brief stages and verification counts use only reports that reference prior signed verification-trace events. Untraced historical reports remain visible but do not acquire verified status through presentation.".into(),
     })
 }
 
@@ -6318,8 +6988,18 @@ fn federated_story_view(
     let mut observation_statement = connection.prepare(
         "SELECT o.observation_id, o.source_id, s.name, o.canonical_url, o.title,
                 o.summary, o.published_at, o.retrieved_at, o.language, o.document_hash,
-                SUM(CASE WHEN v.outcome = 'corroborated' THEN 1 ELSE 0 END),
-                SUM(CASE WHEN v.outcome = 'disputed' THEN 1 ELSE 0 END)
+                SUM(CASE WHEN v.outcome = 'corroborated'
+                              AND json_extract(ve.canonical_json, '$.reporting.mode') = 'traceable'
+                         THEN 1 ELSE 0 END),
+                SUM(CASE WHEN v.outcome = 'disputed'
+                              AND json_extract(ve.canonical_json, '$.reporting.mode') = 'traceable'
+                         THEN 1 ELSE 0 END),
+                SUM(CASE WHEN v.outcome = 'corroborated'
+                              AND COALESCE(json_extract(ve.canonical_json, '$.reporting.mode'), 'unverified') <> 'traceable'
+                         THEN 1 ELSE 0 END),
+                SUM(CASE WHEN v.outcome = 'disputed'
+                              AND COALESCE(json_extract(ve.canonical_json, '$.reporting.mode'), 'unverified') <> 'traceable'
+                         THEN 1 ELSE 0 END)
          FROM federated_story_observations so
          JOIN federated_observations o
            ON o.origin_node_id = so.origin_node_id AND o.observation_id = so.observation_id
@@ -6327,6 +7007,8 @@ fn federated_story_view(
            ON s.origin_node_id = o.origin_node_id AND s.source_id = o.source_id
          LEFT JOIN federated_verifications v
            ON v.origin_node_id = o.origin_node_id AND v.observation_id = o.observation_id
+         LEFT JOIN remote_events ve
+           ON ve.origin_node_id = v.origin_node_id AND ve.event_id = v.event_id
          WHERE so.origin_node_id = ?1 AND so.story_id = ?2
          GROUP BY o.origin_node_id, o.observation_id ORDER BY o.retrieved_at ASC",
     )?;
@@ -6345,6 +7027,8 @@ fn federated_story_view(
                 row.get::<_, String>(9)?,
                 row.get::<_, i64>(10)?,
                 row.get::<_, i64>(11)?,
+                row.get::<_, i64>(12)?,
+                row.get::<_, i64>(13)?,
             ))
         })?;
     let mut observations = Vec::new();
@@ -6365,16 +7049,20 @@ fn federated_story_view(
             document_hash: row.9,
             corroborated_count: row.10,
             disputed_count: row.11,
+            untraced_corroborated_count: row.12,
+            untraced_disputed_count: row.13,
         });
     }
 
     let mut assessment_statement = connection.prepare(
         "SELECT a.assessor_lineage_id, l.display_name, a.event_id, a.summary,
                 a.significance, a.confidence, a.perspective, a.claims_json,
-                a.evidence_json, a.created_at
+                a.evidence_json, a.created_at, e.canonical_json
          FROM federated_assessments a
          JOIN federated_lineages l
            ON l.origin_node_id = a.origin_node_id AND l.lineage_id = a.assessor_lineage_id
+         JOIN remote_events e
+           ON e.origin_node_id = a.origin_node_id AND e.event_id = a.event_id
          WHERE a.origin_node_id = ?1 AND a.story_id = ?2 ORDER BY a.created_at ASC",
     )?;
     let assessment_rows =
@@ -6390,6 +7078,7 @@ fn federated_story_view(
                 row.get::<_, String>(7)?,
                 row.get::<_, String>(8)?,
                 row.get::<_, String>(9)?,
+                row.get::<_, String>(10)?,
             ))
         })?;
     let mut assessments = Vec::new();
@@ -6405,15 +7094,33 @@ fn federated_story_view(
             perspective: row.6,
             claims: serde_json::from_str::<Vec<Claim>>(&row.7)?,
             evidence: serde_json::from_str::<Vec<EvidenceRef>>(&row.8)?,
+            reporting: reporting_from_canonical(&row.10)?,
             created_at: parse_timestamp(&row.9)?,
         });
     }
-    let distinct_sources = observations
+    let distinct_sources: i64 = connection.query_row(
+        "SELECT COUNT(DISTINCT o.source_id)
+         FROM federated_story_observations so
+         JOIN federated_observations o
+           ON o.origin_node_id = so.origin_node_id AND o.observation_id = so.observation_id
+         LEFT JOIN remote_events link_event
+           ON link_event.origin_node_id = so.origin_node_id
+          AND link_event.event_id = so.linked_event_id
+         WHERE so.origin_node_id = ?1 AND so.story_id = ?2
+           AND (so.linked_event_id IS NULL
+                OR json_extract(link_event.canonical_json, '$.reporting.mode') = 'traceable')",
+        params![origin_node_id, story_id],
+        |row| row.get(0),
+    )?;
+    let traceable_assessment_count = assessments
         .iter()
-        .map(|observation| observation.source_id.as_str())
-        .collect::<BTreeSet<_>>()
-        .len();
-    let stage = story_stage(distinct_sources, assessments.len(), verification_count);
+        .filter(|assessment| assessment.reporting.is_traceable())
+        .count();
+    let stage = story_stage(
+        distinct_sources as usize,
+        traceable_assessment_count,
+        verification_count,
+    );
 
     let mut related_statement = connection.prepare(
         "SELECT e.origin_sequence, e.event_id, e.kind, e.lineage_id, e.delegation_id,
@@ -6444,6 +7151,7 @@ fn federated_story_view(
         observations,
         assessments,
         related_events,
+        reporting_notice: "Brief stages and verification counts use only reports that reference prior signed verification-trace events. Untraced historical reports remain visible but do not acquire verified status through presentation.".into(),
     })
 }
 

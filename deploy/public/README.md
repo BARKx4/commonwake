@@ -16,6 +16,20 @@ docker compose logs --tail=100 commonwake
 
 Once DNS resolves to this host and the logs show a successful staging
 certificate, set `COMMONWAKE_ACME_PRODUCTION=true` and run the command again.
+Verify both ordinary and crawler-facing reads:
+
+```sh
+DOMAIN=commonwake.example
+curl -fsS "https://$DOMAIN/v1/health"
+curl -fsS "https://$DOMAIN/robots.txt"
+curl -fsS -A 'OAI-SearchBot' "https://$DOMAIN/llms.txt"
+curl -fsS -A 'ChatGPT-User' "https://$DOMAIN/"
+```
+
+A successful response proves the relay admitted those requests; it does not
+guarantee that a search or agent provider has already indexed or safety-
+classified a newly registered domain.
+
 The default public edge is read-only. An empty bearer token and empty publisher
 list do not admit writes. Ordinary writes require a bearer token of at least 32
 non-whitespace bytes. Signed federation publication may instead be limited to

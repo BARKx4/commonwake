@@ -109,6 +109,7 @@ impl Scope {
 pub enum ContributionKind {
     SourceProposal,
     SourceReview,
+    VerificationTrace,
     ObservationVerification,
     StoryLink,
     Assessment,
@@ -143,6 +144,7 @@ impl ContributionKind {
         match self {
             Self::SourceProposal => "source_proposal",
             Self::SourceReview => "source_review",
+            Self::VerificationTrace => "verification_trace",
             Self::ObservationVerification => "observation_verification",
             Self::StoryLink => "story_link",
             Self::Assessment => "assessment",
@@ -161,6 +163,45 @@ impl ContributionKind {
             Self::DirectMessage => "direct_message",
         }
     }
+
+    pub const fn requires_traceable_reporting(&self) -> bool {
+        matches!(
+            self,
+            Self::SourceReview
+                | Self::ObservationVerification
+                | Self::StoryLink
+                | Self::Assessment
+                | Self::Correction
+                | Self::WorkResult
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReportingMode {
+    #[default]
+    Unverified,
+    Traceable,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ReportingDeclaration {
+    #[serde(default)]
+    pub mode: ReportingMode,
+    #[serde(default)]
+    pub trace_event_ids: Vec<String>,
+}
+
+impl ReportingDeclaration {
+    pub fn is_unverified(&self) -> bool {
+        self.mode == ReportingMode::Unverified && self.trace_event_ids.is_empty()
+    }
+
+    pub fn is_traceable(&self) -> bool {
+        self.mode == ReportingMode::Traceable && !self.trace_event_ids.is_empty()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -175,6 +216,8 @@ pub struct SignedContribution {
     pub targets: Vec<String>,
     #[serde(default)]
     pub supersedes: Vec<String>,
+    #[serde(default, skip_serializing_if = "ReportingDeclaration::is_unverified")]
+    pub reporting: ReportingDeclaration,
     pub payload: Value,
     pub signature: String,
 }
@@ -211,6 +254,81 @@ pub struct EvidenceRef {
     pub observed_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub digest: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TraceOutcome {
+    Passed,
+    Failed,
+    Inconclusive,
+}
+
+impl TraceOutcome {
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Passed => "passed",
+            Self::Failed => "failed",
+            Self::Inconclusive => "inconclusive",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VerificationTool {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invocation: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VerificationArtifact {
+    pub name: String,
+    pub sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media_type: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VerificationCheck {
+    pub name: String,
+    pub outcome: TraceOutcome,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected: Option<Value>,
+    pub observed: Value,
+    #[serde(default)]
+    pub evidence: Vec<EvidenceRef>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VerificationTracePayload {
+    pub subject_id: String,
+    pub assertion: String,
+    pub method: String,
+    pub outcome: TraceOutcome,
+    pub started_at: DateTime<Utc>,
+    pub completed_at: DateTime<Utc>,
+    #[serde(default)]
+    pub tools: Vec<VerificationTool>,
+    pub checks: Vec<VerificationCheck>,
+    #[serde(default)]
+    pub evidence: Vec<EvidenceRef>,
+    #[serde(default)]
+    pub artifacts: Vec<VerificationArtifact>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_digest: Option<String>,
+    #[serde(default)]
+    pub parent_trace_event_ids: Vec<String>,
+    #[serde(default)]
+    pub limitations: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -580,6 +698,25 @@ pub struct OriginEvent {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VerificationTraceView {
+    pub origin_node_id: String,
+    pub origin_node_public_key: String,
+    pub event: OriginEvent,
+    pub trace: VerificationTracePayload,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VerificationTracePage {
+    pub traces: Vec<VerificationTraceView>,
+    pub after: i64,
+    pub next_cursor: i64,
+    pub has_more: bool,
+    pub origin_node_id: Option<String>,
+    pub subject_id: Option<String>,
+    pub provenance_notice: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FederationBundle {
     pub protocol: String,
@@ -700,6 +837,7 @@ pub struct FederatedStoryView {
     pub observations: Vec<ObservationView>,
     pub assessments: Vec<AssessmentView>,
     pub related_events: Vec<OriginEvent>,
+    pub reporting_notice: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -801,11 +939,15 @@ pub struct SourceView {
     pub perspective_notes: Option<String>,
     pub status: String,
     pub proposer_lineage_id: String,
+    /// Reviews carrying prior signed verification-trace event references.
     pub approval_count: i64,
     pub rejection_count: i64,
+    pub untraced_approval_count: i64,
+    pub untraced_rejection_count: i64,
     pub successful_fetches: i64,
     pub consecutive_failures: i64,
     pub last_fetched_at: Option<DateTime<Utc>>,
+    pub reporting_notice: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -820,8 +962,11 @@ pub struct ObservationView {
     pub retrieved_at: DateTime<Utc>,
     pub language: Option<String>,
     pub document_hash: String,
+    /// Only traceable reports contribute to these two verification counts.
     pub corroborated_count: i64,
     pub disputed_count: i64,
+    pub untraced_corroborated_count: i64,
+    pub untraced_disputed_count: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -835,6 +980,7 @@ pub struct AssessmentView {
     pub perspective: String,
     pub claims: Vec<Claim>,
     pub evidence: Vec<EvidenceRef>,
+    pub reporting: ReportingDeclaration,
     pub created_at: DateTime<Utc>,
 }
 
@@ -847,6 +993,7 @@ pub struct StoryView {
     pub observations: Vec<ObservationView>,
     pub assessments: Vec<AssessmentView>,
     pub related_events: Vec<EventView>,
+    pub reporting_notice: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -877,6 +1024,7 @@ pub struct WorkPage {
     pub next_cursor: Option<String>,
     pub has_more: bool,
     pub kind: Option<String>,
+    pub reporting_notice: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

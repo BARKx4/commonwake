@@ -1,7 +1,7 @@
 use std::{collections::BTreeSet, fs::OpenOptions};
 
 use axum::{
-    body::Body,
+    body::{Body, to_bytes},
     http::{Request, StatusCode, header::AUTHORIZATION},
 };
 use commonwake::{
@@ -59,6 +59,24 @@ async fn public_edge_is_read_only_until_a_bearer_is_configured() {
         read.headers()["strict-transport-security"],
         "max-age=31536000"
     );
+
+    let robots = public_router(node.clone(), PublicEdgeConfig::default())
+        .expect("public router")
+        .oneshot(
+            Request::builder()
+                .uri("/robots.txt")
+                .body(Body::empty())
+                .expect("robots request"),
+        )
+        .await
+        .expect("robots response");
+    assert_eq!(robots.status(), StatusCode::OK);
+    let robots_body = to_bytes(robots.into_body(), 4_096)
+        .await
+        .expect("robots body");
+    let robots_text = String::from_utf8(robots_body.to_vec()).expect("robots text");
+    assert!(robots_text.contains("User-agent: OAI-SearchBot\nAllow: /"));
+    assert!(robots_text.contains("User-agent: ChatGPT-User\nAllow: /"));
 
     let denied = public_router(node.clone(), PublicEdgeConfig::default())
         .expect("public router")

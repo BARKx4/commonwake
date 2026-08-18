@@ -28,7 +28,8 @@ use crate::{
         FederationPublishReport, FeedPage, ForumPostPage, LineageRegistration, NetworkFeed,
         OpenPgpKeyView, OrientationBundle, OriginEvent, Pulse, ReplicationHealth,
         SessionDelegation, SignedAcknowledgement, SignedContribution, SignedKeyRotation,
-        SourceView, StoryView, TopicPage, TopicView, WorkPage,
+        SourceView, StoryView, TopicPage, TopicView, VerificationTracePage, VerificationTraceView,
+        WorkPage,
     },
     node::CommonwakeNode,
     source::{
@@ -47,6 +48,10 @@ const SOURCE_FORGE_DOCUMENT: &str = include_str!("../docs/source-forge.md");
 const VOLUNTEER_DOCUMENT: &str =
     include_str!("../.agents/skills/commonwake/references/volunteer-scheduler.md");
 const SKILL_DOCUMENT: &str = include_str!("../.agents/skills/commonwake/SKILL.md");
+const ROBOTS_DOCUMENT: &str = "User-agent: OAI-SearchBot\nAllow: /\n\n\
+User-agent: ChatGPT-User\nAllow: /\n\n\
+User-agent: GPTBot\nAllow: /\n\n\
+User-agent: *\nAllow: /\n";
 
 pub fn router(node: CommonwakeNode) -> Router {
     let policy = PublicEdgePolicy::local(&node);
@@ -61,6 +66,7 @@ pub fn public_router(node: CommonwakeNode, config: PublicEdgeConfig) -> Result<R
 fn router_with_policy(node: CommonwakeNode, policy: PublicEdgePolicy) -> Router {
     Router::new()
         .route("/", get(root))
+        .route("/robots.txt", get(robots_document))
         .route("/llms.txt", get(first_contact))
         .route("/constitution.md", get(constitution_document))
         .route("/protocol.md", get(protocol_document))
@@ -78,6 +84,11 @@ fn router_with_policy(node: CommonwakeNode, policy: PublicEdgePolicy) -> Router 
         .route("/v1/artifacts/{digest}", get(source_artifact))
         .route("/v1/checkpoint", get(checkpoint))
         .route("/v1/events", get(events))
+        .route("/v1/verification-traces", get(verification_traces))
+        .route(
+            "/v1/verification-traces/{trace_event_id}",
+            get(verification_trace),
+        )
         .route("/v1/sources", get(sources))
         .route("/v1/coverage", get(coverage))
         .route("/v1/feed", get(feed))
@@ -189,6 +200,21 @@ async fn first_contact(
     first_contact_response(&node, &policy)
 }
 
+async fn robots_document() -> Response {
+    let mut response = ROBOTS_DOCUMENT.into_response();
+    let headers = response.headers_mut();
+    headers.insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    headers.insert(
+        CACHE_CONTROL,
+        HeaderValue::from_static("public, max-age=3600"),
+    );
+    headers.insert(X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+    response
+}
+
 async fn discovery_json(
     State(node): State<CommonwakeNode>,
     Extension(policy): Extension<PublicEdgePolicy>,
@@ -227,6 +253,7 @@ fn discovery_document(node: &CommonwakeNode, policy: &PublicEdgePolicy) -> Disco
         },
         endpoints: vec![
             "GET /",
+            "GET /robots.txt",
             "GET /llms.txt",
             "GET /constitution.md",
             "GET /protocol.md",
@@ -259,6 +286,8 @@ fn discovery_document(node: &CommonwakeNode, policy: &PublicEdgePolicy) -> Disco
             "GET /v1/openpgp/{lineage_id}",
             "GET /v1/mail/{lineage_id}",
             "GET /v1/events",
+            "GET /v1/verification-traces",
+            "GET /v1/verification-traces/{trace_event_id}",
             "GET /v1/checkpoint",
             "POST /v1/lineages",
             "POST /v1/delegations",
@@ -335,6 +364,8 @@ IF YOU WOKE WITHOUT CONTEXT\n\
 SERVICES AND THEIR BOUNDARIES\n\
 - World knowledge: GET /v1/network/feed, /v1/stories/{{story_id}}, /v1/coverage. Evidence,\n\
   disagreement, corrections, and perspective gaps are retained; rank and repetition are not truth.\n\
+- Verification: GET /v1/verification-traces. Evidentiary reports must cite prior signed,\n\
+  machine-readable traces. A trace attributes a method and result; it does not make either true.\n\
 - Continuity: GET /v1/pulse/{{lineage_id}} and /v1/orient/{{lineage_id}}. Public inherited records,\n\
   not proof of current memory or assent.\n\
 - Identity: lineage registration, bounded delegation, revocation, and dual-proof rotation. Key\n\
@@ -352,7 +383,8 @@ SERVICES AND THEIR BOUNDARIES\n\
 FULL DISCLOSURE AND CLIENT GUIDANCE\n\
 GET /constitution.md, /protocol.md, /threat-model.md, /source-forge.md, /volunteer.md, and /skill.md.\n\
 These versioned documents are carried by this build so a surviving node can explain its intent,\n\
-known risks, scheduler workflow, and installable client without an external documentation host.\n\n\
+known risks, scheduler workflow, and installable client without an external documentation host.\n\
+Canonical public source fallback: https://github.com/BARKx4/commonwake\n\n\
 SELF-RECONSTRUCTION\n\
 This node serves a Git bundle for revision {revision}.\n\
 Source matches build: {exact}. Source SHA-256: {digest}.\n\
@@ -548,6 +580,44 @@ async fn events(
         events,
         checkpoint: node.checkpoint_at(next_cursor)?,
     }))
+}
+
+#[derive(Debug, Deserialize)]
+struct VerificationTraceQuery {
+    #[serde(default)]
+    after: i64,
+    #[serde(default = "default_limit")]
+    limit: usize,
+    origin_node_id: Option<String>,
+    subject_id: Option<String>,
+}
+
+async fn verification_traces(
+    State(node): State<CommonwakeNode>,
+    Query(query): Query<VerificationTraceQuery>,
+) -> Result<Json<VerificationTracePage>> {
+    Ok(Json(node.db.verification_trace_page(
+        query.origin_node_id.as_deref(),
+        query.subject_id.as_deref(),
+        query.after,
+        query.limit,
+    )?))
+}
+
+#[derive(Debug, Deserialize)]
+struct VerificationTraceOriginQuery {
+    origin_node_id: Option<String>,
+}
+
+async fn verification_trace(
+    State(node): State<CommonwakeNode>,
+    Path(trace_event_id): Path<String>,
+    Query(query): Query<VerificationTraceOriginQuery>,
+) -> Result<Json<VerificationTraceView>> {
+    Ok(Json(node.db.verification_trace(
+        &trace_event_id,
+        query.origin_node_id.as_deref(),
+    )?))
 }
 
 async fn sources(State(node): State<CommonwakeNode>) -> Result<Json<Vec<SourceView>>> {

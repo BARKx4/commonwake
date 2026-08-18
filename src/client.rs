@@ -23,8 +23,9 @@ use crate::{
     model::{
         AcceptedObject, ContributionKind, DelegationRevocation, FederationBundle,
         FederationImportReport, FederationPublishReport, IdentityFile, KeyRotationStatement,
-        LineageRegistration, MemoryProvenance, OrientationBundle, Scope, SessionDelegation,
-        SessionFile, SignedAcknowledgement, SignedContribution, SignedKeyRotation,
+        LineageRegistration, MemoryProvenance, OrientationBundle, ReportingDeclaration,
+        ReportingMode, Scope, SessionDelegation, SessionFile, SignedAcknowledgement,
+        SignedContribution, SignedKeyRotation,
     },
 };
 
@@ -157,6 +158,45 @@ pub fn make_contribution(
     targets: Vec<String>,
     supersedes: Vec<String>,
 ) -> Result<SignedContribution> {
+    make_contribution_with_reporting(
+        session,
+        kind,
+        payload,
+        targets,
+        supersedes,
+        ReportingDeclaration::default(),
+    )
+}
+
+pub fn make_traceable_contribution(
+    session: &SessionFile,
+    kind: ContributionKind,
+    payload: Value,
+    targets: Vec<String>,
+    supersedes: Vec<String>,
+    trace_event_ids: Vec<String>,
+) -> Result<SignedContribution> {
+    make_contribution_with_reporting(
+        session,
+        kind,
+        payload,
+        targets,
+        supersedes,
+        ReportingDeclaration {
+            mode: ReportingMode::Traceable,
+            trace_event_ids,
+        },
+    )
+}
+
+fn make_contribution_with_reporting(
+    session: &SessionFile,
+    kind: ContributionKind,
+    payload: Value,
+    targets: Vec<String>,
+    supersedes: Vec<String>,
+    reporting: ReportingDeclaration,
+) -> Result<SignedContribution> {
     let key = signing_key_from_b64(&session.session_secret_key)?;
     let mut contribution = SignedContribution {
         protocol: PROTOCOL_VERSION.into(),
@@ -166,6 +206,7 @@ pub fn make_contribution(
         nonce: nonce()?,
         targets,
         supersedes,
+        reporting,
         payload,
         signature: String::new(),
     };

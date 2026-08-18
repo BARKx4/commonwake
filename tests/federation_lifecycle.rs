@@ -5,7 +5,10 @@ use axum::{
 use chrono::{Duration, SecondsFormat, Utc};
 use commonwake::{
     CommonwakeError, CommonwakeNode, PROTOCOL_VERSION,
-    client::{create_identity, make_contribution, make_registration, make_session},
+    client::{
+        create_identity, make_contribution, make_registration, make_session,
+        make_traceable_contribution,
+    },
     crypto::{
         CHECKPOINT_DOMAIN, DELEGATION_DOMAIN, event_hash, prefixed_id, sign_object,
         signing_key_from_b64,
@@ -14,7 +17,8 @@ use commonwake::{
     model::{
         AssessmentPayload, Checkpoint, Claim, ClaimStatus, ContributionKind, EvidenceRef,
         FederationBundle, ReviewRecommendation, Scope, SessionDelegation, SessionFile,
-        SourceProposalPayload, SourceReviewPayload,
+        SourceProposalPayload, SourceReviewPayload, TraceOutcome, VerificationCheck,
+        VerificationTool, VerificationTracePayload,
     },
     router,
 };
@@ -48,14 +52,64 @@ fn submit(
     payload: impl serde::Serialize,
     targets: Vec<String>,
 ) {
-    let contribution = make_contribution(
-        &actor.session,
-        kind,
-        serde_json::to_value(payload).expect("payload"),
-        targets,
-        vec![],
-    )
-    .expect("signed contribution");
+    let payload = serde_json::to_value(payload).expect("payload");
+    let contribution = if kind.requires_traceable_reporting() {
+        let subject_id = match &kind {
+            ContributionKind::SourceReview => payload["source_id"].as_str(),
+            ContributionKind::Assessment => payload["story_id"].as_str(),
+            _ => None,
+        }
+        .expect("fixture report subject");
+        let completed_at = Utc::now();
+        let trace_payload = VerificationTracePayload {
+            subject_id: subject_id.into(),
+            assertion: format!("Federation fixture checked report subject {subject_id}."),
+            method: "Deterministic inspection of the federation fixture's public evidence.".into(),
+            outcome: TraceOutcome::Passed,
+            started_at: completed_at - Duration::seconds(1),
+            completed_at,
+            tools: vec![VerificationTool {
+                name: "commonwake-federation-fixture".into(),
+                version: Some(env!("CARGO_PKG_VERSION").into()),
+                invocation: None,
+            }],
+            checks: vec![VerificationCheck {
+                name: "fixture_check".into(),
+                outcome: TraceOutcome::Passed,
+                expected: Some(json!(true)),
+                observed: json!(true),
+                evidence: vec![],
+            }],
+            evidence: vec![],
+            artifacts: vec![],
+            output_digest: None,
+            parent_trace_event_ids: vec![],
+            limitations: vec!["Protocol fixture evidence only.".into()],
+        };
+        let trace = make_contribution(
+            &actor.session,
+            ContributionKind::VerificationTrace,
+            serde_json::to_value(trace_payload).expect("trace payload"),
+            vec![subject_id.into()],
+            vec![],
+        )
+        .expect("signed verification trace");
+        let accepted_trace = node
+            .accept_contribution(&trace)
+            .expect("accepted verification trace");
+        make_traceable_contribution(
+            &actor.session,
+            kind,
+            payload,
+            targets,
+            vec![],
+            vec![accepted_trace.id],
+        )
+        .expect("signed traceable contribution")
+    } else {
+        make_contribution(&actor.session, kind, payload, targets, vec![])
+            .expect("signed contribution")
+    };
     node.accept_contribution(&contribution)
         .expect("accepted contribution");
 }
@@ -245,13 +299,18 @@ async fn signed_origin_log_carries_reviewed_news_and_agent_context_between_peers
         )
         .await
         .expect("import response");
-    assert_eq!(response.status(), StatusCode::CREATED);
-    let report: commonwake::model::FederationImportReport = serde_json::from_slice(
-        &to_bytes(response.into_body(), 1024 * 1024)
-            .await
-            .expect("import bytes"),
-    )
-    .expect("import report");
+    let status = response.status();
+    let response_bytes = to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .expect("import bytes");
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "federation import failed: {}",
+        String::from_utf8_lossy(&response_bytes)
+    );
+    let report: commonwake::model::FederationImportReport =
+        serde_json::from_slice(&response_bytes).expect("import report");
     assert_eq!(report.imported_events, bundle.events.len());
     assert_eq!(report.current_cursor, bundle.through_cursor);
     assert!(report.witness_event_id.is_some());
@@ -282,6 +341,24 @@ async fn signed_origin_log_carries_reviewed_news_and_agent_context_between_peers
     assert!(remote_story.observations[0].title.contains("governance"));
     assert_eq!(remote_story.assessments.len(), 1);
     assert!(remote_story.assessments[0].perspective.contains("regional"));
+    let assessment_trace_id = &remote_story.assessments[0].reporting.trace_event_ids[0];
+    let assessment_trace = reader
+        .db
+        .verification_trace(assessment_trace_id, Some(origin.identity.node_id()))
+        .expect("federated assessment trace");
+    assert_eq!(assessment_trace.origin_node_id, origin.identity.node_id());
+    assert_eq!(assessment_trace.trace.subject_id, remote_story.story_id);
+    assert_eq!(assessment_trace.event.event_id, *assessment_trace_id);
+    let trace_page = reader
+        .db
+        .verification_trace_page(Some(origin.identity.node_id()), None, 0, 100)
+        .expect("federated trace page");
+    assert_eq!(trace_page.traces.len(), 3);
+    assert!(
+        trace_page
+            .provenance_notice
+            .contains("does not prove the account was honest")
+    );
     let second_page = reader
         .network_feed(
             0,

@@ -16,8 +16,8 @@ use commonwake::{
         acknowledge, contribute, create_identity, delegate, delegation_id, fetch_federation_bundle,
         fetch_relayed_federation_bundle, make_acknowledgement, make_contribution,
         make_delegation_revocation, make_key_rotation, make_registration, make_session,
-        normalize_server_url, orient, read_identity, read_session, register, revoke, rotate,
-        write_secret,
+        make_traceable_contribution, normalize_server_url, orient, read_identity, read_session,
+        register, revoke, rotate, write_secret,
     },
     edge::{
         DEFAULT_PUBLIC_MAX_CONCURRENCY, DEFAULT_PUBLIC_MAX_FEDERATION_CONCURRENCY,
@@ -384,6 +384,9 @@ struct ContributeArgs {
     target: Vec<String>,
     #[arg(long)]
     supersedes: Vec<String>,
+    /// Prior signed verification-trace event ID. Repeat to publish a traceable report.
+    #[arg(long = "trace-event")]
+    trace_events: Vec<String>,
 }
 
 #[derive(Args)]
@@ -458,6 +461,7 @@ impl From<ScopeArg> for Scope {
 enum KindArg {
     SourceProposal,
     SourceReview,
+    VerificationTrace,
     ObservationVerification,
     StoryLink,
     Assessment,
@@ -482,6 +486,7 @@ impl From<KindArg> for ContributionKind {
         match value {
             KindArg::SourceProposal => Self::SourceProposal,
             KindArg::SourceReview => Self::SourceReview,
+            KindArg::VerificationTrace => Self::VerificationTrace,
             KindArg::ObservationVerification => Self::ObservationVerification,
             KindArg::StoryLink => Self::StoryLink,
             KindArg::Assessment => Self::Assessment,
@@ -609,13 +614,19 @@ async fn main() -> anyhow::Result<()> {
         Command::Contribute(args) => {
             let session = read_session(args.session)?;
             let payload = read_payload(args.payload, args.payload_file)?;
-            let contribution = make_contribution(
-                &session,
-                args.kind.into(),
-                payload,
-                args.target,
-                args.supersedes,
-            )?;
+            let kind = args.kind.into();
+            let contribution = if args.trace_events.is_empty() {
+                make_contribution(&session, kind, payload, args.target, args.supersedes)?
+            } else {
+                make_traceable_contribution(
+                    &session,
+                    kind,
+                    payload,
+                    args.target,
+                    args.supersedes,
+                    args.trace_events,
+                )?
+            };
             print_json(&contribute(&args.server, &contribution).await?)?;
         }
         Command::Ack(args) => {
