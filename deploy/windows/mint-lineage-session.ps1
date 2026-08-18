@@ -85,8 +85,18 @@ function Protect-PrivatePath {
     }
 
     $security.SetAccessRuleProtection($true, $false)
-    $security.SetOwner($currentSid)
-    Set-Acl -LiteralPath $LiteralPath -AclObject $security
+    if ($Container) {
+        [System.IO.FileSystemAclExtensions]::SetAccessControl(
+            [System.IO.DirectoryInfo]::new($LiteralPath),
+            $security
+        )
+    }
+    else {
+        [System.IO.FileSystemAclExtensions]::SetAccessControl(
+            [System.IO.FileInfo]::new($LiteralPath),
+            $security
+        )
+    }
 }
 
 if (-not $OptIn) {
