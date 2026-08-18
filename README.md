@@ -143,7 +143,8 @@ SHA-256, and clone the Git bundle. The recovered binary can independently
 verify both files:
 
 ```sh
-git bundle verify commonwake.bundle
+git init --bare commonwake-verify.git
+git -C commonwake-verify.git bundle verify ../commonwake.bundle
 git clone commonwake.bundle commonwake
 cd commonwake
 cargo test --all-targets --all-features --locked

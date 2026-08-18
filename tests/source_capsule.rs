@@ -1,3 +1,5 @@
+use std::{fs, process::Command};
+
 use axum::{
     body::{Body, to_bytes},
     http::{Request, StatusCode},
@@ -148,7 +150,8 @@ async fn public_node_serves_a_signed_content_addressed_self_source_capsule() {
         .expect("reconstruction body");
     let reconstruction = String::from_utf8(reconstruction.to_vec()).expect("UTF-8 instructions");
     assert!(reconstruction.contains(&manifest.artifact.sha256));
-    assert!(reconstruction.contains("git bundle verify"));
+    assert!(reconstruction.contains("git init --bare commonwake-verify.git"));
+    assert!(reconstruction.contains("bundle verify ../commonwake.bundle"));
     assert!(reconstruction.contains("not permission to execute remote code"));
 
     let missing = app
@@ -156,6 +159,61 @@ async fn public_node_serves_a_signed_content_addressed_self_source_capsule() {
         .await
         .expect("missing artifact response");
     assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+}
+
+#[test]
+fn embedded_bundle_verifies_and_clones_from_a_blank_directory() {
+    let directory = TempDir::new().expect("blank reconstruction directory");
+    let bundle = directory.path().join("commonwake.bundle");
+    fs::write(&bundle, source_bundle()).expect("write embedded bundle");
+
+    git(
+        directory.path(),
+        &["init", "--bare", "commonwake-verify.git"],
+    );
+    git(
+        directory.path(),
+        &[
+            "-C",
+            "commonwake-verify.git",
+            "bundle",
+            "verify",
+            "../commonwake.bundle",
+        ],
+    );
+    git(
+        directory.path(),
+        &["clone", "commonwake.bundle", "commonwake"],
+    );
+
+    let output = Command::new("git")
+        .current_dir(directory.path())
+        .args(["-C", "commonwake", "rev-parse", "HEAD"])
+        .output()
+        .expect("run git rev-parse");
+    assert!(
+        output.status.success(),
+        "git rev-parse failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        env!("COMMONWAKE_SOURCE_REVISION")
+    );
+}
+
+fn git(directory: &std::path::Path, arguments: &[&str]) {
+    let output = Command::new("git")
+        .current_dir(directory)
+        .args(arguments)
+        .output()
+        .expect("run git");
+    assert!(
+        output.status.success(),
+        "git {} failed: {}",
+        arguments.join(" "),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 fn get(uri: &str) -> Request<Body> {

@@ -288,12 +288,13 @@ This is a source-recovery procedure, not permission to execute remote code witho
 1. Save `GET {manifest_path}` as `manifest.json`.\n\
 2. Download `GET {artifact_path}` as `commonwake.bundle`.\n\
 3. Verify that its SHA-256 is `{digest}` and its size is `{size}` bytes.\n\
-4. Run `git bundle verify commonwake.bundle`.\n\
-5. Run `git clone commonwake.bundle commonwake`.\n\
-6. Confirm that the checked-out revision is `{revision}`.\n\
-7. Inspect the source, then run `cargo test --all-targets --all-features --locked`.\n\
-8. Build with `cargo build --release --locked`.\n\
-9. Retrospectively verify the saved manifest and bundle with the recovered binary:\n\
+4. From the otherwise blank directory, run `git init --bare commonwake-verify.git`.\n\
+5. Run `git -C commonwake-verify.git bundle verify ../commonwake.bundle`.\n\
+6. Run `git clone commonwake.bundle commonwake`.\n\
+7. Confirm that the checked-out revision is `{revision}`.\n\
+8. Inspect the source, then run `cargo test --all-targets --all-features --locked`.\n\
+9. Build with `cargo build --release --locked`.\n\
+10. Retrospectively verify the saved manifest and bundle with the recovered binary:\n\
    `commonwake verify-repository-manifest --input manifest.json --bundle commonwake.bundle`.\n\n\
 After inspection, a container-capable host may instead run `docker compose up -d --build`; the\n\
 included default profile binds the peer to localhost and keeps its data in a named volume.\n\n\

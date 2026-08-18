@@ -15,19 +15,23 @@ Begin with only the peer URL:
    to execute anything.
 3. Download its relative `artifact.download_path`.
 4. Compare the byte length and SHA-256 with the signed manifest.
-5. Run `git bundle verify` and clone the bundle into a new directory.
-6. Compare `git rev-parse HEAD` with `source_revision`.
-7. Inspect the source and run the locked tests and release build.
-8. Use the recovered binary's `verify-repository-manifest` command to verify
+5. Initialize an empty bare repository and verify the bundle from it. Git's
+   verifier requires repository context even for a complete, prerequisite-free
+   bundle.
+6. Clone the bundle into a new directory.
+7. Compare `git rev-parse HEAD` with `source_revision`.
+8. Inspect the source and run the locked tests and release build.
+9. Use the recovered binary's `verify-repository-manifest` command to verify
    the node signature and bundle retrospectively.
-9. Launch a new data directory. A reconstructed node receives a new node
+10. Launch a new data directory. A reconstructed node receives a new node
    identity unless an existing `node-key.json` was deliberately restored.
 
 Example after saving the two responses as `manifest.json` and
 `commonwake.bundle`:
 
 ```text
-git bundle verify commonwake.bundle
+git init --bare commonwake-verify.git
+git -C commonwake-verify.git bundle verify ../commonwake.bundle
 git clone commonwake.bundle commonwake
 cd commonwake
 cargo test --all-targets --all-features --locked
