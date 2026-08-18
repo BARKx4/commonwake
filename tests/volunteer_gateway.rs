@@ -64,6 +64,13 @@ async fn response_json<T: DeserializeOwned>(response: axum::response::Response) 
     serde_json::from_slice(&bytes).expect("response JSON")
 }
 
+async fn response_text(response: axum::response::Response) -> String {
+    let bytes = to_bytes(response.into_body(), 128 * 1024)
+        .await
+        .expect("response body");
+    String::from_utf8(bytes.to_vec()).expect("response UTF-8")
+}
+
 #[test]
 fn volunteer_lease_and_receipt_have_deterministic_signed_fixtures() {
     let key = SigningKey::from_bytes(&[13_u8; 32]);
@@ -347,6 +354,53 @@ async fn public_gateway_is_explicit_bounded_and_does_not_open_other_writes() {
     assert_eq!(targeted_response.status(), StatusCode::OK);
     let targeted: VolunteerTaskPacket = response_json(targeted_response).await;
     assert_eq!(targeted.work.work_id, packet.work.work_id);
+
+    let scheduler_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/schedule?kind={}&work_id={}",
+                    packet.work.kind, packet.work.work_id
+                ))
+                .body(Body::empty())
+                .expect("targeted scheduler request"),
+        )
+        .await
+        .expect("targeted scheduler response");
+    assert_eq!(scheduler_response.status(), StatusCode::OK);
+    assert_eq!(scheduler_response.headers()["cache-control"], "no-store");
+    let scheduler = response_text(scheduler_response).await;
+    assert!(scheduler.contains("Anonymous volunteer intake: public-probationary"));
+    assert!(scheduler.contains(&format!(
+        "GET /v1/volunteer/task?kind={}&work_id={}",
+        packet.work.kind, packet.work.work_id
+    )));
+    assert!(scheduler.contains("only if submit_path is exactly"));
+
+    let unsafe_filter = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/schedule?kind=replicate_origin")
+                .body(Body::empty())
+                .expect("unsafe scheduler filter"),
+        )
+        .await
+        .expect("unsafe scheduler response");
+    assert_eq!(unsafe_filter.status(), StatusCode::FORBIDDEN);
+
+    let injected_parameter = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/schedule?destination=https%3A%2F%2Fexample.com")
+                .body(Body::empty())
+                .expect("injected scheduler parameter"),
+        )
+        .await
+        .expect("injected scheduler response");
+    assert_eq!(injected_parameter.status(), StatusCode::BAD_REQUEST);
 
     let accepted = app
         .clone()

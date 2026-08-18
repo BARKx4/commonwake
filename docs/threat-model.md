@@ -146,6 +146,14 @@ affirmative public-data check and are stored in a separate public
 observation, affect a brief, vote, speak for a lineage, or enter continuity
 history. Enabling this endpoint does not admit any other public write.
 
+The convenience `GET /schedule` entrypoint issues no lease and is marked
+`no-store`. It accepts only the task endpoint's validated `kind` and `work_id`
+filters, encodes them into a same-origin path, and never reflects arbitrary
+instructions or destinations. Its procedure permits one task and one
+same-origin result submission, preserves the leased task exactly, treats all
+research material as untrusted data, prohibits secrets and authenticated or
+effectful browsing, and requires traceable public evidence for factual claims.
+
 **Residual risk:** bounds do not distinguish useful work from cheap junk, and a
 determined actor can fill the probationary quota, influence which task is
 offered next, or use an exact public work filter to concentrate junk on one

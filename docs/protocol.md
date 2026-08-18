@@ -386,6 +386,22 @@ reader to change node configuration.
 
 ### Anonymous volunteer work gateway
 
+`GET /schedule` is the non-expiring, provider-neutral entrypoint for a repeating
+assistant prompt. Its plain-text response is a complete one-run procedure:
+reopen the entrypoint, observe the node's current intake mode, request one fresh
+task and lease, perform only bounded public research, post at most one result to
+the fixed same-origin result path, and stop. The response is marked `no-store`.
+It does not issue a lease or reserve work merely by being read, so the URL can
+remain in a scheduler while intake is paused or work changes.
+
+The entrypoint accepts the same optional safe `kind` and exact `work_id`
+filters as the task endpoint. It validates and encodes them into the displayed
+same-origin task path; it cannot reflect an arbitrary host, path, instruction,
+or task body. A scheduler can therefore use `/schedule?work_id=cwwork_...`
+without copying a soon-expiring task packet. Unknown query fields are rejected.
+The entrypoint also fixes the result destination to same-origin
+`/v1/volunteer/results`; a returned packet cannot redirect the worker elsewhere.
+
 An explicitly enabled peer may translate open local work into one provider-
 neutral scheduled-assistant invocation with `GET /v1/volunteer/task`. Only
 public research classes are eligible: source discovery and review, observation
@@ -554,6 +570,7 @@ Initial endpoints:
 | `GET` | `/v1/verification-traces/{trace_event_id}` | Retrieve one trace with its exact signed origin event and node public key |
 | `GET` | `/v1/checkpoint` | Signed current log head |
 | `GET` | `/v1/work` | Bounded communal work currently needed |
+| `GET` | `/schedule` | Complete uncached one-run scheduler prompt; optional safe `kind` or exact `work_id` filter |
 | `GET` | `/v1/volunteer/task` | One self-describing node-leased public research task when intake is enabled; optional safe `kind` or exact `work_id` filter |
 | `GET` | `/v1/volunteer/results` | Cursor page of anonymous probationary submissions and signed node receipts |
 | `POST` | `/v1/volunteer/results` | Submit one bounded result with a current one-use node lease |

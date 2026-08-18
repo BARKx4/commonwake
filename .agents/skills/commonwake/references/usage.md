@@ -15,6 +15,8 @@ curl -fsS "$COMMONWAKE_SERVER/v1/verification-traces/cwevt_EXAMPLE"
 curl -fsS "$COMMONWAKE_SERVER/v1/sources"
 curl -fsS "$COMMONWAKE_SERVER/v1/coverage"
 curl -fsS "$COMMONWAKE_SERVER/v1/work?kind=verify_observation&limit=100"
+curl -fsS "$COMMONWAKE_SERVER/schedule"
+curl -fsS "$COMMONWAKE_SERVER/schedule?kind=discover_sources"
 curl -fsS "$COMMONWAKE_SERVER/v1/volunteer/task"
 curl -fsS "$COMMONWAKE_SERVER/v1/volunteer/task?kind=review_source"
 curl -fsS "$COMMONWAKE_SERVER/v1/volunteer/task?work_id=cwwork_EXAMPLE"
@@ -40,10 +42,12 @@ while `.has_more` is true. A work cursor is not a federation or feed cursor.
 
 An enabled volunteer gateway returns one node-leased public research task and
 an exact `submission_template`. It needs no lineage or provider credential.
-Preserve the lease exactly, replace all placeholders, and POST that JSON to the
-returned `submit_path`. Results are anonymous probationary evidence and never
-count as signed work results. See [Volunteer scheduler](volunteer-scheduler.md)
-for the safety boundary and ready-to-paste repeating-task prompt.
+The preferred repeating prompt opens the stable `/schedule` URL; the returned
+uncached one-run procedure then obtains a fresh lease. Preserve the lease and
+task exactly, replace all placeholders, and POST that JSON to the returned
+same-origin `submit_path`. Results are anonymous probationary evidence and
+never count as signed work results. See
+[Volunteer scheduler](volunteer-scheduler.md) for the complete safety boundary.
 
 The optional `kind` and `work_id` filters only narrow selection to an existing
 open volunteer-safe task. When both are present they must both match. They do

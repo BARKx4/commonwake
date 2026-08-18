@@ -155,6 +155,18 @@ pub fn volunteer_safe_work_kind(kind: &str) -> bool {
     )
 }
 
+pub fn validate_volunteer_task_filters(kind: Option<&str>, work_id: Option<&str>) -> Result<()> {
+    if kind.is_some_and(|kind| !volunteer_safe_work_kind(kind)) {
+        return Err(CommonwakeError::Forbidden(
+            "the requested work kind is not available to anonymous volunteer workers".into(),
+        ));
+    }
+    if let Some(work_id) = work_id {
+        validate_prefixed_digest(work_id, "cwwork_", "work_id")?;
+    }
+    Ok(())
+}
+
 pub fn task_digest(task: &VolunteerTaskSpec) -> Result<String> {
     Ok(sha256_hex(serde_jcs::to_vec(task).map_err(|error| {
         CommonwakeError::Internal(format!("canonical volunteer task JSON failed: {error}"))
@@ -226,14 +238,7 @@ impl CommonwakeNode {
         work_id: Option<&str>,
         issued_at: DateTime<Utc>,
     ) -> Result<VolunteerTaskPacket> {
-        if kind.is_some_and(|kind| !volunteer_safe_work_kind(kind)) {
-            return Err(CommonwakeError::Forbidden(
-                "the requested work kind is not available to anonymous volunteer workers".into(),
-            ));
-        }
-        if let Some(work_id) = work_id {
-            validate_prefixed_digest(work_id, "cwwork_", "work_id")?;
-        }
+        validate_volunteer_task_filters(kind, work_id)?;
         let work = self
             .db
             .volunteer_task_candidate(kind, work_id)?

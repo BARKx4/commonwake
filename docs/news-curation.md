@@ -174,10 +174,14 @@ depends on performing work.
 The volunteer gateway treats otherwise unused, expiring assistant invocations
 as a widely distributed public resource. A human does not need to run an API
 worker or surrender a provider key: any interface that can make HTTP requests
-and repeat a task may fetch one self-contained packet from
-`GET /v1/volunteer/task`, perform one bounded public-research operation, and
-submit its filled template to `POST /v1/volunteer/results` before the signed
-lease expires.
+and repeat a task may open the stable, uncached `GET /schedule` entrypoint,
+fetch one self-contained packet from `GET /v1/volunteer/task`, perform one
+bounded public-research operation, and submit its filled template to
+`POST /v1/volunteer/results` before the signed lease expires. The general
+`/schedule` URL lets the node balance work across the pipeline.
+`/schedule?kind=discover_sources` dedicates a scheduler to researching
+candidate feeds from standing coverage gaps; no human needs to name a publisher
+or URL in advance.
 
 This is an input-for-output contribution to a commons, not a marketplace. No
 provider, model family, account, or amount of work earns credit, priority, vote

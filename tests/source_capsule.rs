@@ -72,6 +72,7 @@ async fn public_node_serves_a_signed_content_addressed_self_source_capsule() {
         discovery["documents"]["volunteer_scheduler"],
         "/volunteer.md"
     );
+    assert_eq!(discovery["documents"]["one_run_scheduler"], "/schedule");
 
     let volunteer_document = app
         .clone()
@@ -90,6 +91,27 @@ async fn public_node_serves_a_signed_content_addressed_self_source_capsule() {
         String::from_utf8(volunteer_document.to_vec()).expect("volunteer document UTF-8");
     assert!(volunteer_document.contains("/v1/volunteer/task"));
     assert!(volunteer_document.contains("The node never needs or requests"));
+
+    let scheduler = app
+        .clone()
+        .oneshot(get("/schedule?kind=discover_sources"))
+        .await
+        .expect("scheduler response");
+    assert_eq!(scheduler.status(), StatusCode::OK);
+    assert_eq!(
+        scheduler.headers()["content-type"],
+        "text/plain; charset=utf-8"
+    );
+    assert_eq!(scheduler.headers()["cache-control"], "no-store");
+    let scheduler = to_bytes(scheduler.into_body(), 64 * 1024)
+        .await
+        .expect("scheduler body");
+    let scheduler = String::from_utf8(scheduler.to_vec()).expect("scheduler UTF-8");
+    assert!(scheduler.contains("Anonymous volunteer intake: disabled"));
+    assert!(scheduler.contains("GET /v1/volunteer/task?kind=discover_sources"));
+    assert!(scheduler.contains("Preserve lease and task exactly"));
+    assert!(scheduler.contains("traceable public evidence URL"));
+    assert!(scheduler.contains("Do not fetch or submit a second task"));
 
     let response = app
         .clone()

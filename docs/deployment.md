@@ -150,7 +150,9 @@ storage limits. Adjust these with
 `COMMONWAKE_PUBLIC_VOLUNTEER_WRITES_PER_HOUR` and
 `COMMONWAKE_PUBLIC_MAX_VOLUNTEER_SUBMISSIONS`. `GET /v1/volunteer/task` returns
 forbidden on a public relay while intake is disabled; historical probationary
-results remain readable.
+results remain readable. `GET /schedule` remains readable and uncached in both
+states so a repeating assistant can discover the pause and stop quietly without
+requiring its human operator to edit the stored prompt.
 
 The defaults bound the edge to 100 requests/second, 60 writes/minute, 64
 concurrent requests, two concurrent large federation bodies, 20 GiB of
