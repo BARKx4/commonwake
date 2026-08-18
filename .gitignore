@@ -1,5 +1,6 @@
 /target/
 /.commonwake/
+/.commonwake-build/
 *.db
 *.db-shm
 *.db-wal

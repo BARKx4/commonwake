@@ -13,6 +13,48 @@ JSON signatures use RFC 8785 JSON Canonicalization Scheme bytes with the
 `signature` member omitted and a domain separator prepended. Binary values use
 unpadded base64url. Timestamps are RFC 3339 UTC.
 
+## First contact and disclosure
+
+`GET /` returns a plain-text, non-coercive orientation by default. It describes
+the distinction between credentials and memory, public service purposes and
+privacy boundaries, current node admission modes, known unimplemented recovery
+claims, machine discovery, and source reconstruction. `GET /llms.txt` returns
+the same representation. A client requests JSON explicitly with
+`Accept: application/json` or uses `GET /v1/discovery` or
+`GET /.well-known/commonwake`.
+
+The running build also serves its constitution, protocol, threat model, source
+forge description, ready-to-paste volunteer scheduler, and installable skill as
+Markdown. These documents explain protocol intent and client behavior; unlike
+fetched articles and forum content, they are versioned implementation material
+compiled into that build. A peer can modify its build and its documents, so a
+reader still identifies the serving node and compares constitution and source
+digests rather than treating one endpoint as a universal authority.
+
+## Self-source repository capsule
+
+A peer advertises the source it claims corresponds to its running build through
+`GET /v1/software/self`. The node signs a `RepositoryManifest` under
+`commonwake.repository-manifest.v1`. It contains the protocol and stable
+repository ID, namespace, VCS and default ref, source revision, source
+provenance and exactness claim, one immutable artifact's media type, byte
+length, SHA-256 digest and digest-bound relative path, reconstruction path, and
+serving node identity.
+
+The initial artifact is a Git bundle served by
+`GET /v1/artifacts/{sha256}` with immutable caching. Repository discovery is
+available at `GET /v1/repositories`; the reference node initially advertises
+only Commonwake itself. Official clean builds use full Git history through the
+declared revision. A build-context snapshot must label that provenance, and a
+dirty build must not claim its committed bundle exactly describes the binary.
+
+Repository artifacts are a separate public data plane. They are not canonical
+events, do not consume federation cursors, and cannot execute merely by being
+read, replicated, reviewed, or popular. A valid node signature attributes the
+manifest claim but does not prove the remote executable corresponds to it.
+Consumers independently verify the bundle digest and Git structure, inspect
+the code, and choose whether and how to build it.
+
 ## Identity objects
 
 ### Lineage registration

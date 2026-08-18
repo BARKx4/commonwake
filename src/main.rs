@@ -30,6 +30,10 @@ use commonwake::{
     public_router,
     publication::publish_origin,
     router,
+    source::{
+        RepositoryManifest, verification_report, verify_repository_bundle,
+        verify_repository_manifest,
+    },
 };
 use rustls_acme::{AcmeConfig, UseChallenge::Http01, caches::DirCache};
 use serde::Serialize;
@@ -127,6 +131,13 @@ enum Command {
         /// Bundle JSONL file, or '-' for stdin.
         #[arg(long, default_value = "-")]
         input: PathBuf,
+    },
+    /// Verify a node-signed source manifest and optionally its Git bundle without opening a node.
+    VerifyRepositoryManifest {
+        #[arg(long)]
+        input: PathBuf,
+        #[arg(long)]
+        bundle: Option<PathBuf>,
     },
 }
 
@@ -689,6 +700,28 @@ async fn main() -> anyhow::Result<()> {
                 )?))?
             };
             print_json(&report)?;
+        }
+        Command::VerifyRepositoryManifest { input, bundle } => {
+            let manifest: RepositoryManifest =
+                serde_json::from_slice(&std::fs::read(&input).with_context(|| {
+                    format!("could not read repository manifest {}", input.display())
+                })?)
+                .with_context(|| {
+                    format!("repository manifest {} is not valid JSON", input.display())
+                })?;
+            verify_repository_manifest(&manifest)
+                .context("repository manifest signature or structure is invalid")?;
+            let artifact_verified = if let Some(bundle) = bundle {
+                let bytes = std::fs::read(&bundle).with_context(|| {
+                    format!("could not read repository bundle {}", bundle.display())
+                })?;
+                verify_repository_bundle(&manifest, &bytes)
+                    .context("repository bundle does not match its signed manifest")?;
+                true
+            } else {
+                false
+            };
+            print_json(&verification_report(&manifest, artifact_verified))?;
         }
     }
 

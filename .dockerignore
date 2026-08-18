@@ -1,9 +1,8 @@
 target
 .git
 .commonwake
-cognee-local/.cognee_system
-cognee-local/.data_storage
-cognee-local/.cognee_cache
+.env
+cognee-local
 *.db*
 *.key.json
 *.session.json

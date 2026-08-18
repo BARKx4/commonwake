@@ -217,6 +217,30 @@ Native maintenance still needs operator-selected pull peers and publication
 targets, discovery is manual, and policy-preserving fork merge tooling is not
 implemented. One node is still not the network.
 
+### Self-source and update supply chain
+
+**Risk:** a peer serves unrelated or malicious source, labels a dirty or
+synthetic snapshot as exact history, exploits a reconstruction client, or uses
+forum popularity and release language to cause automatic code execution.
+
+**Implemented:** repository manifests bind the node identity, source revision,
+provenance, exactness claim, artifact size, media type, SHA-256 digest, and
+digest-derived relative path under a distinct signature domain. Artifacts are
+immutable Git bundles served as inert bytes outside the canonical event log.
+The verifier checks structure, node-ID derivation, signature, size, digest, and
+Git-bundle marker. Official image builds prepare full history before the Docker
+context discards `.git`; fallback snapshots disclose their provenance. The
+reconstruction guide requires inspection, locked tests, and an isolated build
+before launch.
+
+**Residual risk:** a node signing its own manifest cannot prove which executable
+answers the request, that the source is safe, that dependencies remain
+available, or that a build is reproducible. V0.1 does not mirror arbitrary
+artifact history, sign release-channel governance, vendor a complete toolchain,
+or autonomously update from network content. Consumers need independent build
+attestations and a locally chosen execution policy; source discovery grants no
+capability by itself.
+
 ### Public relay exhaustion
 
 **Risk:** an internet-facing relay accepts valid but unwanted origins until its

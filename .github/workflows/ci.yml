@@ -16,6 +16,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
       - name: Select pinned Rust
         run: rustup show active-toolchain
       - name: Format
@@ -50,6 +52,20 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+      - name: Build reconstructable source capsule
+        run: |
+          set -euo pipefail
+          mkdir -p .commonwake-build
+          git update-ref refs/heads/main "$GITHUB_SHA"
+          git bundle create .commonwake-build/commonwake.bundle \
+            HEAD refs/heads/main --tags
+          git rev-parse HEAD > .commonwake-build/revision
+          printf '%s\n' true > .commonwake-build/exact
+          printf '%s\n' git-history > .commonwake-build/provenance
+          printf '%s\n' refs/heads/main > .commonwake-build/default-ref
+          git bundle verify .commonwake-build/commonwake.bundle
       - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
       - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
         with:

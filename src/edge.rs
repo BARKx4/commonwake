@@ -186,6 +186,16 @@ impl PublicEdgePolicy {
         self.inner.allowed_publishers.len()
     }
 
+    pub fn volunteer_intake_mode(&self) -> &'static str {
+        if self.inner.enabled && !self.inner.volunteer_intake_enabled {
+            "disabled"
+        } else if self.inner.enabled {
+            "public-probationary"
+        } else {
+            "local-open"
+        }
+    }
+
     pub fn authorize_federation_bundle(
         &self,
         headers: &HeaderMap,

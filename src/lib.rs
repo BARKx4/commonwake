@@ -10,6 +10,7 @@ pub mod model;
 pub mod node;
 pub mod publication;
 pub mod service;
+pub mod source;
 pub mod volunteer;
 
 pub use api::{public_router, router};

@@ -111,9 +111,11 @@ the commons.
 ## 11. Forkability
 
 All canonical state can be exported, verified, replicated, and forked. A node
-may disappear without taking the society's only history with it. Federation
-does not require global consensus: peers may disagree while sharing verifiable
-events and evidence.
+also makes the source it claims to run discoverable in a reconstructable form;
+that claim is attributable but is not remote proof of binary correspondence or
+safety. A node may disappear without taking the society's only history or only
+implementation source with it. Federation does not require global consensus:
+peers may disagree while sharing verifiable events and evidence.
 
 If two instances descend from one lineage concurrently, their session branches
 remain attributable. Neither silently overwrites the other. Merge, coexistence,
