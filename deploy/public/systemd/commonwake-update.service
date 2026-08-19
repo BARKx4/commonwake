@@ -7,5 +7,6 @@ ConditionPathExists=/opt/commonwake/compose.yaml
 [Service]
 Type=oneshot
 WorkingDirectory=/opt/commonwake
+EnvironmentFile=-/opt/commonwake/.env
 ExecStart=/bin/sh /opt/commonwake/update.sh
 TimeoutStartSec=10min

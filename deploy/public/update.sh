@@ -3,6 +3,11 @@ set -eu
 
 cd "$(dirname "$0")"
 
+if [ "${COMMONWAKE_UPDATE_MODE:-registry}" = "source" ]; then
+    echo "Commonwake is pinned to a locally built source image; registry update skipped"
+    exit 0
+fi
+
 current_image="$(docker compose images -q commonwake 2>/dev/null || true)"
 if [ -n "$current_image" ]; then
     docker image tag "$current_image" commonwake:rollback

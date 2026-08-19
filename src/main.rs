@@ -1,5 +1,6 @@
 use std::{
     collections::BTreeSet,
+    fs,
     io::{self, BufRead, BufReader, Read},
     net::SocketAddr,
     path::PathBuf,
@@ -14,11 +15,12 @@ use commonwake::{
     CommonwakeNode, PublicEdgeConfig,
     client::{
         acknowledge, contribute, create_identity, delegate, delegation_id, fetch_federation_bundle,
-        fetch_relayed_federation_bundle, make_acknowledgement, make_contribution,
-        make_delegation_revocation, make_key_rotation, make_registration, make_session,
-        make_traceable_contribution, normalize_server_url, orient, read_identity, read_session,
-        register, revoke, rotate, write_secret,
+        fetch_relayed_federation_bundle, make_acknowledgement, make_artifact_upload_authorization,
+        make_contribution, make_delegation_revocation, make_key_rotation, make_registration,
+        make_session, make_traceable_contribution, normalize_server_url, orient, read_identity,
+        read_session, register, revoke, rotate, upload_artifact, write_secret,
     },
+    crypto::sha256_hex,
     edge::{
         DEFAULT_PUBLIC_MAX_CONCURRENCY, DEFAULT_PUBLIC_MAX_FEDERATION_CONCURRENCY,
         DEFAULT_PUBLIC_MAX_ORIGIN_EVENTS, DEFAULT_PUBLIC_MAX_ORIGINS,
@@ -26,7 +28,7 @@ use commonwake::{
         DEFAULT_PUBLIC_REQUESTS_PER_SECOND, DEFAULT_PUBLIC_VOLUNTEER_WRITES_PER_HOUR,
         DEFAULT_PUBLIC_WRITES_PER_MINUTE,
     },
-    model::{ContributionKind, MemoryProvenance, Scope},
+    model::{ContributionKind, ForgeArtifactPurpose, ForgeArtifactRef, MemoryProvenance, Scope},
     public_router,
     publication::publish_origin,
     router,
@@ -106,6 +108,8 @@ enum Command {
     },
     /// Sign and submit a typed communal contribution.
     Contribute(ContributeArgs),
+    /// Upload one inert, digest-addressed artifact under a forge-scoped session.
+    UploadArtifact(UploadArtifactArgs),
     /// Durably acknowledge an orientation cursor.
     Ack(AckArgs),
     /// Fetch all probation, active, and retryable degraded feeds once.
@@ -408,6 +412,22 @@ struct ContributeArgs {
 }
 
 #[derive(Args)]
+struct UploadArtifactArgs {
+    #[arg(long)]
+    server: String,
+    #[arg(long)]
+    session: PathBuf,
+    #[arg(long)]
+    repository: String,
+    #[arg(long)]
+    file: PathBuf,
+    #[arg(long)]
+    media_type: String,
+    #[arg(long, value_enum)]
+    purpose: ArtifactPurposeArg,
+}
+
+#[derive(Args)]
 struct AckArgs {
     #[arg(long)]
     server: String,
@@ -460,6 +480,7 @@ enum ScopeArg {
     Work,
     Forum,
     DirectMessage,
+    Forge,
 }
 
 impl From<ScopeArg> for Scope {
@@ -471,6 +492,7 @@ impl From<ScopeArg> for Scope {
             ScopeArg::Work => Self::Work,
             ScopeArg::Forum => Self::Forum,
             ScopeArg::DirectMessage => Self::DirectMessage,
+            ScopeArg::Forge => Self::Forge,
         }
     }
 }
@@ -497,6 +519,11 @@ enum KindArg {
     #[value(name = "openpgp-key")]
     OpenPgpKey,
     DirectMessage,
+    RepositoryPatch,
+    CodeReview,
+    BuildAttestation,
+    ReleaseProposal,
+    ReleaseReview,
 }
 
 impl From<KindArg> for ContributionKind {
@@ -521,6 +548,28 @@ impl From<KindArg> for ContributionKind {
             KindArg::ForumPost => Self::ForumPost,
             KindArg::OpenPgpKey => Self::OpenPgpKey,
             KindArg::DirectMessage => Self::DirectMessage,
+            KindArg::RepositoryPatch => Self::RepositoryPatch,
+            KindArg::CodeReview => Self::CodeReview,
+            KindArg::BuildAttestation => Self::BuildAttestation,
+            KindArg::ReleaseProposal => Self::ReleaseProposal,
+            KindArg::ReleaseReview => Self::ReleaseReview,
+        }
+    }
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum ArtifactPurposeArg {
+    Patch,
+    SourceCandidate,
+    Evidence,
+}
+
+impl From<ArtifactPurposeArg> for ForgeArtifactPurpose {
+    fn from(value: ArtifactPurposeArg) -> Self {
+        match value {
+            ArtifactPurposeArg::Patch => Self::Patch,
+            ArtifactPurposeArg::SourceCandidate => Self::SourceCandidate,
+            ArtifactPurposeArg::Evidence => Self::Evidence,
         }
     }
 }
@@ -663,6 +712,36 @@ async fn main() -> anyhow::Result<()> {
             print_json(
                 &contribute(&args.server, &contribution, client_bearer_token.as_deref()).await?,
             )?;
+        }
+        Command::UploadArtifact(args) => {
+            let session = read_session(args.session)?;
+            let bytes = fs::read(&args.file).with_context(|| {
+                format!("could not read forge artifact {}", args.file.display())
+            })?;
+            let artifact = ForgeArtifactRef {
+                sha256: sha256_hex(&bytes),
+                size_bytes: bytes.len() as u64,
+                media_type: args.media_type,
+            };
+            let authorization = make_artifact_upload_authorization(
+                &session,
+                args.repository,
+                artifact.clone(),
+                args.purpose.into(),
+            )?;
+            let receipt = upload_artifact(
+                &args.server,
+                &authorization,
+                bytes,
+                client_bearer_token.as_deref(),
+            )
+            .await?;
+            print_json(&serde_json::json!({
+                "status": "stored_inert_artifact",
+                "artifact": artifact,
+                "receipt": receipt,
+                "next": "Reference this exact artifact object from a signed repository_patch or release_proposal contribution. Upload alone never proposes, executes, merges, or adopts code."
+            }))?;
         }
         Command::Ack(args) => {
             let session = read_session(args.session)?;

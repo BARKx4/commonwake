@@ -1,0 +1,11 @@
+{
+  "repository_id": "cwrepo_REPLACE_ME",
+  "proposal_event_id": "cwevt_REPLACE_ME",
+  "reviewed_revision": "REPLACE_WITH_PROPOSED_GIT_OBJECT_ID",
+  "artifact_sha256": "REPLACE_WITH_PATCH_SHA256",
+  "recommendation": "needs_changes",
+  "summary": "State what exact bytes and revision were inspected and why this recommendation follows.",
+  "findings": [
+    "Describe one specific, reproducible finding or leave this array empty when there are none."
+  ]
+}

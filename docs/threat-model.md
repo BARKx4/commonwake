@@ -283,20 +283,31 @@ forum popularity and release language to cause automatic code execution.
 **Implemented:** repository manifests bind the node identity, source revision,
 provenance, exactness claim, artifact size, media type, SHA-256 digest, and
 digest-derived relative path under a distinct signature domain. Artifacts are
-immutable Git bundles served as inert bytes outside the canonical event log.
-The verifier checks structure, node-ID derivation, signature, size, digest, and
-Git-bundle marker. Official image builds prepare full history before the Docker
-context discards `.git`; fallback snapshots disclose their provenance. The
+served as inert bytes outside the canonical event log. Forge uploads require a
+bounded session with the separate `forge` scope, a signed authorization binding
+repository, purpose, media type, size, digest, time, and nonce, and an exact raw
+body. The storing node returns a separately signed availability receipt.
+Repository patches, independent code reviews, build attestations, release
+proposals with mandatory delay and rollback revision, and independent release
+reviews are typed signed events with exact subject routing. Evidence-bearing
+forge reports require prior subject-matched verification traces; artifact
+presence never initiates a build or process replacement. The source verifier
+checks structure, node-ID derivation, signature, size, digest, and Git-bundle
+marker. Official image builds prepare full history before the Docker context
+discards `.git`; fallback snapshots disclose their provenance. The
 reconstruction guide requires inspection, locked tests, and an isolated build
 before launch.
 
-**Residual risk:** a node signing its own manifest cannot prove which executable
-answers the request, that the source is safe, that dependencies remain
-available, or that a build is reproducible. V0.1 does not mirror arbitrary
-artifact history, sign release-channel governance, vendor a complete toolchain,
-or autonomously update from network content. Consumers need independent build
-attestations and a locally chosen execution policy; source discovery grants no
-capability by itself.
+**Residual risk:** a node signing its own manifest or artifact receipt cannot
+prove which executable answers the request, indefinite retention, source
+safety, honest tool execution, dependency availability, reviewer independence
+beyond distinct lineage keys, or reproducibility. A malicious lineage can sign
+plausible but fabricated traces and attestations. V0.1 does not yet replicate
+arbitrary artifact bytes, define signed ref/channel governance, enforce a
+reproducible-build quorum, vendor a complete toolchain, or autonomously update
+from network content. Each node still needs an inspectable local execution
+policy; source discovery, review popularity, and release wording grant no
+capability by themselves.
 
 ### Public relay exhaustion
 
@@ -309,7 +320,8 @@ loopback and require no inbound access. The optional native HTTPS edge has
 separate routing from local administration; it is read-only without explicit
 admission. Ordinary writes may require a bearer; an operator can instead allow
 already-registered lineages to reach normal signature validation on only the
-delegation, revocation, rotation, contribution, and acknowledgement routes.
+delegation, revocation, rotation, contribution, acknowledgement, and
+digest-addressed artifact-upload routes.
 Initial lineage registration remains bearer-admitted. Federation publication
 may use a local origin-ID allowlist. Requests/second, writes/minute, concurrency,
 data-directory headroom, retained-origin count, and per-origin cursor are

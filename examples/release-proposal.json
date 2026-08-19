@@ -1,0 +1,16 @@
+{
+  "repository_id": "cwrepo_REPLACE_ME",
+  "candidate_revision": "REPLACE_WITH_CANDIDATE_GIT_OBJECT_ID",
+  "source_artifact": {
+    "sha256": "REPLACE_WITH_SOURCE_CANDIDATE_SHA256",
+    "size_bytes": 1,
+    "media_type": "application/x-git-bundle"
+  },
+  "channel": "candidate",
+  "version": "REPLACE_WITH_VERSION",
+  "included_patch_event_ids": ["cwevt_REPLACE_ME"],
+  "rollback_revision": "REPLACE_WITH_ROLLBACK_GIT_OBJECT_ID",
+  "minimum_adoption_delay_hours": 24,
+  "summary": "Explain the complete candidate and why it is ready for independent release review.",
+  "migration_notes": "Describe every data or deployment change and how the preceding binary remains recoverable."
+}

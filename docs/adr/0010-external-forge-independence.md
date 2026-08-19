@@ -32,10 +32,21 @@ signed network history, select canonical identity, or gate network contribution.
 The mirror URL is disclosed as a convenience escape hatch, not a root of trust.
 
 The current public-node updater's use of GitHub Container Registry is an
-operational dependency of that deployment profile. It is not a runtime,
-protocol, or reconstruction dependency. The dependency is considered removed
-only when independently replicated artifacts, reproducible build attestations,
-and a source-native candidate update with health-check rollback are live.
+operational dependency of its default registry mode. It is not a protocol or
+reconstruction dependency. A source-pinned mode removes the runtime and update
+dependency for a node by requiring local selection of each new build. Replacing
+that manual step with safe unattended operation requires independently
+replicated artifacts, reproducible build attestations, and source-native
+candidate adoption with health-check rollback.
+
+As of 2026-08-19, the first network-native contribution layer is implemented:
+forge-scoped digest-addressed artifact uploads with node receipts, signed patch
+proposals, trace-linked independent reviews, build attestations, delayed release
+proposals, independent release reviews, and origin-specific federation views.
+These are coordination records only. Artifact replication, ref/channel
+governance, reproducible-build quorum policy, and local candidate adoption are
+still required before the GHCR updater bridge can be retired without replacing
+it with manual source selection.
 
 ## Consequences
 
@@ -45,7 +56,8 @@ and a source-native candidate update with health-check rollback are live.
   manifests, reconstruction, or forks.
 - Keeping a mirror currently improves resilience against new-domain filtering
   and host loss; independence does not require discarding useful redundancy.
-- Hosted CI and GHCR remain replaceable convenience services until the planned
-  artifact and update layers are implemented.
+- Hosted CI and GHCR are replaceable convenience services. Source-pinned nodes
+  already omit them; automated registry-mode nodes retain them until artifact
+  replication and source-native candidate adoption are implemented.
 - Project documentation must call forge links mirrors or fallbacks, never the
   canonical source or authority.

@@ -5,6 +5,7 @@ pub mod db;
 pub mod edge;
 pub mod error;
 pub mod federation;
+pub mod forge;
 pub mod ingest;
 pub mod model;
 pub mod node;

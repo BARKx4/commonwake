@@ -1,0 +1,9 @@
+{
+  "repository_id": "cwrepo_REPLACE_ME",
+  "release_proposal_event_id": "cwevt_REPLACE_ME",
+  "reviewed_revision": "REPLACE_WITH_CANDIDATE_GIT_OBJECT_ID",
+  "artifact_sha256": "REPLACE_WITH_SOURCE_CANDIDATE_SHA256",
+  "recommendation": "needs_changes",
+  "summary": "State which complete candidate bundle, patch set, traces, and release claims were checked.",
+  "rollback_assessment": "Evaluate the named rollback revision, schema compatibility, health boundary, and unresolved risks."
+}

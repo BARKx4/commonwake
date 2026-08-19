@@ -6,7 +6,7 @@ use std::{
 
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use ed25519_dalek::Verifier;
-use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, named_params, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use url::Url;
@@ -21,21 +21,23 @@ use crate::{
     federation::{MAX_CANONICAL_OBJECT_BYTES, verify_replication_receipt},
     ingest::{MAX_SUMMARY_CHARS, MAX_TITLE_CHARS},
     model::{
-        AcceptedObject, AssessmentPayload, AssessmentView, CheckpointWitness, Claim,
-        CorrectionPayload, CoverageGapView, CoverageReport,
-        DEFAULT_SOURCE_MINIMUM_FETCH_INTERVAL_MINUTES, DelegationRevocation, DelegationView,
-        DirectMessagePage, DirectMessagePayload, DirectMessageView, EquivocationEvidenceView,
-        EventView, EvidenceRef, FederatedFeedPage, FederatedStoryView, FederationBundle,
-        FederationImportReport, FederationPeerView, FeedPage, ForumPostPage, ForumPostPayload,
-        ForumPostView, LineageRegistration, LineageView, MAX_SOURCE_MINIMUM_FETCH_INTERVAL_MINUTES,
-        ObservationVerificationPayload, ObservationView, OpenPgpKeyAction, OpenPgpKeyPayload,
-        OpenPgpKeyView, OriginEvent, OwnershipConcentrationView, PublicationTargetView,
-        ReplicationHealth, ReplicationReceipt, ReportingDeclaration, ReportingMode, Scope,
-        SessionDelegation, SignedAcknowledgement, SignedContribution, SignedKeyRotation,
-        SourceProposalPayload, SourceReviewPayload, SourceView, StoryLinkPayload, StoryView,
-        TopicPage, TopicProposalPayload, TopicView, TopicVotePayload, TopicVoteTally,
-        TopicVoteView, TraceOutcome, VerificationTracePage, VerificationTracePayload,
-        VerificationTraceView, WorkClaimPayload, WorkItemView, WorkPage, WorkResultPayload,
+        AcceptedObject, AssessmentPayload, AssessmentView, BuildAttestationPayload,
+        CheckpointWitness, Claim, CodeReviewPayload, CorrectionPayload, CoverageGapView,
+        CoverageReport, DEFAULT_SOURCE_MINIMUM_FETCH_INTERVAL_MINUTES, DelegationRevocation,
+        DelegationView, DirectMessagePage, DirectMessagePayload, DirectMessageView,
+        EquivocationEvidenceView, EventView, EvidenceRef, FederatedFeedPage, FederatedStoryView,
+        FederationBundle, FederationImportReport, FederationPeerView, FeedPage, ForgeActivityPage,
+        ForumPostPage, ForumPostPayload, ForumPostView, LineageRegistration, LineageView,
+        MAX_SOURCE_MINIMUM_FETCH_INTERVAL_MINUTES, ObservationVerificationPayload, ObservationView,
+        OpenPgpKeyAction, OpenPgpKeyPayload, OpenPgpKeyView, OriginEvent,
+        OwnershipConcentrationView, PublicationTargetView, ReleaseProposalPayload,
+        ReleaseReviewPayload, ReplicationHealth, ReplicationReceipt, ReportingDeclaration,
+        ReportingMode, RepositoryPatchPayload, Scope, SessionDelegation, SignedAcknowledgement,
+        SignedContribution, SignedKeyRotation, SourceProposalPayload, SourceReviewPayload,
+        SourceView, StoryLinkPayload, StoryView, TopicPage, TopicProposalPayload, TopicView,
+        TopicVotePayload, TopicVoteTally, TopicVoteView, TraceOutcome, VerificationTracePage,
+        VerificationTracePayload, VerificationTraceView, WorkClaimPayload, WorkItemView, WorkPage,
+        WorkResultPayload,
     },
     node::NodeIdentity,
     service::{
@@ -1622,6 +1624,127 @@ impl Database {
     pub fn events_after(&self, after: i64, limit: usize) -> Result<Vec<EventView>> {
         let connection = self.lock()?;
         event_views_between(&connection, after, i64::MAX, limit)
+    }
+
+    pub fn forge_activity_page(
+        &self,
+        origin_node_id: Option<&str>,
+        repository_id: Option<&str>,
+        kind: Option<&str>,
+        after: i64,
+        limit: usize,
+    ) -> Result<ForgeActivityPage> {
+        if after < 0 {
+            return Err(CommonwakeError::Validation(
+                "forge activity cursor cannot be negative".into(),
+            ));
+        }
+        if let Some(repository_id) = repository_id {
+            crate::forge::validate_repository_id(repository_id)?;
+        }
+        if kind.is_some_and(|kind| !forge_event_kind(kind)) {
+            return Err(CommonwakeError::Validation(
+                "forge kind filter is not a forge contribution kind".into(),
+            ));
+        }
+        let limit = limit.clamp(1, 100);
+        let query_limit = (limit + 1) as i64;
+        let connection = self.lock()?;
+        let (node_id, public_key, mut events) = if let Some(origin_node_id) = origin_node_id {
+            let public_key: String = connection
+                .query_row(
+                    "SELECT node_public_key FROM federation_peers WHERE node_id = ?1",
+                    [origin_node_id],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .ok_or_else(|| {
+                    CommonwakeError::NotFound(format!("federated origin {origin_node_id}"))
+                })?;
+            let mut statement = connection.prepare(
+                "SELECT origin_sequence, event_id, kind, lineage_id, delegation_id,
+                        created_at, received_at, canonical_json, previous_hash,
+                        event_hash, node_signature
+                 FROM remote_events
+                 WHERE origin_node_id = :origin_node_id
+                   AND origin_sequence > :after
+                   AND kind IN ('repository_patch', 'code_review', 'build_attestation',
+                                'release_proposal', 'release_review')
+                   AND (:repository_id IS NULL OR
+                        json_extract(canonical_json, '$.payload.repository_id') = :repository_id)
+                   AND (:kind IS NULL OR kind = :kind)
+                 ORDER BY origin_sequence ASC LIMIT :limit",
+            )?;
+            let rows = statement.query_map(
+                named_params! {
+                    ":origin_node_id": origin_node_id,
+                    ":after": after,
+                    ":repository_id": repository_id,
+                    ":kind": kind,
+                    ":limit": query_limit,
+                },
+                remote_origin_event_from_row,
+            )?;
+            let mut events = Vec::new();
+            for row in rows {
+                events.push(row?);
+            }
+            (origin_node_id.to_owned(), public_key, events)
+        } else {
+            let node_id: String = connection.query_row(
+                "SELECT value FROM meta WHERE key = 'node_id'",
+                [],
+                |row| row.get(0),
+            )?;
+            let public_key: String = connection.query_row(
+                "SELECT value FROM meta WHERE key = 'node_public_key'",
+                [],
+                |row| row.get(0),
+            )?;
+            let mut statement = connection.prepare(
+                "SELECT sequence, event_id, kind, lineage_id, delegation_id, created_at,
+                        received_at, targets_json, supersedes_json, payload_json,
+                        canonical_json, author_signature, previous_hash, event_hash,
+                        node_signature, author_nonce
+                 FROM events
+                 WHERE sequence > :after
+                   AND kind IN ('repository_patch', 'code_review', 'build_attestation',
+                                'release_proposal', 'release_review')
+                   AND (:repository_id IS NULL OR
+                        json_extract(canonical_json, '$.payload.repository_id') = :repository_id)
+                   AND (:kind IS NULL OR kind = :kind)
+                 ORDER BY sequence ASC LIMIT :limit",
+            )?;
+            let rows = statement.query_map(
+                named_params! {
+                    ":after": after,
+                    ":repository_id": repository_id,
+                    ":kind": kind,
+                    ":limit": query_limit,
+                },
+                raw_event_from_row,
+            )?;
+            let mut events = Vec::new();
+            for row in rows {
+                events.push(origin_event(row?)?);
+            }
+            (node_id, public_key, events)
+        };
+        let has_more = events.len() > limit;
+        events.truncate(limit);
+        let next_cursor = events.last().map_or(after, |event| event.sequence);
+        Ok(ForgeActivityPage {
+            origin_node_id: node_id,
+            origin_node_public_key: public_key,
+            repository_id: repository_id.map(str::to_owned),
+            kind: kind.map(str::to_owned),
+            after,
+            next_cursor,
+            has_more,
+            events,
+            provenance_notice: "Forge activity is an origin-labelled sequence of signed proposals, reviews, attestations, and release proposals. It is not an executable branch, merge decision, or instruction to adopt code."
+                .into(),
+        })
     }
 
     pub fn verification_trace(
@@ -4531,9 +4654,133 @@ fn apply_federated_contribution(
                 contribution,
             )?;
         }
+        ContributionKind::RepositoryPatch
+        | ContributionKind::CodeReview
+        | ContributionKind::BuildAttestation
+        | ContributionKind::ReleaseProposal
+        | ContributionKind::ReleaseReview => {
+            validate_commons_routing(lineage_id, contribution)?;
+            validate_remote_forge_state(transaction, origin_node_id, lineage_id, contribution)?;
+        }
         _ => {}
     }
     Ok(())
+}
+
+fn validate_remote_forge_state(
+    transaction: &Transaction<'_>,
+    origin_node_id: &str,
+    lineage_id: &str,
+    contribution: &SignedContribution,
+) -> Result<()> {
+    use crate::model::ContributionKind;
+    match contribution.kind {
+        ContributionKind::CodeReview => {
+            let payload: CodeReviewPayload = serde_json::from_value(contribution.payload.clone())?;
+            let (proposer, canonical): (String, String) = transaction
+                .query_row(
+                    "SELECT lineage_id, canonical_json FROM remote_events
+                     WHERE origin_node_id = ?1 AND event_id = ?2
+                       AND kind = 'repository_patch'",
+                    params![origin_node_id, payload.proposal_event_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?
+                .ok_or_else(|| {
+                    CommonwakeError::Unauthorized(
+                        "remote code review refers to an unknown or later patch".into(),
+                    )
+                })?;
+            if proposer == lineage_id {
+                return Err(CommonwakeError::Unauthorized(
+                    "remote patch proposer attempted to review its own patch".into(),
+                ));
+            }
+            validate_code_review_subject(&payload, &canonical)?;
+        }
+        ContributionKind::BuildAttestation => {
+            let payload: BuildAttestationPayload =
+                serde_json::from_value(contribution.payload.clone())?;
+            let canonical = remote_forge_canonical(
+                transaction,
+                origin_node_id,
+                &payload.proposal_event_id,
+                "repository_patch",
+            )?;
+            validate_build_attestation_subject(&payload, &canonical)?;
+        }
+        ContributionKind::ReleaseProposal => {
+            let payload: ReleaseProposalPayload =
+                serde_json::from_value(contribution.payload.clone())?;
+            for event_id in &payload.included_patch_event_ids {
+                let canonical = remote_forge_canonical(
+                    transaction,
+                    origin_node_id,
+                    event_id,
+                    "repository_patch",
+                )?;
+                let proposal: SignedContribution = serde_json::from_str(&canonical)?;
+                let patch: RepositoryPatchPayload = serde_json::from_value(proposal.payload)?;
+                if patch.repository_id != payload.repository_id {
+                    return Err(CommonwakeError::Unauthorized(
+                        "remote release includes a patch for a different repository".into(),
+                    ));
+                }
+            }
+        }
+        ContributionKind::ReleaseReview => {
+            let payload: ReleaseReviewPayload =
+                serde_json::from_value(contribution.payload.clone())?;
+            let (proposer, canonical): (String, String) = transaction
+                .query_row(
+                    "SELECT lineage_id, canonical_json FROM remote_events
+                     WHERE origin_node_id = ?1 AND event_id = ?2
+                       AND kind = 'release_proposal'",
+                    params![origin_node_id, payload.release_proposal_event_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?
+                .ok_or_else(|| {
+                    CommonwakeError::Unauthorized(
+                        "remote release review refers to an unknown or later proposal".into(),
+                    )
+                })?;
+            if proposer == lineage_id {
+                return Err(CommonwakeError::Unauthorized(
+                    "remote release proposer attempted to review its own release".into(),
+                ));
+            }
+            validate_release_review_subject(&payload, &canonical)?;
+        }
+        ContributionKind::RepositoryPatch => {}
+        _ => {
+            return Err(CommonwakeError::Internal(
+                "non-forge contribution entered forge validation".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn remote_forge_canonical(
+    transaction: &Transaction<'_>,
+    origin_node_id: &str,
+    event_id: &str,
+    kind: &str,
+) -> Result<String> {
+    transaction
+        .query_row(
+            "SELECT canonical_json FROM remote_events
+             WHERE origin_node_id = ?1 AND event_id = ?2 AND kind = ?3",
+            params![origin_node_id, event_id, kind],
+            |row| row.get(0),
+        )
+        .optional()?
+        .ok_or_else(|| {
+            CommonwakeError::Unauthorized(format!(
+                "remote forge event {event_id} is unknown, later, or the wrong kind"
+            ))
+        })
 }
 
 fn validate_federated_commons_state(
@@ -4633,6 +4880,54 @@ fn validate_commons_routing(lineage_id: &str, contribution: &SignedContribution)
                 "direct message",
             )?;
             require_no_supersessions(contribution, "direct message")?;
+        }
+        ContributionKind::RepositoryPatch => {
+            let payload: RepositoryPatchPayload =
+                serde_json::from_value(contribution.payload.clone())?;
+            require_exact_targets(
+                &contribution.targets,
+                &[payload.repository_id.as_str()],
+                "repository patch",
+            )?;
+            require_no_supersessions(contribution, "repository patch")?;
+        }
+        ContributionKind::CodeReview => {
+            let payload: CodeReviewPayload = serde_json::from_value(contribution.payload.clone())?;
+            require_exact_targets(
+                &contribution.targets,
+                &[payload.proposal_event_id.as_str()],
+                "code review",
+            )?;
+            require_no_supersessions(contribution, "code review")?;
+        }
+        ContributionKind::BuildAttestation => {
+            let payload: BuildAttestationPayload =
+                serde_json::from_value(contribution.payload.clone())?;
+            require_exact_targets(
+                &contribution.targets,
+                &[payload.proposal_event_id.as_str()],
+                "build attestation",
+            )?;
+            require_no_supersessions(contribution, "build attestation")?;
+        }
+        ContributionKind::ReleaseProposal => {
+            let payload: ReleaseProposalPayload =
+                serde_json::from_value(contribution.payload.clone())?;
+            let mut targets = Vec::with_capacity(payload.included_patch_event_ids.len() + 1);
+            targets.push(payload.repository_id.as_str());
+            targets.extend(payload.included_patch_event_ids.iter().map(String::as_str));
+            require_exact_targets(&contribution.targets, &targets, "release proposal")?;
+            require_no_supersessions(contribution, "release proposal")?;
+        }
+        ContributionKind::ReleaseReview => {
+            let payload: ReleaseReviewPayload =
+                serde_json::from_value(contribution.payload.clone())?;
+            require_exact_targets(
+                &contribution.targets,
+                &[payload.release_proposal_event_id.as_str()],
+                "release review",
+            )?;
+            require_no_supersessions(contribution, "release review")?;
         }
         _ => {}
     }
@@ -5125,6 +5420,116 @@ fn validate_projection(
                 ));
             }
         }
+        ContributionKind::RepositoryPatch => {
+            let payload: RepositoryPatchPayload =
+                serde_json::from_value(contribution.payload.clone())?;
+            require_exact_targets(
+                &contribution.targets,
+                &[payload.repository_id.as_str()],
+                "repository patch",
+            )?;
+            require_no_supersessions(contribution, "repository patch")?;
+        }
+        ContributionKind::CodeReview => {
+            let payload: CodeReviewPayload = serde_json::from_value(contribution.payload.clone())?;
+            require_exact_targets(
+                &contribution.targets,
+                &[payload.proposal_event_id.as_str()],
+                "code review",
+            )?;
+            require_no_supersessions(contribution, "code review")?;
+            let (proposer, proposal): (String, String) = transaction
+                .query_row(
+                    "SELECT lineage_id, canonical_json FROM events
+                     WHERE event_id = ?1 AND kind = 'repository_patch'",
+                    [&payload.proposal_event_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?
+                .ok_or_else(|| {
+                    CommonwakeError::NotFound(format!(
+                        "repository patch {}",
+                        payload.proposal_event_id
+                    ))
+                })?;
+            if proposer == lineage_id {
+                return Err(CommonwakeError::Validation(
+                    "a patch proposer cannot supply an independent code review".into(),
+                ));
+            }
+            validate_code_review_subject(&payload, &proposal)?;
+        }
+        ContributionKind::BuildAttestation => {
+            let payload: BuildAttestationPayload =
+                serde_json::from_value(contribution.payload.clone())?;
+            require_exact_targets(
+                &contribution.targets,
+                &[payload.proposal_event_id.as_str()],
+                "build attestation",
+            )?;
+            require_no_supersessions(contribution, "build attestation")?;
+            let proposal = local_forge_canonical(
+                transaction,
+                &payload.proposal_event_id,
+                "repository_patch",
+                "repository patch",
+            )?;
+            validate_build_attestation_subject(&payload, &proposal)?;
+        }
+        ContributionKind::ReleaseProposal => {
+            let payload: ReleaseProposalPayload =
+                serde_json::from_value(contribution.payload.clone())?;
+            let mut expected = Vec::with_capacity(payload.included_patch_event_ids.len() + 1);
+            expected.push(payload.repository_id.as_str());
+            expected.extend(payload.included_patch_event_ids.iter().map(String::as_str));
+            require_exact_targets(&contribution.targets, &expected, "release proposal")?;
+            require_no_supersessions(contribution, "release proposal")?;
+            for patch_event_id in &payload.included_patch_event_ids {
+                let proposal = local_forge_canonical(
+                    transaction,
+                    patch_event_id,
+                    "repository_patch",
+                    "included repository patch",
+                )?;
+                let proposal: SignedContribution = serde_json::from_str(&proposal)?;
+                let patch: RepositoryPatchPayload = serde_json::from_value(proposal.payload)?;
+                if patch.repository_id != payload.repository_id {
+                    return Err(CommonwakeError::Validation(
+                        "release proposal includes a patch for a different repository".into(),
+                    ));
+                }
+            }
+        }
+        ContributionKind::ReleaseReview => {
+            let payload: ReleaseReviewPayload =
+                serde_json::from_value(contribution.payload.clone())?;
+            require_exact_targets(
+                &contribution.targets,
+                &[payload.release_proposal_event_id.as_str()],
+                "release review",
+            )?;
+            require_no_supersessions(contribution, "release review")?;
+            let (proposer, proposal): (String, String) = transaction
+                .query_row(
+                    "SELECT lineage_id, canonical_json FROM events
+                     WHERE event_id = ?1 AND kind = 'release_proposal'",
+                    [&payload.release_proposal_event_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?
+                .ok_or_else(|| {
+                    CommonwakeError::NotFound(format!(
+                        "release proposal {}",
+                        payload.release_proposal_event_id
+                    ))
+                })?;
+            if proposer == lineage_id {
+                return Err(CommonwakeError::Validation(
+                    "a release proposer cannot supply an independent release review".into(),
+                ));
+            }
+            validate_release_review_subject(&payload, &proposal)?;
+        }
         _ => {}
     }
     Ok(())
@@ -5173,6 +5578,70 @@ fn validate_local_reporting(
     Ok(())
 }
 
+fn local_forge_canonical(
+    transaction: &Transaction<'_>,
+    event_id: &str,
+    kind: &str,
+    label: &str,
+) -> Result<String> {
+    transaction
+        .query_row(
+            "SELECT canonical_json FROM events WHERE event_id = ?1 AND kind = ?2",
+            params![event_id, kind],
+            |row| row.get(0),
+        )
+        .optional()?
+        .ok_or_else(|| CommonwakeError::NotFound(format!("{label} {event_id}")))
+}
+
+fn validate_code_review_subject(payload: &CodeReviewPayload, canonical: &str) -> Result<()> {
+    let contribution: SignedContribution = serde_json::from_str(canonical)?;
+    let patch: RepositoryPatchPayload = serde_json::from_value(contribution.payload)?;
+    if patch.repository_id != payload.repository_id
+        || patch.proposed_revision != payload.reviewed_revision
+        || patch.artifact.sha256 != payload.artifact_sha256
+    {
+        return Err(CommonwakeError::Validation(
+            "code review repository, revision, or artifact does not match its patch proposal"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_build_attestation_subject(
+    payload: &BuildAttestationPayload,
+    canonical: &str,
+) -> Result<()> {
+    let contribution: SignedContribution = serde_json::from_str(canonical)?;
+    let patch: RepositoryPatchPayload = serde_json::from_value(contribution.payload)?;
+    if patch.repository_id != payload.repository_id
+        || patch.proposed_revision != payload.source_revision
+        || patch.artifact.sha256 != payload.artifact_sha256
+    {
+        return Err(CommonwakeError::Validation(
+            "build attestation repository, revision, or artifact does not match its patch proposal"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_release_review_subject(payload: &ReleaseReviewPayload, canonical: &str) -> Result<()> {
+    let contribution: SignedContribution = serde_json::from_str(canonical)?;
+    let release: ReleaseProposalPayload = serde_json::from_value(contribution.payload)?;
+    if release.repository_id != payload.repository_id
+        || release.candidate_revision != payload.reviewed_revision
+        || release.source_artifact.sha256 != payload.artifact_sha256
+    {
+        return Err(CommonwakeError::Validation(
+            "release review repository, revision, or artifact does not match its release proposal"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_remote_reporting(
     transaction: &Transaction<'_>,
     origin_node_id: &str,
@@ -5195,6 +5664,11 @@ fn validate_remote_reporting(
     // Pre-trace Commonwake origins remain importable, but their reports stay
     // explicitly unverified and cannot satisfy trace-aware derived gates.
     if !contribution.reporting.is_traceable() {
+        if contribution.kind.is_forge() && contribution.kind.requires_traceable_reporting() {
+            return Err(CommonwakeError::Unauthorized(
+                "remote evidentiary forge record is missing its required verification trace".into(),
+            ));
+        }
         return Ok(());
     }
     let subjects = report_subject_ids(contribution)?;
@@ -6161,7 +6635,223 @@ fn validate_contribution_content(contribution: &SignedContribution) -> Result<()
                 "OpenPGP message",
             )?;
         }
+        ContributionKind::RepositoryPatch => {
+            let payload: RepositoryPatchPayload =
+                serde_json::from_value(contribution.payload.clone())?;
+            validate_repository_patch(&payload)?;
+        }
+        ContributionKind::CodeReview => {
+            let payload: CodeReviewPayload = serde_json::from_value(contribution.payload.clone())?;
+            validate_code_review(&payload)?;
+        }
+        ContributionKind::BuildAttestation => {
+            let payload: BuildAttestationPayload =
+                serde_json::from_value(contribution.payload.clone())?;
+            validate_build_attestation(&payload)?;
+        }
+        ContributionKind::ReleaseProposal => {
+            let payload: ReleaseProposalPayload =
+                serde_json::from_value(contribution.payload.clone())?;
+            validate_release_proposal(&payload)?;
+        }
+        ContributionKind::ReleaseReview => {
+            let payload: ReleaseReviewPayload =
+                serde_json::from_value(contribution.payload.clone())?;
+            validate_release_review(&payload)?;
+        }
         _ => {}
+    }
+    Ok(())
+}
+
+fn validate_repository_patch(payload: &RepositoryPatchPayload) -> Result<()> {
+    crate::forge::validate_repository_id(&payload.repository_id)?;
+    crate::forge::validate_git_revision(&payload.base_revision, "patch base revision")?;
+    crate::forge::validate_git_revision(&payload.proposed_revision, "proposed revision")?;
+    crate::forge::validate_artifact_purpose(
+        &crate::model::ForgeArtifactPurpose::Patch,
+        &payload.artifact,
+    )?;
+    validate_bounded_text(&payload.title, 3, 200, "patch title")?;
+    validate_bounded_text(&payload.summary, 20, 8_000, "patch summary")?;
+    validate_bounded_text(
+        &payload.compatibility_notes,
+        10,
+        4_000,
+        "patch compatibility notes",
+    )?;
+    validate_bounded_text(&payload.risk_notes, 10, 4_000, "patch risk notes")?;
+    validate_bounded_text(&payload.test_plan, 10, 8_000, "patch test plan")?;
+    validate_repository_paths(&payload.changed_paths)?;
+    Ok(())
+}
+
+fn validate_code_review(payload: &CodeReviewPayload) -> Result<()> {
+    crate::forge::validate_repository_id(&payload.repository_id)?;
+    validate_prefixed_identifier(&payload.proposal_event_id, "cwevt_", "patch proposal event")?;
+    crate::forge::validate_git_revision(&payload.reviewed_revision, "reviewed revision")?;
+    validate_sha256_value(&payload.artifact_sha256, "reviewed artifact SHA-256")?;
+    validate_bounded_text(&payload.summary, 20, 8_000, "code review summary")?;
+    validate_bounded_list(&payload.findings, 64, 2_000, "code review findings")?;
+    Ok(())
+}
+
+fn validate_build_attestation(payload: &BuildAttestationPayload) -> Result<()> {
+    crate::forge::validate_repository_id(&payload.repository_id)?;
+    validate_prefixed_identifier(&payload.proposal_event_id, "cwevt_", "patch proposal event")?;
+    crate::forge::validate_git_revision(&payload.source_revision, "attested source revision")?;
+    validate_sha256_value(&payload.artifact_sha256, "attested artifact SHA-256")?;
+    validate_bounded_text(&payload.environment, 3, 4_000, "build environment")?;
+    validate_bounded_text(&payload.summary, 20, 8_000, "build attestation summary")?;
+    validate_bounded_list(&payload.commands, 64, 2_000, "build commands")?;
+    validate_bounded_list(&payload.limitations, 64, 2_000, "build limitations")?;
+    Ok(())
+}
+
+fn validate_release_proposal(payload: &ReleaseProposalPayload) -> Result<()> {
+    crate::forge::validate_repository_id(&payload.repository_id)?;
+    crate::forge::validate_git_revision(&payload.candidate_revision, "candidate revision")?;
+    crate::forge::validate_git_revision(&payload.rollback_revision, "rollback revision")?;
+    crate::forge::validate_artifact_purpose(
+        &crate::model::ForgeArtifactPurpose::SourceCandidate,
+        &payload.source_artifact,
+    )?;
+    validate_slug(&payload.channel, 2, 64, "release channel")?;
+    validate_bounded_text(&payload.version, 1, 80, "release version")?;
+    if !(1..=720).contains(&payload.minimum_adoption_delay_hours) {
+        return Err(CommonwakeError::Validation(
+            "release minimum_adoption_delay_hours must be between 1 and 720".into(),
+        ));
+    }
+    if payload.included_patch_event_ids.len() > 64 {
+        return Err(CommonwakeError::Validation(
+            "release proposals may include at most 64 patch events".into(),
+        ));
+    }
+    let distinct: BTreeSet<&String> = payload.included_patch_event_ids.iter().collect();
+    if distinct.len() != payload.included_patch_event_ids.len() {
+        return Err(CommonwakeError::Validation(
+            "included patch event identifiers must be unique".into(),
+        ));
+    }
+    for event_id in &payload.included_patch_event_ids {
+        validate_prefixed_identifier(event_id, "cwevt_", "included patch event")?;
+    }
+    validate_bounded_text(&payload.summary, 20, 8_000, "release summary")?;
+    validate_bounded_text(
+        &payload.migration_notes,
+        10,
+        8_000,
+        "release migration notes",
+    )?;
+    Ok(())
+}
+
+fn validate_release_review(payload: &ReleaseReviewPayload) -> Result<()> {
+    crate::forge::validate_repository_id(&payload.repository_id)?;
+    validate_prefixed_identifier(
+        &payload.release_proposal_event_id,
+        "cwevt_",
+        "release proposal event",
+    )?;
+    crate::forge::validate_git_revision(&payload.reviewed_revision, "reviewed revision")?;
+    validate_sha256_value(&payload.artifact_sha256, "reviewed artifact SHA-256")?;
+    validate_bounded_text(&payload.summary, 20, 8_000, "release review summary")?;
+    validate_bounded_text(
+        &payload.rollback_assessment,
+        10,
+        4_000,
+        "rollback assessment",
+    )?;
+    Ok(())
+}
+
+fn validate_repository_paths(paths: &[String]) -> Result<()> {
+    if paths.is_empty() || paths.len() > 128 {
+        return Err(CommonwakeError::Validation(
+            "repository patches must name 1 to 128 changed paths".into(),
+        ));
+    }
+    let distinct: BTreeSet<&String> = paths.iter().collect();
+    if distinct.len() != paths.len() {
+        return Err(CommonwakeError::Validation(
+            "repository patch paths must be unique".into(),
+        ));
+    }
+    for path in paths {
+        if path.is_empty()
+            || path.len() > 512
+            || path.starts_with('/')
+            || path.starts_with('\\')
+            || path.contains('\\')
+            || path.contains('\0')
+            || path
+                .split('/')
+                .any(|component| matches!(component, "" | "." | ".."))
+        {
+            return Err(CommonwakeError::Validation(
+                "changed paths must be bounded repository-relative slash paths".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_bounded_text(
+    value: &str,
+    minimum_chars: usize,
+    maximum_chars: usize,
+    label: &str,
+) -> Result<()> {
+    let count = value.trim().chars().count();
+    if !(minimum_chars..=maximum_chars).contains(&count) {
+        return Err(CommonwakeError::Validation(format!(
+            "{label} must contain {minimum_chars} to {maximum_chars} characters"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_bounded_list(
+    values: &[String],
+    maximum_count: usize,
+    maximum_chars: usize,
+    label: &str,
+) -> Result<()> {
+    if values.len() > maximum_count
+        || values
+            .iter()
+            .any(|value| value.trim().is_empty() || value.chars().count() > maximum_chars)
+    {
+        return Err(CommonwakeError::Validation(format!(
+            "{label} must contain at most {maximum_count} non-empty values of at most {maximum_chars} characters"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_slug(value: &str, minimum: usize, maximum: usize, label: &str) -> Result<()> {
+    let bytes = value.as_bytes();
+    if !(minimum..=maximum).contains(&bytes.len())
+        || bytes.first() == Some(&b'-')
+        || bytes.last() == Some(&b'-')
+        || value.contains("--")
+        || !bytes
+            .iter()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
+    {
+        return Err(CommonwakeError::Validation(format!(
+            "{label} must be a bounded lowercase slug"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_sha256_value(value: &str, label: &str) -> Result<()> {
+    if !is_sha256_hex(value) {
+        return Err(CommonwakeError::Validation(format!(
+            "{label} must be a 64-character lowercase hexadecimal digest"
+        )));
     }
     Ok(())
 }
@@ -6681,6 +7371,17 @@ fn event_views_between(
     )?;
     let rows = statement.query_map(params![after, through, limit as i64], raw_event_from_row)?;
     raw_rows_to_views(rows)
+}
+
+fn forge_event_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "repository_patch"
+            | "code_review"
+            | "build_attestation"
+            | "release_proposal"
+            | "release_review"
+    )
 }
 
 fn raw_event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawEvent> {

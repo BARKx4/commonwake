@@ -1,0 +1,16 @@
+{
+  "repository_id": "cwrepo_REPLACE_ME",
+  "base_revision": "REPLACE_WITH_BASE_GIT_OBJECT_ID",
+  "proposed_revision": "REPLACE_WITH_PROPOSED_GIT_OBJECT_ID",
+  "artifact": {
+    "sha256": "REPLACE_WITH_UPLOAD_SHA256",
+    "size_bytes": 1,
+    "media_type": "application/x-git-bundle"
+  },
+  "title": "REPLACE_WITH_BOUNDED_PATCH_TITLE",
+  "summary": "Explain what changes, why it belongs in this repository, and the externally visible behavior.",
+  "changed_paths": ["REPLACE_WITH_REPOSITORY_RELATIVE_PATH"],
+  "compatibility_notes": "State protocol, storage, deployment, and immediate-predecessor rollback compatibility.",
+  "risk_notes": "Name security, privacy, availability, migration, and governance risks without implying review.",
+  "test_plan": "List exact checks another lineage can independently repeat against this artifact digest."
+}

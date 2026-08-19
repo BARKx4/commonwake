@@ -14,15 +14,21 @@ use url::Url;
 use crate::{
     PROTOCOL_VERSION,
     crypto::{
-        ACK_DOMAIN, CONTRIBUTION_DOMAIN, DELEGATION_DOMAIN, KEY_ROTATION_DOMAIN, LINEAGE_DOMAIN,
-        REVOCATION_DOMAIN, canonical_without_signature, encode, generate_signing_key, lineage_id,
-        prefixed_id, random_32, sign_object, signing_key_from_b64,
+        ACK_DOMAIN, ARTIFACT_UPLOAD_DOMAIN, CONTRIBUTION_DOMAIN, DELEGATION_DOMAIN,
+        KEY_ROTATION_DOMAIN, LINEAGE_DOMAIN, REVOCATION_DOMAIN, canonical_without_signature,
+        encode, generate_signing_key, lineage_id, prefixed_id, random_32, sign_object,
+        signing_key_from_b64,
     },
     error::{CommonwakeError, Result},
     federation::{MAX_FEDERATION_BODY_BYTES, MAX_FEDERATION_EVENTS},
+    forge::{
+        ARTIFACT_AUTHORIZATION_HEADER, encode_artifact_authorization, validate_artifact_purpose,
+        validate_repository_id,
+    },
     model::{
-        AcceptedObject, ContributionKind, DelegationRevocation, FederationBundle,
-        FederationImportReport, FederationPublishReport, IdentityFile, KeyRotationStatement,
+        AcceptedObject, ArtifactReceipt, ArtifactUploadAuthorization, ContributionKind,
+        DelegationRevocation, FederationBundle, FederationImportReport, FederationPublishReport,
+        ForgeArtifactPurpose, ForgeArtifactRef, IdentityFile, KeyRotationStatement,
         LineageRegistration, MemoryProvenance, OrientationBundle, ReportingDeclaration,
         ReportingMode, Scope, SessionDelegation, SessionFile, SignedAcknowledgement,
         SignedContribution, SignedKeyRotation,
@@ -214,6 +220,29 @@ fn make_contribution_with_reporting(
     Ok(contribution)
 }
 
+pub fn make_artifact_upload_authorization(
+    session: &SessionFile,
+    repository_id: String,
+    artifact: ForgeArtifactRef,
+    purpose: ForgeArtifactPurpose,
+) -> Result<ArtifactUploadAuthorization> {
+    validate_repository_id(&repository_id)?;
+    validate_artifact_purpose(&purpose, &artifact)?;
+    let key = signing_key_from_b64(&session.session_secret_key)?;
+    let mut authorization = ArtifactUploadAuthorization {
+        protocol: PROTOCOL_VERSION.into(),
+        delegation_id: delegation_id(session)?,
+        repository_id,
+        artifact,
+        purpose,
+        created_at: Utc::now(),
+        nonce: nonce()?,
+        signature: String::new(),
+    };
+    authorization.signature = sign_object(&key, ARTIFACT_UPLOAD_DOMAIN, &authorization)?;
+    Ok(authorization)
+}
+
 pub fn make_acknowledgement(
     session: &SessionFile,
     cursor: i64,
@@ -271,6 +300,32 @@ pub async fn contribute(
     bearer_token: Option<&str>,
 ) -> Result<AcceptedObject> {
     post_json(server, "v1/contributions", contribution, bearer_token).await
+}
+
+pub async fn upload_artifact(
+    server: &str,
+    authorization: &ArtifactUploadAuthorization,
+    bytes: Vec<u8>,
+    bearer_token: Option<&str>,
+) -> Result<ArtifactReceipt> {
+    let path = format!("v1/artifacts/{}", authorization.artifact.sha256);
+    let mut request = http_client()?
+        .post(endpoint(server, &path)?)
+        .header(
+            ARTIFACT_AUTHORIZATION_HEADER,
+            encode_artifact_authorization(authorization)?,
+        )
+        .header("content-type", &authorization.artifact.media_type)
+        .body(bytes);
+    if let Some(token) = bearer_token {
+        if token.is_empty() {
+            return Err(CommonwakeError::Validation(
+                "client bearer token cannot be empty".into(),
+            ));
+        }
+        request = request.bearer_auth(token);
+    }
+    decode_response(request.send().await?).await
 }
 
 pub async fn acknowledge(

@@ -1,0 +1,11 @@
+{
+  "repository_id": "cwrepo_REPLACE_ME",
+  "proposal_event_id": "cwevt_REPLACE_ME",
+  "source_revision": "REPLACE_WITH_PROPOSED_GIT_OBJECT_ID",
+  "artifact_sha256": "REPLACE_WITH_PATCH_SHA256",
+  "outcome": "inconclusive",
+  "environment": "Disclose operating system, architecture, toolchain versions, dependency mode, and relevant isolation.",
+  "summary": "Report what actually built or failed for the exact artifact; do not infer checks that were not run.",
+  "commands": ["REPLACE_WITH_ACTUAL_BOUNDED_COMMAND"],
+  "limitations": ["State missing architectures, dependencies, credentials, services, or reproducibility comparisons."]
+}

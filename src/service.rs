@@ -128,6 +128,7 @@ impl CommonwakeNode {
             contribution,
             &contribution.signature,
         )?;
+        self.require_local_forge_artifacts(contribution)?;
         self.db
             .append_contribution(&self.identity, &delegation.lineage_id, contribution)
     }
@@ -256,7 +257,7 @@ impl CommonwakeNode {
         })
     }
 
-    fn authorize_delegation(
+    pub(crate) fn authorize_delegation(
         &self,
         delegation_id: &str,
         required_scope: Scope,
@@ -290,7 +291,7 @@ impl CommonwakeNode {
     }
 }
 
-fn require_protocol(protocol: &str) -> Result<()> {
+pub(crate) fn require_protocol(protocol: &str) -> Result<()> {
     if protocol != PROTOCOL_VERSION {
         return Err(CommonwakeError::Validation(format!(
             "unsupported protocol {protocol}; expected {PROTOCOL_VERSION}"

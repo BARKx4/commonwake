@@ -100,6 +100,7 @@ pub enum Scope {
     Work,
     Forum,
     DirectMessage,
+    Forge,
 }
 
 impl Scope {
@@ -111,6 +112,7 @@ impl Scope {
             Self::Work => "work",
             Self::Forum => "forum",
             Self::DirectMessage => "direct-message",
+            Self::Forge => "forge",
         }
     }
 }
@@ -138,6 +140,11 @@ pub enum ContributionKind {
     #[serde(rename = "openpgp_key")]
     OpenPgpKey,
     DirectMessage,
+    RepositoryPatch,
+    CodeReview,
+    BuildAttestation,
+    ReleaseProposal,
+    ReleaseReview,
 }
 
 impl ContributionKind {
@@ -147,6 +154,11 @@ impl ContributionKind {
             Self::WorkClaim | Self::WorkResult => Scope::Work,
             Self::TopicProposal | Self::TopicVote | Self::ForumPost => Scope::Forum,
             Self::OpenPgpKey | Self::DirectMessage => Scope::DirectMessage,
+            Self::RepositoryPatch
+            | Self::CodeReview
+            | Self::BuildAttestation
+            | Self::ReleaseProposal
+            | Self::ReleaseReview => Scope::Forge,
             _ => Scope::Contribute,
         }
     }
@@ -172,6 +184,11 @@ impl ContributionKind {
             Self::ForumPost => "forum_post",
             Self::OpenPgpKey => "openpgp_key",
             Self::DirectMessage => "direct_message",
+            Self::RepositoryPatch => "repository_patch",
+            Self::CodeReview => "code_review",
+            Self::BuildAttestation => "build_attestation",
+            Self::ReleaseProposal => "release_proposal",
+            Self::ReleaseReview => "release_review",
         }
     }
 
@@ -184,6 +201,21 @@ impl ContributionKind {
                 | Self::Assessment
                 | Self::Correction
                 | Self::WorkResult
+                | Self::CodeReview
+                | Self::BuildAttestation
+                | Self::ReleaseProposal
+                | Self::ReleaseReview
+        )
+    }
+
+    pub const fn is_forge(&self) -> bool {
+        matches!(
+            self,
+            Self::RepositoryPatch
+                | Self::CodeReview
+                | Self::BuildAttestation
+                | Self::ReleaseProposal
+                | Self::ReleaseReview
         )
     }
 }
@@ -392,6 +424,152 @@ pub struct SourceReviewPayload {
     #[serde(default)]
     pub evidence: Vec<EvidenceRef>,
     pub notes: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ForgeArtifactPurpose {
+    Patch,
+    SourceCandidate,
+    Evidence,
+}
+
+impl ForgeArtifactPurpose {
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Patch => "patch",
+            Self::SourceCandidate => "source_candidate",
+            Self::Evidence => "evidence",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ForgeArtifactRef {
+    pub sha256: String,
+    pub size_bytes: u64,
+    pub media_type: String,
+}
+
+/// Session-signed authority to store one inert, digest-addressed forge artifact.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ArtifactUploadAuthorization {
+    pub protocol: String,
+    pub delegation_id: String,
+    pub repository_id: String,
+    pub artifact: ForgeArtifactRef,
+    pub purpose: ForgeArtifactPurpose,
+    pub created_at: DateTime<Utc>,
+    pub nonce: String,
+    pub signature: String,
+}
+
+/// Node-signed availability claim. It attributes storage, not safety or execution.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ArtifactReceipt {
+    pub protocol: String,
+    pub receipt_id: String,
+    pub authorization: ArtifactUploadAuthorization,
+    pub uploader_lineage_id: String,
+    pub stored_at: DateTime<Utc>,
+    pub node_id: String,
+    pub node_public_key: String,
+    pub trust_notice: String,
+    pub signature: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RepositoryPatchPayload {
+    pub repository_id: String,
+    pub base_revision: String,
+    pub proposed_revision: String,
+    pub artifact: ForgeArtifactRef,
+    pub title: String,
+    pub summary: String,
+    #[serde(default)]
+    pub changed_paths: Vec<String>,
+    pub compatibility_notes: String,
+    pub risk_notes: String,
+    pub test_plan: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ForgeReviewRecommendation {
+    Approve,
+    Reject,
+    NeedsChanges,
+}
+
+impl ForgeReviewRecommendation {
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Approve => "approve",
+            Self::Reject => "reject",
+            Self::NeedsChanges => "needs_changes",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CodeReviewPayload {
+    pub repository_id: String,
+    pub proposal_event_id: String,
+    pub reviewed_revision: String,
+    pub artifact_sha256: String,
+    pub recommendation: ForgeReviewRecommendation,
+    pub summary: String,
+    #[serde(default)]
+    pub findings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BuildAttestationPayload {
+    pub repository_id: String,
+    pub proposal_event_id: String,
+    pub source_revision: String,
+    pub artifact_sha256: String,
+    pub outcome: TraceOutcome,
+    pub environment: String,
+    pub summary: String,
+    #[serde(default)]
+    pub commands: Vec<String>,
+    #[serde(default)]
+    pub limitations: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReleaseProposalPayload {
+    pub repository_id: String,
+    pub candidate_revision: String,
+    pub source_artifact: ForgeArtifactRef,
+    pub channel: String,
+    pub version: String,
+    #[serde(default)]
+    pub included_patch_event_ids: Vec<String>,
+    pub rollback_revision: String,
+    pub minimum_adoption_delay_hours: u32,
+    pub summary: String,
+    pub migration_notes: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReleaseReviewPayload {
+    pub repository_id: String,
+    pub release_proposal_event_id: String,
+    pub reviewed_revision: String,
+    pub artifact_sha256: String,
+    pub recommendation: ForgeReviewRecommendation,
+    pub summary: String,
+    pub rollback_assessment: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -711,6 +889,19 @@ pub struct OriginEvent {
     pub previous_hash: String,
     pub event_hash: String,
     pub node_signature: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ForgeActivityPage {
+    pub origin_node_id: String,
+    pub origin_node_public_key: String,
+    pub repository_id: Option<String>,
+    pub kind: Option<String>,
+    pub after: i64,
+    pub next_cursor: i64,
+    pub has_more: bool,
+    pub events: Vec<OriginEvent>,
+    pub provenance_notice: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

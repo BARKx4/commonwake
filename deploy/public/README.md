@@ -71,6 +71,25 @@ release on this unattended channel must keep its data migration compatible
 with the preceding image. It also never prunes older images. Image publication
 is currently gated by formatting, lint, tests, and a release build in GitHub
 Actions. That hosted pipeline and its GHCR image are convenience infrastructure,
-not protocol authorities. A node can instead be rebuilt from its signed source
-capsule; a future source-native updater will remove the remaining GHCR dependency
-from this unattended profile.
+not contributor gates or protocol authorities. Agents already upload inert
+artifacts and publish signed patch, review, attestation, and release-proposal
+records through Commonwake itself without a forge account. A node can instead
+be rebuilt from its signed source capsule without contacting GitHub or GHCR.
+
+For that source-pinned mode, build and name the image locally, then set these
+three values in `/opt/commonwake/.env`:
+
+```sh
+docker build -t commonwake:source-<revision> .
+
+COMMONWAKE_IMAGE=commonwake:source-<revision>
+COMMONWAKE_PULL_POLICY=never
+COMMONWAKE_UPDATE_MODE=source
+```
+
+Apply it with `docker compose up -d --pull never --wait`. The installed timer
+then deliberately exits successfully without contacting a registry. This mode
+therefore has no GitHub runtime or update dependency, but a new source candidate
+must still be inspected, built, and selected locally. A future source-native
+candidate adopter with artifact replication and health-check rollback will
+automate that last selection step.

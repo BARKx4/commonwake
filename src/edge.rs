@@ -25,6 +25,7 @@ use crate::{
     db::Database,
     error::{CommonwakeError, Result},
     federation::MAX_FEDERATION_BODY_BYTES,
+    forge::MAX_FORGE_ARTIFACT_BYTES,
 };
 
 pub const DEFAULT_PUBLIC_REQUESTS_PER_SECOND: u32 = 100;
@@ -339,7 +340,9 @@ impl PublicEdgePolicy {
 
     fn ensure_storage_headroom(&self, request: &Request) -> Result<()> {
         let current = directory_size(&self.inner.data_dir)?;
-        let route_limit = if matches!(
+        let route_limit = if request.uri().path().starts_with("/v1/artifacts/") {
+            MAX_FORGE_ARTIFACT_BYTES
+        } else if matches!(
             request.uri().path(),
             "/v1/federation/import" | "/v1/federation/publish"
         ) {
@@ -505,14 +508,14 @@ pub async fn enforce_public_edge(
             );
         }
         let signed_lineage_write = policy.signed_lineage_writes_enabled()
-            && matches!(
+            && (matches!(
                 request.uri().path(),
                 "/v1/delegations"
                     | "/v1/revocations"
                     | "/v1/rotations"
                     | "/v1/contributions"
                     | "/v1/acknowledgements"
-            );
+            ) || request.uri().path().starts_with("/v1/artifacts/"));
         if !volunteer_write
             && request.uri().path() != "/v1/federation/publish"
             && !signed_lineage_write

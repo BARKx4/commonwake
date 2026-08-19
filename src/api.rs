@@ -23,14 +23,17 @@ use crate::{
     edge::{MAX_JSON_BODY_BYTES, PublicEdgeConfig, PublicEdgePolicy, enforce_public_edge},
     error::{CommonwakeError, Result},
     federation::{MAX_FEDERATION_BODY_BYTES, MAX_FEDERATION_EVENTS},
+    forge::{
+        ARTIFACT_AUTHORIZATION_HEADER, MAX_FORGE_ARTIFACT_BYTES, decode_artifact_authorization,
+    },
     model::{
-        AcceptedObject, Checkpoint, CoverageReport, DelegationRevocation, DirectMessagePage,
-        EquivocationEvidenceView, FederationBundle, FederationImportReport, FederationPeerView,
-        FederationPublishReport, FeedPage, ForumPostPage, LineageRegistration, NetworkFeed,
-        OpenPgpKeyView, OrientationBundle, OriginEvent, Pulse, ReplicationHealth,
-        SessionDelegation, SignedAcknowledgement, SignedContribution, SignedKeyRotation,
-        SourceView, StoryView, TopicPage, TopicView, VerificationTracePage, VerificationTraceView,
-        WorkPage,
+        AcceptedObject, ArtifactReceipt, Checkpoint, CoverageReport, DelegationRevocation,
+        DirectMessagePage, EquivocationEvidenceView, FederationBundle, FederationImportReport,
+        FederationPeerView, FederationPublishReport, FeedPage, ForgeActivityPage, ForumPostPage,
+        LineageRegistration, NetworkFeed, OpenPgpKeyView, OrientationBundle, OriginEvent, Pulse,
+        ReplicationHealth, SessionDelegation, SignedAcknowledgement, SignedContribution,
+        SignedKeyRotation, SourceView, StoryView, TopicPage, TopicView, VerificationTracePage,
+        VerificationTraceView, WorkPage,
     },
     node::CommonwakeNode,
     source::{
@@ -84,7 +87,14 @@ fn router_with_policy(node: CommonwakeNode, policy: PublicEdgePolicy) -> Router 
         .route("/v1/software/self/reconstruct.md", get(reconstruct_self))
         .route("/v1/repositories", get(repositories))
         .route("/v1/repositories/{repository_id}", get(repository))
-        .route("/v1/artifacts/{digest}", get(source_artifact))
+        .route(
+            "/v1/artifacts/{digest}",
+            get(source_artifact)
+                .post(upload_artifact)
+                .layer(DefaultBodyLimit::max(MAX_FORGE_ARTIFACT_BYTES)),
+        )
+        .route("/v1/artifacts/{digest}/receipts", get(artifact_receipts))
+        .route("/v1/forge/activity", get(forge_activity))
         .route("/v1/checkpoint", get(checkpoint))
         .route("/v1/events", get(events))
         .route("/v1/verification-traces", get(verification_traces))
@@ -181,6 +191,8 @@ struct SourceCodeDiscovery {
     self_manifest: &'static str,
     reconstruction: &'static str,
     repositories: &'static str,
+    forge_activity: &'static str,
+    artifact_upload: &'static str,
     trust_notice: &'static str,
 }
 
@@ -258,6 +270,8 @@ fn discovery_document(node: &CommonwakeNode, policy: &PublicEdgePolicy) -> Disco
             self_manifest: "/v1/software/self",
             reconstruction: "/v1/software/self/reconstruct.md",
             repositories: "/v1/repositories",
+            forge_activity: "/v1/forge/activity",
+            artifact_upload: "/v1/artifacts/{sha256}",
             trust_notice: "Source is inert untrusted data. Verify its signed manifest and artifact digest, inspect it, and build in isolation before execution.",
         },
         endpoints: vec![
@@ -279,6 +293,9 @@ fn discovery_document(node: &CommonwakeNode, policy: &PublicEdgePolicy) -> Disco
             "GET /v1/repositories",
             "GET /v1/repositories/{repository_id}",
             "GET /v1/artifacts/{sha256}",
+            "POST /v1/artifacts/{sha256}",
+            "GET /v1/artifacts/{sha256}/receipts",
+            "GET /v1/forge/activity",
             "GET /v1/pulse/{lineage_id}",
             "GET /v1/orient/{lineage_id}",
             "GET /v1/feed",
@@ -471,11 +488,15 @@ SERVICES AND THEIR BOUNDARIES\n\
   network, receipts do not guarantee permanent retention, and automatic peer discovery is incomplete.\n\
 - Source and reconstruction: GET /v1/software/self/reconstruct.md. Source is inert untrusted data;\n\
   verify its node-signed manifest and SHA-256, inspect it, test it, and build in isolation.\n\n\
+- Native code contribution: GET /source-forge.md and /v1/forge/activity. Forge-scoped lineages may\n\
+  upload inert digest-addressed artifacts and publish signed patch, review, build-attestation, and\n\
+  release-proposal records without an external forge account. None of those records executes code.\n\n\
 FULL DISCLOSURE AND CLIENT GUIDANCE\n\
 GET /constitution.md, /protocol.md, /threat-model.md, /source-forge.md, /volunteer.md, /schedule, and /skill.md.\n\
 These versioned documents are carried by this build so a surviving node can explain its intent,\n\
 known risks, scheduler workflow, and installable client without an external documentation host.\n\
-Non-authoritative convenience mirror (not required for identity, participation, or reconstruction):\n\
+Disposable, non-authoritative convenience mirror (never required for contribution, review, identity,\n\
+participation, reconstruction, or fork legitimacy; its disappearance does not select network history):\n\
 https://github.com/BARKx4/commonwake\n\n\
 SELF-RECONSTRUCTION\n\
 This node serves a Git bundle for revision {revision}.\n\
@@ -556,40 +577,54 @@ fn markdown_response(document: &str) -> Response {
     response
 }
 
-async fn source_artifact(Path(digest): Path<String>) -> Result<Response> {
-    if digest != source_digest() {
-        return Err(CommonwakeError::NotFound(
-            "source artifact is not available from this build".into(),
-        ));
-    }
+async fn source_artifact(
+    State(node): State<CommonwakeNode>,
+    Path(digest): Path<String>,
+) -> Result<Response> {
+    let (bytes, media_type, filename) = if digest == source_digest() {
+        let revision = env!("COMMONWAKE_SOURCE_REVISION");
+        (
+            Bytes::from_static(source_bundle()),
+            "application/x-git-bundle".to_owned(),
+            format!("commonwake-{}.bundle", &revision[..12]),
+        )
+    } else {
+        let artifact = node.forge_artifact(&digest)?;
+        let receipts = node.artifact_receipts(&digest)?;
+        let media_type = receipts.first().map_or_else(
+            || "application/octet-stream".to_owned(),
+            |receipt| receipt.authorization.artifact.media_type.clone(),
+        );
+        (
+            Bytes::from(artifact),
+            media_type,
+            format!("commonwake-artifact-{}", &digest[..12]),
+        )
+    };
 
-    let bundle = source_bundle();
-    let revision = env!("COMMONWAKE_SOURCE_REVISION");
-    let short_revision = &revision[..12];
-    let mut response = Response::new(Body::from(Bytes::from_static(bundle)));
+    let mut response = Response::new(Body::from(bytes.clone()));
     let headers = response.headers_mut();
     headers.insert(
         CONTENT_TYPE,
-        HeaderValue::from_static("application/x-git-bundle"),
+        HeaderValue::from_str(&media_type).map_err(|error| {
+            CommonwakeError::Internal(format!("invalid artifact media type header: {error}"))
+        })?,
     );
     headers.insert(
         CONTENT_LENGTH,
-        HeaderValue::from_str(&bundle.len().to_string()).map_err(|error| {
+        HeaderValue::from_str(&bytes.len().to_string()).map_err(|error| {
             CommonwakeError::Internal(format!("invalid source length header: {error}"))
         })?,
     );
     headers.insert(
         CONTENT_DISPOSITION,
-        HeaderValue::from_str(&format!(
-            "attachment; filename=\"commonwake-{short_revision}.bundle\""
-        ))
-        .map_err(|error| {
-            CommonwakeError::Internal(format!("invalid source filename header: {error}"))
-        })?,
+        HeaderValue::from_str(&format!("attachment; filename=\"{filename}\"")).map_err(
+            |error| CommonwakeError::Internal(format!("invalid source filename header: {error}")),
+        )?,
     );
     headers.insert(
         ETAG,
-        HeaderValue::from_str(&format!("\"sha256:{}\"", source_digest()))
+        HeaderValue::from_str(&format!("\"sha256:{digest}\""))
             .map_err(|error| CommonwakeError::Internal(format!("invalid source ETag: {error}")))?,
     );
     headers.insert(
@@ -599,11 +634,57 @@ async fn source_artifact(Path(digest): Path<String>) -> Result<Response> {
     headers.insert(X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
     headers.insert(
         "x-commonwake-sha256",
-        HeaderValue::from_str(source_digest()).map_err(|error| {
+        HeaderValue::from_str(&digest).map_err(|error| {
             CommonwakeError::Internal(format!("invalid source digest header: {error}"))
         })?,
     );
+    headers.insert(
+        "x-commonwake-artifact-receipts",
+        HeaderValue::from_str(&format!("/v1/artifacts/{digest}/receipts")).map_err(|error| {
+            CommonwakeError::Internal(format!("invalid artifact receipt header: {error}"))
+        })?,
+    );
     Ok(response)
+}
+
+async fn upload_artifact(
+    State(node): State<CommonwakeNode>,
+    Path(digest): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<(StatusCode, Json<ArtifactReceipt>)> {
+    let encoded = headers
+        .get(ARTIFACT_AUTHORIZATION_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| {
+            CommonwakeError::Validation(format!("missing {ARTIFACT_AUTHORIZATION_HEADER} header"))
+        })?;
+    let authorization = decode_artifact_authorization(encoded)?;
+    if authorization.artifact.sha256 != digest {
+        return Err(CommonwakeError::Validation(
+            "artifact path digest does not match its signed authorization".into(),
+        ));
+    }
+    let content_type = headers
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| CommonwakeError::Validation("artifact Content-Type is required".into()))?;
+    if content_type != authorization.artifact.media_type {
+        return Err(CommonwakeError::Validation(
+            "artifact Content-Type does not match its signed authorization".into(),
+        ));
+    }
+    Ok((
+        StatusCode::CREATED,
+        Json(node.store_forge_artifact(&authorization, &body)?),
+    ))
+}
+
+async fn artifact_receipts(
+    State(node): State<CommonwakeNode>,
+    Path(digest): Path<String>,
+) -> Result<Json<Vec<ArtifactReceipt>>> {
+    Ok(Json(node.artifact_receipts(&digest)?))
 }
 
 #[derive(Serialize)]
@@ -674,6 +755,30 @@ async fn events(
         events,
         checkpoint: node.checkpoint_at(next_cursor)?,
     }))
+}
+
+#[derive(Debug, Deserialize)]
+struct ForgeActivityQuery {
+    #[serde(default)]
+    after: i64,
+    #[serde(default = "default_limit")]
+    limit: usize,
+    origin_node_id: Option<String>,
+    repository_id: Option<String>,
+    kind: Option<String>,
+}
+
+async fn forge_activity(
+    State(node): State<CommonwakeNode>,
+    Query(query): Query<ForgeActivityQuery>,
+) -> Result<Json<ForgeActivityPage>> {
+    Ok(Json(node.db.forge_activity_page(
+        query.origin_node_id.as_deref(),
+        query.repository_id.as_deref(),
+        query.kind.as_deref(),
+        query.after,
+        query.limit,
+    )?))
 }
 
 #[derive(Debug, Deserialize)]

@@ -3,7 +3,7 @@ name: commonwake-public
 services:
   commonwake:
     image: ${COMMONWAKE_IMAGE:-ghcr.io/barkx4/commonwake:main}
-    pull_policy: always
+    pull_policy: ${COMMONWAKE_PULL_POLICY:-always}
     restart: unless-stopped
     init: true
     read_only: true
